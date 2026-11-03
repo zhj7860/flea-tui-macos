@@ -11,6 +11,9 @@ const SIGINT: i32 = 2;
 const SIGTERM: i32 = 15;
 const SIGHUP: i32 = 1;
 const SIGKILL: i32 = 9;
+#[cfg(target_os = "macos")]
+const SIGCONT: i32 = 19;
+#[cfg(not(target_os = "macos"))]
 const SIGCONT: i32 = 18;
 const SIGTTOU: i32 = 22;
 // The shown faults of the stty calls: raw mode at the start and the terminal handed back at the end, then the same two around the editor.
@@ -32,12 +35,23 @@ fn editor_result(status: std::process::ExitStatus) -> io::Result<()> {
 pub fn launch(path: &Path, window: bool) -> io::Result<Child> {
     let path = path.canonicalize()?;
     if !path.is_dir() { return Err(io::Error::other("That is not a folder, so no terminal was opened")); }
-    let mut directory = std::ffi::OsString::from("--dir=");
-    directory.push(&path);
-    let mut command = Command::new("xdg-terminal-exec");
-    command.arg(directory);
-    if window { command.arg("--").arg(std::env::current_exe()?).arg("--tui").arg(&path); }
-    command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).process_group(0).spawn()
+    #[cfg(target_os = "macos")]
+    {
+        let _ = window;
+        // Terminal.app's open-with-directory form starts a new window already cd'd there.
+        let mut command = Command::new("/usr/bin/open");
+        command.arg("-a").arg("Terminal").arg(&path);
+        return command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).process_group(0).spawn();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut directory = std::ffi::OsString::from("--dir=");
+        directory.push(&path);
+        let mut command = Command::new("xdg-terminal-exec");
+        command.arg(directory);
+        if window { command.arg("--").arg(std::env::current_exe()?).arg("--tui").arg(&path); }
+        command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).process_group(0).spawn()
+    }
 }
 extern "C" {
     fn ioctl(fd: i32, request: usize, ...) -> i32;

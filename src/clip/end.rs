@@ -10,11 +10,45 @@ use std::sync::{atomic::{AtomicBool, Ordering}, mpsc::Sender, Arc, Mutex};
 struct PollFd { fd: c_int, events: i16, revents: i16 }
 
 extern "C" {
-    fn pidfd_open(pid: c_int, flags: u32) -> c_int;
-    fn eventfd(value: u32, flags: c_int) -> c_int;
     fn poll(fds: *mut PollFd, count: usize, timeout: c_int) -> c_int;
     fn read(fd: c_int, bytes: *mut c_void, count: usize) -> isize;
     fn write(fd: c_int, bytes: *const c_void, count: usize) -> isize;
+}
+#[cfg(target_os = "linux")]
+extern "C" {
+    fn pidfd_open(pid: c_int, flags: u32) -> c_int;
+    fn eventfd(value: u32, flags: c_int) -> c_int;
+}
+// Darwin has neither: src/sys.rs watches the owner's exit with kqueue and wakes the waiter with a pipe.
+#[cfg(target_os = "macos")]
+use crate::sys::pidfd_open;
+
+// The waiter's wake: one eventfd on Linux, a nonblocking pipe pair on macOS. Both ends live here so
+// the Drop that stops the thread closes exactly what it opened.
+struct Wake {
+    read: OwnedFd,
+    write: OwnedFd,
+}
+
+impl Wake {
+    fn new() -> std::io::Result<Wake> {
+        #[cfg(target_os = "linux")]
+        {
+            let raw = unsafe { eventfd(0, CLOEXEC_NONBLOCK) };
+            if raw < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+            // dup keeps one counter: the waiter reads one descriptor and every writer uses the other.
+            let read = fd.try_clone()?;
+            return Ok(Wake { read, write: fd });
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let (read, write) = crate::sys::wake_pair()?;
+            Ok(Wake { read: unsafe { OwnedFd::from_raw_fd(read) }, write: unsafe { OwnedFd::from_raw_fd(write) } })
+        }
+    }
 }
 
 const CLOEXEC_NONBLOCK: c_int = 0o2000000 | 0o4000;
@@ -45,7 +79,7 @@ struct Mail {
 
 pub(super) struct OwnerEnd {
     mail: Arc<Mutex<Mail>>,
-    wake: Option<Arc<OwnedFd>>,
+    wake: Option<Arc<Wake>>,
     worker: Option<std::thread::JoinHandle<()>>,
     replies: Sender<OpMsg>,
     state: watch::Shared,
@@ -67,16 +101,18 @@ impl OwnerEnd {
     pub fn track(&mut self, pid: Option<u32>, token: &str) {
         let owner = pid.and_then(owner_fd);
         if owner.is_some() && self.wake.is_none() {
-            let raw = unsafe { eventfd(0, CLOEXEC_NONBLOCK) };
-            if raw < 0 {
-                if !self.eventfd_failed {
-                    eprintln!("flea: clipboard owner-end eventfd failed: {}", std::io::Error::last_os_error());
-                    self.eventfd_failed = true;
+            let made = Wake::new();
+            let wake = match made {
+                Ok(wake) => Arc::new(wake),
+                Err(error) => {
+                    if !self.eventfd_failed {
+                        eprintln!("flea: clipboard owner-end eventfd failed: {}", error);
+                        self.eventfd_failed = true;
+                    }
+                    return;
                 }
-                return;
-            }
+            };
             self.eventfd_failed = false;
-            let wake = Arc::new(unsafe { OwnedFd::from_raw_fd(raw) });
             let (mail, signal, replies, state, socket) =
                 (self.mail.clone(), wake.clone(), self.replies.clone(), self.state.clone(), self.socket.clone());
             let worker = std::thread::Builder::new().name("flea-clip-end".into())
@@ -115,15 +151,15 @@ impl Drop for OwnerEnd {
     }
 }
 
-fn signal(wake: &OwnedFd) {
+fn signal(wake: &Wake) {
     let value = 1u64.to_ne_bytes();
     loop {
-        if unsafe { write(wake.as_raw_fd(), value.as_ptr().cast(), value.len()) } >= 0
+        if unsafe { write(wake.write.as_raw_fd(), value.as_ptr().cast(), value.len()) } >= 0
             || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted { return; }
     }
 }
 
-fn replace(mail: &Mutex<Mail>, wake: &OwnedFd, owner: Option<OwnerFd>, token: &str) {
+fn replace(mail: &Mutex<Mail>, wake: &Wake, owner: Option<OwnerFd>, token: &str) {
     let mut mail = mail.lock().unwrap_or_else(|e| e.into_inner());
     if mail.stopped { return; }
     if let Some(active) = mail.active.take() { active.store(true, Ordering::Release); }
@@ -143,12 +179,12 @@ fn replace(mail: &Mutex<Mail>, wake: &OwnedFd, owner: Option<OwnerFd>, token: &s
 #[cfg(test)]
 pub(crate) static STOP_HOLD_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn wait(mail: Arc<Mutex<Mail>>, wake: Arc<OwnedFd>, replies: Sender<OpMsg>, state: watch::Shared, socket: Option<PathBuf>) {
+fn wait(mail: Arc<Mutex<Mail>>, wake: Arc<Wake>, replies: Sender<OpMsg>, state: watch::Shared, socket: Option<PathBuf>) {
     let mut current: Option<Job> = None;
     loop {
         let ended = current.as_ref().is_some_and(|job| job.fd.is_none());
         let mut fds = [
-            PollFd { fd: wake.as_raw_fd(), events: POLLIN, revents: 0 },
+            PollFd { fd: wake.read.as_raw_fd(), events: POLLIN, revents: 0 },
             PollFd { fd: current.as_ref().and_then(|job| job.fd.as_ref()).map_or(NO_FD, AsRawFd::as_raw_fd), events: POLLIN, revents: 0 },
         ];
         let timeout = if ended { POLL_NOW } else { POLL_FOREVER };
@@ -160,7 +196,7 @@ fn wait(mail: Arc<Mutex<Mail>>, wake: Arc<OwnedFd>, replies: Sender<OpMsg>, stat
         }
         if fds[0].revents != 0 {
             let mut value = [0u8; 8];
-            unsafe { read(wake.as_raw_fd(), value.as_mut_ptr().cast(), value.len()); }
+            unsafe { read(wake.read.as_raw_fd(), value.as_mut_ptr().cast(), value.len()); }
             let mut mail = mail.lock().unwrap_or_else(|e| e.into_inner());
             if mail.stopped {
                 drop(mail);
@@ -208,6 +244,13 @@ fn owner_ended(fd: &OwnedFd) -> Option<bool> {
         .then(|| polled[0].revents & POLLIN != 0)
 }
 
+// Darwin has no /proc, so the owner's executable and argv cannot be read here; nothing is claimed.
+#[cfg(target_os = "macos")]
+fn is_owner(_pid: u32) -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
 fn is_owner(pid: u32) -> bool {
     use std::os::unix::fs::MetadataExt;
     let Ok(own) = std::fs::metadata("/proc/self/exe") else { return false; };

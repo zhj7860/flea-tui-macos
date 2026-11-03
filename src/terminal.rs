@@ -30,9 +30,20 @@ pub fn open_terminal(path: &str) -> i32 {
     let mut dir = OsString::from("--dir=");
     dir.push(&target);
     // corner: spawn and not exec, because the terminal outlives us; see AGENTS.md "Opening a file".
-    let mut terminal = Command::new("xdg-terminal-exec");
+    #[cfg(target_os = "macos")]
+    let mut terminal = {
+        let mut command = Command::new("/usr/bin/open");
+        command.arg("-a").arg("Terminal").arg(&target);
+        command
+    };
+    #[cfg(not(target_os = "macos"))]
+    let mut terminal = {
+        let mut command = Command::new("xdg-terminal-exec");
+        command.arg(&dir);
+        command
+    };
     detach(&mut terminal);
-    let started = terminal.arg(&dir).spawn();
+    let started = terminal.spawn();
     match started {
         Ok(_) => 0,
         Err(_) => {

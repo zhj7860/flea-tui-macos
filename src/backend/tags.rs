@@ -5,21 +5,52 @@ use std::path::Path;
 
 // The attribute Dolphin reads and writes; a comma separated list of names.
 const ATTR_NAME: &str = "user.xdg.tags";
-// ENOTSUP on Linux; EOPNOTSUPP shares this value, so one constant refuses either spelling.
+// ENOTSUP on Linux; EOPNOTSUPP shares this value, so one constant refuses either spelling. Darwin
+// spells the two apart: ENOTSUP is 45, and a missing attribute is ENOATTR, 93.
+#[cfg(target_os = "linux")]
 const ENOTSUP: i32 = 95;
+#[cfg(target_os = "macos")]
+const ENOTSUP: i32 = 45;
 // ENODATA: the filesystem answers tags, this file just has none.
+#[cfg(target_os = "linux")]
 const ENODATA: i32 = 61;
+#[cfg(target_os = "macos")]
+const ENODATA: i32 = 93;
 // A hostile value cannot exceed the filesystem's own limit; this caps the read, never the write.
 pub(crate) const MAX_VALUE: usize = 65536;
 
 // Flea's seven names in menu order, which is also the 1 to 7 key order; see ui/js/Tags.js.
 pub const NAMES: [&str; 7] = ["Red", "Orange", "Yellow", "Green", "Blue", "Purple", "Gray"];
 
+#[cfg(target_os = "linux")]
 extern "C" {
     fn lgetxattr(path: *const c_char, name: *const c_char, value: *mut c_void, size: usize) -> isize;
     fn lsetxattr(path: *const c_char, name: *const c_char, value: *const c_void, size: usize, flags: c_int)
         -> c_int;
     fn lremovexattr(path: *const c_char, name: *const c_char) -> c_int;
+}
+
+// Darwin has one xattr family with an options word instead of l-prefixed names; XATTR_NOFOLLOW is
+// the link-not-target rule the Linux l* calls spell in their names.
+#[cfg(target_os = "macos")]
+const XATTR_NOFOLLOW: c_int = 0x0001;
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn getxattr(path: *const c_char, name: *const c_char, value: *mut c_void, size: usize, position: u32, options: c_int) -> isize;
+    fn setxattr(path: *const c_char, name: *const c_char, value: *const c_void, size: usize, position: u32, options: c_int) -> c_int;
+    fn removexattr(path: *const c_char, name: *const c_char, options: c_int) -> c_int;
+}
+#[cfg(target_os = "macos")]
+unsafe fn lgetxattr(path: *const c_char, name: *const c_char, value: *mut c_void, size: usize) -> isize {
+    getxattr(path, name, value, size, 0, XATTR_NOFOLLOW)
+}
+#[cfg(target_os = "macos")]
+unsafe fn lsetxattr(path: *const c_char, name: *const c_char, value: *const c_void, size: usize, flags: c_int) -> c_int {
+    setxattr(path, name, value, size, 0, flags | XATTR_NOFOLLOW)
+}
+#[cfg(target_os = "macos")]
+unsafe fn lremovexattr(path: *const c_char, name: *const c_char) -> c_int {
+    removexattr(path, name, XATTR_NOFOLLOW)
 }
 
 // Sample input: "red" answers Some("Red"), "Custom" answers None.
