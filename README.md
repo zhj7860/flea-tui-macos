@@ -35,6 +35,10 @@
 - **Desktop integration.** Default file manager, “Show in folder” and Open/Save dialogs.
 - **Your settings.** Omarchy text sizes, configurable menus, and Default, Vim, Mac or Windows keys.
 
+**macOS.** This tree also builds Flea's terminal interface for macOS, with `Ctrl+T` opening
+Terminal.app in the folder on screen. Build, limits and the Darwin port notes are in
+[MACOS.md](MACOS.md); the windowed GUI needs Quickshell and stays Linux-only.
+
 ## Install
 
 Flea is available only from the Omarchy Package Repository. Install it and make it your default

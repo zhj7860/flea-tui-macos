@@ -31,6 +31,8 @@ struct Kevent {
 // sys/event.h values on Darwin, never the Linux or FreeBSD ones.
 const EVFILT_VNODE: i16 = -4;
 const EVFILT_PROC: i16 = -5;
+const EVFILT_USER: i16 = -10;
+const NOTE_TRIGGER: u32 = 0x0100_0000;
 const EV_ADD: u16 = 0x0001;
 const EV_DELETE: u16 = 0x0002;
 const EV_ONESHOT: u16 = 0x0010;
@@ -440,6 +442,21 @@ pub fn pidfd_open(pid: c_int, _flags: u32) -> c_int {
     };
     if unsafe { kevent(fd, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) } != 0 {
         let failure = std::io::Error::last_os_error();
+        // A child that exited before the wait began is a zombie: the kernel refuses a proc knote for it
+        // with ESRCH, but the exit already happened, so the descriptor is made readable at once.
+        if failure.raw_os_error() == Some(ESRCH) && unsafe { kill(pid, 0) } == 0 {
+            let trigger = Kevent {
+                ident: 0,
+                filter: EVFILT_USER,
+                flags: EV_ADD | EV_ONESHOT | EV_CLEAR,
+                fflags: NOTE_TRIGGER,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            if unsafe { kevent(fd, &trigger, 1, std::ptr::null_mut(), 0, std::ptr::null()) } == 0 {
+                return fd;
+            }
+        }
         unsafe { close(fd) };
         if failure.raw_os_error() == Some(ESRCH) {
             unsafe { *__error() = ESRCH };

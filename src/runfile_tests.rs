@@ -341,6 +341,8 @@ fn harden_strips_a_private_variable_the_process_itself_inherited() {
     assert!(text.lines().any(|line| line == "inherited=absent"), "probe env: {text}");
 }
 
+// The probe lists /proc/self/fd, which Darwin does not have; the hardening itself still runs on macOS.
+#[cfg(target_os = "linux")]
 #[test]
 fn spawned_child_sees_no_fd_above_2_and_no_private_env() {
     // The R6 probe: the child half reports and the parent half judges, re-running this test behind FLEA_RUNFILE_PROBE.
