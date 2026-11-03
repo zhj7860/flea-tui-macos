@@ -167,6 +167,8 @@ fn a_skipped_row_is_named_as_a_search_listing_shows_it() {
     assert!(line.contains(r#""skipped":["a/x.lnk","b/x.lnk"]"#), "each link is named by its row path: {}", line);
 }
 
+// The refusing filesystem is procfs, which Darwin does not mount.
+#[cfg(target_os = "linux")]
 #[test]
 fn every_filesystem_the_targets_sit_on_is_probed_before_any_write() {
     let _guard = crate::backend::tags::SEAM.lock().unwrap_or_else(|poisoned| poisoned.into_inner());

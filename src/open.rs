@@ -93,13 +93,27 @@ fn open_inner(path: &str, ask: bool) -> i32 {
     open_normally(&target, ask)
 }
 
+// The program a file is handed to: gio's desktop database on Linux, LaunchServices' `open` on Darwin.
+fn open_program() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "/usr/bin/open"
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "gio"
+    }
+}
+
 // Past every run decision: handed to gio open and waited on, the way the opener always did.
 fn open_normally(target: &Path, ask: bool) -> i32 {
     // corner: waited for, not detached, and on an archive that wait is a cold handler start; see AGENTS.md "Opening a file".
-    let mut launcher = Command::new("gio");
+    // Darwin asks LaunchServices with `open`, which is `gio open`'s counterpart and needs no subcommand.
+    let mut launcher = Command::new(open_program());
     prepare(&mut launcher);
+    #[cfg(not(target_os = "macos"))]
+    launcher.arg("open");
     let finished = launcher
-        .arg("open")
         .arg(target)
         // The handler outlives us, so an inherited pipe would kill it on its first write; see AGENTS.md "Opening a file".
         .stdin(Stdio::null())
@@ -127,6 +141,24 @@ fn open_normally(target: &Path, ask: bool) -> i32 {
     }
 }
 
-#[cfg(test)]
+// The suite's stubs speak gio, GNU timeout and mkfifo, so those checks are Linux's.
+#[cfg(all(test, target_os = "linux"))]
 #[path = "open_tests.rs"]
 mod tests;
+
+#[cfg(all(test, target_os = "macos"))]
+mod darwin_tests {
+    use super::*;
+
+    #[test]
+    fn a_file_is_handed_to_launch_services() {
+        assert_eq!(open_program(), "/usr/bin/open");
+        assert!(Path::new(open_program()).is_file(), "every macOS ships this");
+    }
+
+    #[test]
+    fn a_directory_is_answered_without_a_launch() {
+        let dir = std::env::temp_dir();
+        assert_eq!(open(&dir.to_string_lossy()), IS_DIRECTORY);
+    }
+}

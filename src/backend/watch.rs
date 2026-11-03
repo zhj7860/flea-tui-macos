@@ -3,7 +3,9 @@ use crate::backend::events::Event;
 use crate::backend::inotifyburst::each_event;
 use crate::json::escape;
 use std::io;
-use std::ffi::{c_char, c_int, c_void, CString};
+use std::ffi::{c_int, c_void, CString};
+#[cfg(target_os = "linux")]
+use std::ffi::c_char;
 use std::path::Path;
 use std::sync::mpsc::Sender;
 use std::thread;

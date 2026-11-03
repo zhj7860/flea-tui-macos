@@ -427,7 +427,8 @@ mod tests {
         assert!(support_error(&file).is_none());
     }
 
-    // The real probe with no forced seam: procfs answers ENOTSUP, so the row hides there.
+    // The real probe with no forced seam: procfs answers ENOTSUP, so the row hides there. Darwin has no procfs.
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_real_probe_refuses_procfs_without_the_forced_seam() {
         let dir = Path::new("/proc");

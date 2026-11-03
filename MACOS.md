@@ -52,6 +52,7 @@ without AppleScript automation permission, which this port does not request.
 - Live updates: the listed folder and the columns' neighbours watch through kqueue and
   re-list when an outside change lands.
 - Drag and drop inside the terminal (path paste), bulk selection, inline text preview.
+- Opening a file hands it to LaunchServices (`/usr/bin/open`), the counterpart of `gio open`.
 - The filesystem line in the status bar, from Darwin `statfs` (APFS, HFS+, exFAT,
   FAT32, SMB, NFS, ISO 9660, …).
 - Volume table rebuilt from `/sbin/mount`, so per-mount rules (FAT/exFAT durability,
@@ -79,8 +80,8 @@ than misbehaving:
 ## Port shape
 
 - `src/sys.rs` provides the Darwin layer: kqueue-backed inotify-compatible directory
-  watches (including `IN_IGNORED` on removal, `IN_NONBLOCK` reads and deduplicated
-  descriptors), a nonblocking wake pipe, `pidfd` waiting through `EVFILT_PROC` (with a
+  watches (synthetic, never-reused watch descriptors, `IN_IGNORED` on removal,
+  `IN_NONBLOCK` reads and per-kqueue deduplication), a nonblocking wake pipe, `pidfd` waiting through `EVFILT_PROC` (with a
   triggered user event for a child that exited before the wait began), close-on-exec
   sweeps, poll helpers and `F_FULLFSYNC` writeback.
 - `src/macos_compat.rs` supplies the remaining Linux libc names as `#[no_mangle]`

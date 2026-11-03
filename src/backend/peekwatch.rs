@@ -2,7 +2,9 @@
 use crate::backend::events::Event;
 use crate::backend::peekpump::pump;
 use std::collections::VecDeque;
-use std::ffi::{c_int, c_void};
+use std::ffi::c_int;
+#[cfg(target_os = "linux")]
+use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::thread::{self, JoinHandle};
