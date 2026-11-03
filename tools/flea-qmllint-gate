@@ -1,0 +1,126 @@
+#!/bin/bash
+# Runs qmllint over ui/*.qml and fails on any actionable finding above its known ceiling.
+#   tools/flea-qmllint-gate                          lints this checkout's ui/*.qml
+#   FLEA_QMLLINT=/no/such/qmllint tools/flea-qmllint-gate   points at a missing binary, for the
+#                                                            simulate-the-defect drill only
+#
+# qmllint is not on the non-interactive ssh PATH: `command -v qmllint` prints nothing and exits 1
+# here, because it lives at /usr/lib/qt6/bin/qmllint and nothing adds that to PATH over ssh. A gate
+# written the way this project has been writing one, `qmllint ui/*.qml 2>&1 | grep -E '...'`, runs
+# a shell built-in "command not found" through that grep, finds no match, and reports clean. This
+# checks the binary exists at an absolute path before running anything, because that check is the
+# entire reason this script exists.
+set -u
+cd "$(dirname "$0")/.." || exit 1
+
+bin=${FLEA_QMLLINT:-/usr/lib/qt6/bin/qmllint}
+if [ ! -x "$bin" ]; then
+  echo "flea-qmllint-gate: no qmllint at $bin (not on this shell's PATH, which is the defect this gate exists for)" >&2
+  exit 1
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "flea-qmllint-gate: jq not found, needed to read qmllint's own --json output" >&2
+  exit 1
+fi
+
+# --json sidesteps a second trap already found on this branch: qmllint's plain-text mode prints the
+# offending source line as context under each warning, and array-index syntax in that context, like
+# root.rows[index] or root.centres[row], reads as a category to a bracket grep. A whole-file
+# `grep -oE '\[[a-zA-Z-]+\]'` over this tree counts 12 such lines as a category named "index", which
+# is not one of qmllint's categories (see `qmllint --help`) and never appears in --json output.
+# --json gives one explicit "id" field per real diagnostic and nothing else.
+json=$("$bin" --json - ui/*.qml 2>&1)
+if ! printf '%s' "$json" | jq -e '.files' >/dev/null 2>&1; then
+  echo "flea-qmllint-gate: qmllint did not return the JSON this gate reads:" >&2
+  printf '%s\n' "$json" | head -5 | sed 's/^/  /' >&2
+  exit 1
+fi
+
+# qmllint cannot resolve QProcess::ExitStatus, so every Process onExited in this tree raises one
+# signal-handler-parameters finding, measured identically at 0, 1 and 2 declared parameters: a
+# category that fires the same at every arity is not measuring arity. Matched on the message rather
+# than on the file or the handler name, so a real arity bug on onExited itself still fails the gate.
+exit_status_note="Type QProcess::ExitStatus of parameter exitStatus in signal called exited was not found"
+# Quickshell converts the QVariantMap an `environment: ({ ... })` literal binds into its QVariantHash, so only this message is filtered and any other incompatible-type still fails.
+environment_note="Cannot assign binding of type QVariantMap to QVariantHash"
+
+counts=$(printf '%s' "$json" \
+  | jq -r --arg note "$exit_status_note" --arg env "$environment_note" \
+    '.files[].warnings[] | select((.message | contains($note)) or (.message | contains($env)) | not) | .id' \
+  | sort | uniq -c)
+exit_status_filtered=$(printf '%s' "$json" \
+  | jq -r --arg note "$exit_status_note" '.files[].warnings[] | select(.message | contains($note)) | .id' \
+  | wc -l)
+environment_filtered=$(printf '%s' "$json" \
+  | jq -r --arg env "$environment_note" '.files[].warnings[] | select(.message | contains($env)) | .id' \
+  | wc -l)
+
+count_of() {
+  printf '%s\n' "$counts" | grep -E " $1\$" | awk '{print $1}'
+}
+get() {
+  local n
+  n=$(count_of "$1")
+  [ -n "$n" ] && printf '%s' "$n" || printf '0'
+}
+
+# id|ceiling. A ceiling, not an exact pin: ui/*.qml grows every week, and an exact pin would fail
+# the gate the moment anyone fixes one of these findings, which is the shape of gate people disable.
+# The ceiling is today's measured count for each id, so the gate is silent now and red only on a
+# regression: a NEW actionable finding past what already exists. Re-measure when the tree shrinks:
+# import and unresolved-type sat at 17 and 7, four and one above the truth, and slack in a ceiling
+# is exactly the number of real findings that can land under it unseen. property-override's ceiling
+# was 1 for the one accepted case, ui/OmarchyMark.qml:13 overriding "scale"; that file left the
+# tree with the Omarchy logo it drew, so the ceiling is re-measured at 0. AGENTS.md says why import is 12.
+actionable="import|12
+unused-imports|0
+signal-handler-parameters|0
+unresolved-type|6
+property-override|0
+incompatible-type|0"
+
+# import qs.Commons never resolves under qmllint (it is a Quickshell module, not a Qt one), so
+# Theme.color and Theme.spacing degrade to bare QObject and every access to either fills one of
+# these two categories with a false positive. They are context, not verdict: AGENTS.md's own
+# baseline was 548/301 and is higher here only because the tree has grown since, which is expected
+# and not itself a finding.
+context="missing-property
+unqualified"
+
+drift=0
+echo "flea-qmllint-gate: actionable categories (ceiling, this run)"
+while IFS='|' read -r id ceiling; do
+  [ -n "$id" ] || continue
+  got=$(get "$id")
+  if [ "$got" -gt "$ceiling" ]; then
+    echo "  FAIL  $id: $got, ceiling $ceiling"
+    drift=$((drift + 1))
+  else
+    echo "  ok    $id: $got (ceiling $ceiling)"
+  fi
+done <<< "$actionable"
+
+echo "flea-qmllint-gate: documented false positives (context, not gated)"
+while IFS= read -r id; do
+  [ -n "$id" ] || continue
+  echo "  ---   $id: $(get "$id")"
+done <<< "$context"
+echo "  ---   signal-handler-parameters on QProcess::ExitStatus: $exit_status_filtered (one per Process onExited, filtered out of the gated count above)"
+echo "  ---   incompatible-type on Process environment (QVariantMap to QVariantHash): $environment_filtered (one per environment literal, filtered out of the gated count above)"
+
+# A category this table has never seen is a genuine unknown, not a false positive by default: name
+# it and fail, rather than let a new finding class hide inside a total the way "index" hid inside a
+# bracket grep.
+known=$(printf '%s\n%s\n' "$actionable" "$context" | cut -d'|' -f1)
+seen=$(printf '%s\n' "$counts" | awk '{print $2}')
+while IFS= read -r id; do
+  [ -n "$id" ] || continue
+  if ! printf '%s\n' "$known" | grep -qxF "$id"; then
+    echo "  UNKNOWN category $id: $(get "$id") (not on the actionable or context list, classify it)"
+    drift=$((drift + 1))
+  fi
+done <<< "$seen"
+
+echo "flea-qmllint-gate: $drift regression(s)"
+[ "$drift" -eq 0 ]

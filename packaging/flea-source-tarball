@@ -1,0 +1,45 @@
+#!/bin/bash
+# Builds flea-vX.Y.Z.tar.gz, the release's source tarball that OPR and the AUR flea package build from.
+# Usage: packaging/flea-source-tarball <tag> <outdir>
+set -euo pipefail
+
+if [ "$#" -ne 2 ]; then
+  echo "flea-source-tarball: expected <tag> <outdir>" >&2
+  exit 2
+fi
+tag=$1
+outdir=$2
+
+here=$(cd "$(dirname "$0")" && pwd)
+repo=$(dirname "$here")
+
+# The same expression the release workflow holds the tag to.
+if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "flea-source-tarball: '$tag' is not vX.Y.Z" >&2
+  exit 2
+fi
+git -C "$repo" rev-parse -q --verify "refs/tags/$tag^{commit}" >/dev/null || {
+  echo "flea-source-tarball: $repo has no tag '$tag'" >&2; exit 1; }
+
+version=${tag#v}
+root="flea-$version"
+asset="flea-$tag.tar.gz"
+stage=$(mktemp -d "${TMPDIR:-/tmp}/flea-source-tarball.XXXXXX")
+cleanup() { rm -rf -- "$stage"; }
+trap cleanup EXIT
+
+# git archive stamps every entry with the tag commit's time and gzip -n drops its own, so one tag and one gzip give one set of bytes.
+archive() { git -C "$repo" archive --format=tar --prefix="$root/" "refs/tags/$tag" | gzip -n > "$1"; }
+archive "$stage/first.tar.gz"
+archive "$stage/second.tar.gz"
+cmp -s "$stage/first.tar.gz" "$stage/second.tar.gz" || {
+  echo "flea-source-tarball: two builds of $tag differ, so its bytes are not reproducible" >&2; exit 1; }
+
+# Sample input: tar -tzf prints "flea-0.3.3/", "flea-0.3.3/Cargo.toml" and so on, so the first path segment is the root.
+roots=$(tar -tzf "$stage/first.tar.gz" | cut -d/ -f1 | sort -u)
+[ "$roots" = "$root" ] || {
+  echo "flea-source-tarball: the tarball's roots are '$roots', not '$root'" >&2; exit 1; }
+
+mkdir -p "$outdir"
+mv "$stage/first.tar.gz" "$outdir/$asset"
+echo "$outdir/$asset"

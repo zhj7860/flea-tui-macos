@@ -1,0 +1,100 @@
+import QtQuick
+import Quickshell.Io
+
+// The five second "gio mount -li" poll, lifted out of ui/NetworkMounts.qml whole so that file has
+// room in the 0.1.4 composition. The Service reads "text" when "listed" fires, and its own
+// pollMounts() is the only thing outside this file that calls poll().
+// -i rides along for ui/js/Phones.js: a phone volume's activation_root and can_mount print only
+// under it, and both spellings measured half a second on this box over three interleaved runs, with
+// no separation between the arms, because the cost is walking the volume monitors and not printing.
+Item {
+    id: root
+
+    // Nothing filesystem-watchable tells us when a share appears or drops: a mount materialises a
+    // directory under /run/user/1000/gvfs that inotify never reports an event for, measured on this box.
+    readonly property int pollMs: 5000
+    // A listing is bounded the same way a mount is in ui/NetworkMounts.qml. "gio mount -l" against a
+    // share whose server has stopped answering never returns, and an unbounded one froze the rail.
+    readonly property int timeoutMs: 10000
+    // The C locale ui/NetworkMounts.qml pins on its own gio calls, passed in so one property sets it.
+    property var environment: ({})
+    // The last listing that finished on time; a listing this component ended never replaces it.
+    property string text: ""
+
+    // The rail's NETWORK gate: true once the first listing answered, timed out or not, without replacing anything.
+    property bool answered: false
+
+    // The window-long host sets this: the 5 s poll runs only while a rail is loaded or an
+    // open or wait is in flight, so a hidden rail costs no gio and no mountinfo read. The
+    // last listing stands while it is off, the way 0.3.5 ran none.
+    property bool active: true
+
+    // Raised once "text" holds the new listing, so a handler that rebuilds reads it and not the last.
+    signal listed()
+
+    // A Process's own onExited can race its StdioCollector's text property, so the listing is also
+    // captured via onStreamFinished as a fallback; poll() clears it, because a fallback held over
+    // from the last listing would answer an empty one with the shares it found the time before.
+    property string _output: ""
+    // A re-read asked for mid-listing used to be dropped, leaving a just-mounted share to wait out
+    // the poll; this remembers it instead, and listProcess runs it the moment the listing ends.
+    property bool _pollAgain: false
+    // Cleared only when the next listing starts, never in onExited, so it still reads true while the
+    // ended listing's own stream finishes and cannot overwrite the last good listing with nothing.
+    property bool _timedOut: false
+
+    Timer {
+        interval: root.pollMs
+        running: root.active
+        repeat: true
+        triggeredOnStart: true
+        onTriggered: root.poll()
+    }
+
+    function poll() {
+        if (!root.active) return
+        if (listProcess.running) {
+            root._pollAgain = true
+            return
+        }
+        root._timedOut = false
+        root._output = ""
+        listProcess.running = true
+        listTimeout.restart()
+    }
+
+    Timer {
+        id: listTimeout
+        interval: root.timeoutMs
+        repeat: false
+        onTriggered: {
+            if (!listProcess.running)
+                return
+            // Ending it is what lets the next poll run at all; a listing nobody can end froze the rail.
+            root._timedOut = true
+            listProcess.running = false
+        }
+    }
+
+    Process {
+        id: listProcess
+        environment: root.environment
+        command: ["gio", "mount", "-li"]
+        stdout: StdioCollector { id: listOut; waitForEnd: true; onStreamFinished: if (!root._timedOut) root._output = listOut.text }
+        onExited: function () {
+            listTimeout.stop()
+            // A listing this timer ended collected nothing, and reading that as "no shares" would
+            // empty the rail, taking the Unmount action with it exactly when a server is misbehaving.
+            if (!root._timedOut) {
+                root.text = listOut.text || root._output || ""
+                root.listed()
+            }
+            // Last, so anything waiting on the answer reads the listing it answered with.
+            root.answered = true
+            if (root._pollAgain) {
+                root._pollAgain = false
+                root.poll()
+            }
+        }
+    }
+}

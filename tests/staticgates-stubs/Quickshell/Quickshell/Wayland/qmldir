@@ -1,0 +1,5 @@
+module Quickshell.Wayland
+typeinfo plugins.qmltypes
+WlrLayer 1.0 WlrLayer.qml
+WlrKeyboardFocus 1.0 WlrKeyboardFocus.qml
+ExclusionMode 1.0 ExclusionMode.qml

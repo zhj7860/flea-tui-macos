@@ -1,0 +1,32 @@
+#!/bin/bash
+# Is a process running, without the self-match that pgrep -f always has?
+#   tools/flea-running "sleep 3600"     prints matching pids, exits 0 when there are any
+#
+# pgrep -f matches its own command line, and any shell that mentions the pattern, so it answers "yes"
+# for a process that died minutes ago. It has done that three times on this project and once told the
+# oversight session a benchmark was running when none had been for an hour. The handoff bans the
+# shape; this exists so the correct form is the easy one to reach for.
+set -u
+
+pattern=${1:-}
+if [ -z "$pattern" ]; then
+  echo "usage: flea-running <exact-command-line>" >&2
+  exit 2
+fi
+
+# ps -eo args gives the command line with no pid column to match against, and the comparison is a
+# whole-string equality rather than a substring, so neither this script nor its caller can match.
+found=0
+while IFS= read -r line; do
+  [ "$line" = "$pattern" ] || continue
+  found=1
+done < <(ps -eo args=)
+
+if [ "$found" = 1 ]; then
+  # The pids, for a caller that wants to signal them by number rather than by pattern.
+  ps -eo pid=,args= | while read -r pid rest; do
+    [ "$rest" = "$pattern" ] && printf '%s\n' "$pid"
+  done
+  exit 0
+fi
+exit 1

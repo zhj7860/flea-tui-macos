@@ -1,0 +1,474 @@
+import QtQuick
+
+// Execute shipped callbacks and bindings without a native FileView or worker dependency.
+QtObject {
+    id: gate
+    property Item sandbox: Item {}
+    property int checks: 0
+    property int failures: 0
+    readonly property int remoteRowBytes: 600 * 1024
+    readonly property int remoteLimitBytes: 256 * 1024
+    readonly property int defaultReaderLimitBytes: 1024 * 1024
+    readonly property int geometryWidth: 400
+    // The hold checks: a list of holdContentPx in a view of holdViewPx, a hold waiting at holdAtPx for a place at holdSavedPx, a reader who moves to holdReaderPx.
+    readonly property int holdContentPx: 5000
+    readonly property int holdViewPx: 500
+    readonly property int holdAtPx: 100
+    readonly property int holdSavedPx: 300
+    readonly property int holdReaderPx: 40
+    // The by-block place: one built block and the view past its top edge.
+    readonly property int placeBlockIdx: 3
+    readonly property int placeBlockY: 1000
+    readonly property int placeBlockH: 200
+    readonly property int placeViewY: 1050
+    readonly property int placeOffsetPx: 50
+    readonly property int placeSmallPx: 800
+    readonly property int placeLastLen: 6
+    readonly property int placeBeginMode: 7
+
+    function readSource(path) {
+        var request = new XMLHttpRequest()
+        request.open("GET", Qt.resolvedUrl(path), false)
+        request.send()
+        return request.responseText
+    }
+
+    // Sample input: onMessage: function (messageObject) { if (...) return; ... }
+    function body(source, marker) {
+        var markerAt = source.indexOf(marker)
+        if (markerAt < 0)
+            throw new Error("missing callback " + marker)
+        var start = source.indexOf("{", markerAt)
+        var depth = 1
+        var end = start + 1
+        for (; depth && end < source.length; end++) {
+            if (source[end] === "{")
+                depth++
+            if (source[end] === "}")
+                depth--
+        }
+        return source.slice(start + 1, end - 1)
+    }
+
+    function check(ok, name) {
+        checks++
+        console.log((ok ? "ok " : "FAIL ") + name)
+        if (!ok)
+            failures++
+    }
+
+    function stateChecks(source) {
+        var file = { loaded: true }
+        var root = { active: true, tooLarge: false, readFailed: false, parseError: "",
+            parseSeq: 7, appliedSeq: 6, parsing: true, blockList: [], path: "/doc/A.md" }
+        // Sample input: readonly property bool loading: root.active && ... followed by status.
+        var loading = source.match(/readonly property bool loading:([\s\S]*?)readonly property string status:/)[1]
+        Object.defineProperty(root, "blocksReady", { get: function () {
+            return root.parseSeq === root.appliedSeq && !root.parsing
+        } })
+        Object.defineProperty(root, "loading", { get: function () {
+            return new Function("root", "file", "return " + loading)(root, file)
+        } })
+        Object.defineProperty(root, "status", { get: function () {
+            return new Function("root", "file", body(source, "readonly property string status:"))(root, file)
+        } })
+        var landed = new Function("root", "messageObject", body(source, "function landed(messageObject)"))
+        root.landed = function (messageObject) { landed(root, messageObject) }
+        var reply = new Function("root", "messageObject", body(source, "onMessage: function"))
+        reply(root, { seq: root.parseSeq, error: "probe worker fault" })
+        check(root.appliedSeq === root.parseSeq && !root.loading
+            && root.status === "This file could not be read.", "F40 worker error settles loading and status")
+
+        file.loaded = false
+        check(!root.loading, "F40 parse error stays settled with unloaded reader")
+        var markdown = { blocks: function () { return [] }, dirOf: function () { return "/doc" } }
+        var timer = { restart: function () {}, stop: function () {} }
+        var parserLoader = { active: false, item: { sendMessage: function () {} } }
+        var ask = new Function("root", "file", "Markdown", "parseFallback", "parserLoader",
+            body(source, "function askParse()"))
+        // The shipped dropParse, parseNow and restoreScroll bodies, bound to the stub root over an empty stub list.
+        var drop = new Function("root", body(source, "function dropParse()"))
+        var landing = new Function("root", "Markdown", "text", "dir", "chrome", "ink", "deep", body(source, "function parseNow("))
+        var restore = new Function("root", "body", body(source, "function restoreScroll()"))
+        var remember = new Function("root", "body", body(source, "function rememberScroll()"))
+        var list = { originY: 0, topMargin: 0, bottomMargin: 0, contentHeight: 0, height: 0, contentY: 0, contentItem: { children: [] } }
+        root.topBlockItem = function () { return placeHelper(source, "function topBlockItem()")(root, list) }
+        root.dropParse = function () { drop(root) }
+        // The worker's release is the pane's own and has no worker to reach here.
+        root.releaseWorker = function () {}
+        root.parseNow = function (text, dir, chrome, ink, deep) { landing(root, markdown, text, dir, chrome, ink, deep) }
+        root.restoreScroll = function () { restore(root, list) }
+        root.rememberScroll = function () { remember(root, list) }
+        root.askParse = function () {}
+        // File pointing belongs to quicklook-firstframe; the path handler only needs it callable here.
+        root.pointFile = function () {}
+        root.path = "/doc/B.md"
+        var tableRoute = { resets: 0, reset: function () { this.resets++ } }
+        new Function("root", "reloadCoalesce", "tableRoute", body(source, "    onPathChanged: {"))(root, { stop: function () {} }, tableRoute)
+        check(root.parseError === "" && root.status === "loading", "F41 unloaded path clears previous error")
+        check(tableRoute.resets === 1, "a path change forgets the old document's table places")
+        root.askParse = function () { ask(root, file, markdown, timer, parserLoader) }
+        root.parseError = "probe previous fault"
+        root.askParse()
+        check(root.parseError === "", "F41 askParse clears error before unloaded return")
+
+        file.loaded = true
+        root.parsing = true
+        markdown.blocks = function () { throw new Error("probe parse fault") }
+        var fallbackSource = source.slice(source.indexOf("id: parseFallback"))
+        var fallback = new Function("root", "Markdown", body(fallbackSource, "onTriggered:"))
+        root.askedText = "doc"
+        root.askedDir = "/doc"
+        var escaped = false
+        try {
+            fallback(root, markdown)
+        } catch (error) {
+            escaped = true
+        }
+        check(!escaped && root.parseError === "probe parse fault" && root.appliedSeq === root.parseSeq
+            && !root.loading && root.status === "This file could not be read.", "F42 throwing fallback settles error")
+
+        // A path change or a failed load drops keepScroll and leaves heldY, so the next place taken must clear it.
+        var held = { keepScroll: false, heldY: 40, savedY: 0, topBlockItem: function () { return null } }
+        remember(held, { contentY: 300 })
+        check(held.keepScroll && held.savedY === 300 && isNaN(held.heldY), "F43 a new place starts with no hold waiting")
+    }
+
+    // One shipped place helper bound to a stub root and list, run with the root's own helpers.
+    function placeHelper(source, header) {
+        var fn = new Function("root", "body", body(source, header))
+        return function (root, list) { return fn(root, list) }
+    }
+
+    // A stub root and list running the shipped place functions; assigning blockList resets the list to its top, as the real model does.
+    function holdStub(source) {
+        var list = { originY: 0, topMargin: 0, bottomMargin: 0, contentHeight: holdContentPx, height: holdViewPx, contentY: 0, contentItem: { children: [] } }
+        var root = { keepScroll: false, heldY: NaN, savedY: 0, settingBlocks: false, samePlacePx: 1, parseSeq: 3,
+            appliedSeq: 2, parsing: true, parseError: "", parsedOffThread: false, askedAny: true, blocksSet: 0 }
+        var blocks = []
+        Object.defineProperty(root, "blockList", { get: function () { return blocks },
+            set: function (value) { blocks = value; root.blocksSet++; list.contentY = 0 } })
+        var release = new Function("root", "body", body(source, "function releaseHeldPlace()"))
+        var remember = new Function("root", "body", body(source, "function rememberScroll()"))
+        var restore = new Function("root", "body", body(source, "function restoreScroll()"))
+        root.releaseHeldPlace = function () { release(root, list) }
+        root.topBlockItem = function () { return placeHelper(source, "function topBlockItem()")(root, list) }
+        root.rememberScroll = function () { remember(root, list) }
+        root.restoreScroll = function () { restore(root, list) }
+        return { root: root, list: list }
+    }
+
+    // A hold waits at holdAtPx for a place at holdSavedPx; the reader then moves to holdReaderPx and the hold is released.
+    function holdChecks(source) {
+        var parse = new Function("root", "Markdown", "text", "dir", "chrome", "ink", "deep", body(source, "function parseNow("))
+        var markdown = { blocks: function () { return ["parsed"] } }
+        var sync = holdStub(source)
+        sync.root.keepScroll = true
+        sync.root.savedY = holdSavedPx
+        sync.root.heldY = holdAtPx
+        sync.list.contentY = holdReaderPx
+        sync.root.releaseHeldPlace()
+        parse(sync.root, markdown, "text", "/doc", "chrome", "ink")
+        check(sync.list.contentY === holdReaderPx && !sync.root.keepScroll && isNaN(sync.root.heldY),
+            "F48 a hold released in flight lands at the reader's place (got " + sync.list.contentY + ")")
+
+        var worker = holdStub(source)
+        var landed = new Function("root", "messageObject", body(source, "function landed(messageObject)"))
+        worker.root.keepScroll = true
+        worker.root.savedY = holdSavedPx
+        worker.root.heldY = holdAtPx
+        worker.list.contentY = holdReaderPx
+        worker.root.releaseHeldPlace()
+        landed(worker.root, { seq: worker.root.parseSeq, error: "", blocks: ["parsed"] })
+        check(worker.list.contentY === holdReaderPx && !worker.root.keepScroll && isNaN(worker.root.heldY)
+            && worker.root.blocksSet === 1, "F49 a worker landing after a released hold lands at the reader's place (got "
+            + worker.list.contentY + ")")
+
+        // A parse that throws replaces no model, so it must take no place: nothing would land to release it.
+        var failing = holdStub(source)
+        failing.list.contentY = holdReaderPx
+        parse(failing.root, { blocks: function () { throw new Error("probe parse fault") } }, "text", "/doc", "chrome", "ink")
+        check(!failing.root.keepScroll && failing.root.blocksSet === 0 && !failing.root.settingBlocks
+            && failing.root.parseError === "probe parse fault", "F50 a parse that throws takes no place and replaces no model")
+    }
+
+    // A stub list with one built block, running the shipped by-block place helpers.
+    function blockStub(source, contentH, listLen, withLast) {
+        var calls = []
+        var kids = [{ blockIndex: placeBlockIdx, y: placeBlockY, height: placeBlockH }]
+        if (withLast)
+            kids.push({ blockIndex: listLen - 1, y: placeBlockY + placeBlockH + placeOffsetPx, height: placeBlockH })
+        var list = { originY: 0, topMargin: endInsetPx, bottomMargin: endInsetPx, contentHeight: contentH, height: endViewPx, contentY: 0,
+            contentItem: { children: kids }, calls: calls, positionViewAtIndex: function (idx, mode) { calls.push([idx, mode]) } }
+        var root = { keepScroll: false, heldY: NaN, savedY: 0, savedIndex: -1, savedOffset: 0, samePlacePx: 1, blockList: [] }
+        for (var i = 0; i < listLen; i++) root.blockList.push("b" + i)
+        var topFn = new Function("root", "body", body(source, "function topBlockItem()"))
+        var blockFn = new Function("root", "body", "i", body(source, "function blockItem("))
+        var rememberFn = new Function("root", "body", body(source, "function rememberScroll()"))
+        var restoreFn = new Function("root", "body", "ListView", body(source, "function restoreScroll()"))
+        root.topBlockItem = function () { return topFn(root, list) }
+        root.blockItem = function (i) { return blockFn(root, list, i) }
+        root.rememberScroll = function () { rememberFn(root, list) }
+        root.restoreScroll = function (lv) { restoreFn(root, list, lv) }
+        return { root: root, list: list }
+    }
+
+    // The by-block place: remember saves the block, restore asks for it, an unbuilt end never clamps and a built end does.
+    function blockPlaceChecks(source) {
+        var begin = { Beginning: placeBeginMode }
+        var rem = blockStub(source, endContentPx, placeBlockIdx + 1, false)
+        rem.list.contentY = placeViewY
+        rem.root.rememberScroll()
+        check(rem.root.savedIndex === placeBlockIdx && rem.root.savedOffset === placeOffsetPx
+            && rem.root.savedY === placeViewY && rem.root.keepScroll && isNaN(rem.root.heldY), "F52 rememberScroll saves the built block and its offset")
+        var settled = blockStub(source, endContentPx, placeBlockIdx + 1, false)
+        settled.root.savedIndex = placeBlockIdx
+        settled.root.savedOffset = placeOffsetPx
+        settled.root.savedY = placeViewY
+        settled.root.keepScroll = true
+        settled.list.contentY = 0
+        settled.root.restoreScroll(begin)
+        check(settled.list.calls.length === 1 && settled.list.calls[0][0] === placeBlockIdx
+            && settled.list.calls[0][1] === placeBeginMode, "F52 restoreScroll asks for the saved block at the beginning")
+        check(settled.list.contentY === placeBlockY + placeOffsetPx && !settled.root.keepScroll && isNaN(settled.root.heldY),
+            "F52 restoreScroll lands at the block top plus the saved offset (got " + settled.list.contentY + ")")
+        var smallEnd = placeSmallPx - endViewPx + endInsetPx
+        var unbuilt = blockStub(source, placeSmallPx, placeLastLen, false)
+        unbuilt.root.savedIndex = placeBlockIdx
+        unbuilt.root.savedOffset = placeOffsetPx
+        unbuilt.root.savedY = placeViewY
+        unbuilt.root.keepScroll = true
+        unbuilt.list.contentY = 0
+        unbuilt.root.restoreScroll(begin)
+        check(unbuilt.list.contentY === placeBlockY + placeOffsetPx && !unbuilt.root.keepScroll && isNaN(unbuilt.root.heldY),
+            "F52 a place past an estimated end is not clamped while the last block is unbuilt (got " + unbuilt.list.contentY + ")")
+        var built = blockStub(source, placeSmallPx, placeLastLen, true)
+        built.root.savedIndex = placeBlockIdx
+        built.root.savedOffset = placeOffsetPx
+        built.root.savedY = placeViewY
+        built.root.keepScroll = true
+        built.list.contentY = 0
+        built.root.restoreScroll(begin)
+        check(built.list.calls.length === 1 && built.list.calls[0][0] === placeBlockIdx
+            && built.list.contentY === smallEnd && built.root.keepScroll && built.root.heldY === smallEnd,
+            "F52 a place past the end is clamped once the last block is built (got " + built.list.contentY + ")")
+    }
+
+    // The reader's place at the end of the list: a block above the end growing must not leave them short of it.
+    readonly property int endContentPx: 3000
+    readonly property int endViewPx: 500
+    readonly property int endInsetPx: 16
+    readonly property int endGrowPx: 80
+    readonly property real endRoundingPx: 0.5
+    function endStub(source) {
+        var list = { originY: 0, topMargin: endInsetPx, bottomMargin: endInsetPx, contentHeight: endContentPx, height: endViewPx, contentY: 0 }
+        var root = { seenEnd: 0, endBuilt: false, lastBuilt: true, snappingToEnd: false, samePlacePx: 1, blockList: ["first", "last"] }
+        root.blockItem = function () { return root.lastBuilt ? {} : null }
+        var note = new Function("root", body(source, "function noteEnd()"))
+        root.noteEnd = function () { note(root) }
+        var hold = new Function("root", "body", body(source, "function holdEnd()"))
+        root.holdEnd = function () { hold(root, list) }
+        // The list's own height change: the new height is seen by the shipped handler, as onContentHeightChanged does.
+        root.grow = function (by) { list.contentHeight += by; root.holdEnd() }
+        root.holdEnd()
+        return { root: root, list: list }
+    }
+
+    function endChecks(source) {
+        var end = endContentPx - endViewPx + endInsetPx
+        var held = endStub(source)
+        held.list.contentY = end
+        held.root.grow(endGrowPx)
+        check(held.list.contentY === end + endGrowPx, "N1 a view that sat at its end follows a block that grows (got " + held.list.contentY + ")")
+        held.root.grow(endGrowPx)
+        check(held.list.contentY === end + 2 * endGrowPx && !held.root.snappingToEnd, "N1 it keeps following the next block that grows")
+
+        var near = endStub(source)
+        near.list.contentY = end - endRoundingPx
+        near.root.grow(endGrowPx)
+        check(near.list.contentY === end + endGrowPx, "N1 a view within a pixel of its end counts as at it (got " + near.list.contentY + ")")
+
+        var away = endStub(source)
+        away.list.contentY = end - endGrowPx
+        away.root.grow(endGrowPx)
+        check(away.list.contentY === end - endGrowPx, "N1 a reader who left the end is not pulled back (got " + away.list.contentY + ")")
+
+        var top = endStub(source)
+        top.list.contentY = -endInsetPx
+        top.root.grow(endGrowPx)
+        check(top.list.contentY === -endInsetPx, "N1 a view at the top stays there when a block grows (got " + top.list.contentY + ")")
+
+        var fits = endStub(source)
+        fits.list.contentHeight = endViewPx - endGrowPx
+        fits.root.holdEnd()
+        fits.list.contentY = -endInsetPx
+        fits.root.grow(2 * endGrowPx)
+        check(fits.list.contentY === -endInsetPx, "N1 a document that fitted the view is not scrolled when it grows past it (got " + fits.list.contentY + ")")
+
+        var shrunk = endStub(source)
+        shrunk.list.contentY = end
+        shrunk.root.grow(-endGrowPx)
+        check(shrunk.list.contentY === end, "N1 a list that shrinks moves nothing")
+
+        var unbuilt = endStub(source)
+        unbuilt.root.lastBuilt = false
+        unbuilt.root.holdEnd()
+        unbuilt.list.contentY = end
+        unbuilt.root.grow(endGrowPx)
+        check(unbuilt.list.contentY === end, "N1 a reader at an estimated end, the last block unbuilt, is not run to the new end (got " + unbuilt.list.contentY + ")")
+
+        var building = endStub(source)
+        building.root.lastBuilt = false
+        building.root.holdEnd()
+        building.list.contentY = end
+        building.root.lastBuilt = true
+        building.root.grow(endGrowPx)
+        check(building.list.contentY === end, "N1 the growth that builds the last block does not carry the reader to it (got " + building.list.contentY + ")")
+        building.list.contentY = end + endGrowPx
+        building.root.grow(endGrowPx)
+        check(building.list.contentY === end + 2 * endGrowPx, "N1 once the reader is at the drawn end, the next growth is followed (got " + building.list.contentY + ")")
+    }
+
+    // A refill that grows the list on every contentY write must not recurse: the snap writes once and the settling height is only seen.
+    function reentryChecks(source) {
+        var held = endStub(source)
+        var writes = 0
+        var stored = endContentPx - endViewPx + endInsetPx
+        Object.defineProperty(held.list, "contentY", {
+            get: function () { return stored },
+            set: function (value) {
+                stored = value
+                writes++
+                held.list.contentHeight += endGrowPx
+                held.root.holdEnd()
+            }
+        })
+        // The stub's own first holdEnd primed these, so the growth below reaches the snap and no earlier exit.
+        var primed = held.root.endBuilt && held.root.seenEnd === endContentPx
+        var error = ""
+        try {
+            held.root.grow(endGrowPx)
+        } catch (thrown) {
+            error = String(thrown)
+        }
+        check(primed && error === "" && writes === 1 && !held.root.snappingToEnd, "N1 a height that settles under the snap does not re-enter it (primed " + primed + ", endBuilt " + held.root.endBuilt + ", seenEnd " + held.root.seenEnd + " of " + endContentPx + ", writes " + writes + ", snappingToEnd " + held.root.snappingToEnd + " " + error + ")")
+    }
+
+    function lazyChecks() {
+        var source = readSource("markdown-lazy.qml")
+        var shell = { done: false, failed: false, log: function () {}, quit: function () {},
+            fail: function () { this.failed = true } }
+        var md = { contentReady: true, blockList: ["drawn"], parsedOffThread: true,
+            bodyItem: { forceLayout: function () {} }, delegateCount: function () { return 0 } }
+        new Function("shell", "md", body(source, "function report()"))(shell, md)
+        check(shell.failed, "F39 zero delegates fail after forceLayout")
+    }
+
+    // Sample input: readonly property bool tooLarge: root.size > root.maxBytes, answering " item.size > item.maxBytes".
+    function expression(source, pattern) {
+        var found = source.match(pattern)
+        if (!found)
+            throw new Error("missing shipped expression " + pattern)
+        return found[1].replace(/\broot\./g, "item.")
+    }
+
+    // The reader gate: PreviewColumn's onLoaded wiring driving the shipped tooLarge and FileView path expressions.
+    function readerGate(markdownSource, columnSource) {
+        var callback = body(columnSource.slice(columnSource.indexOf("id: markdownLoader")), "onLoaded:")
+        var tooLarge = expression(markdownSource, /readonly property bool tooLarge:([^\n]*)/)
+        // Sample input: function pointFile() { then var want = (root.active && !root.tooLarge) ? root.path : "" on its own line.
+        var readerPath = expression(body(markdownSource, "function pointFile()"), /\n\s*var want =([^\n]*)/)
+        // The loader gate the callback binds: PreviewColumn's shipped expression over a remote Markdown row.
+        var active = new Function("item", "Facts", "return" + expression(columnSource, /readonly property bool markdownActive:([^\n]*)/))(
+            { visible: true, manualHold: false, rowState: "text", isMarkdownRow: true, isDocumentRow: true, isHtmlRow: false, selectionCount: 1 }, { TEXT: "text" })
+        var probe = Qt.createQmlObject('import QtQuick\nQtObject {\n'
+            + 'id: item\nproperty var root: ({ path: "/remote/A.md", row: { s: ' + remoteRowBytes + ' }, '
+            + 'markdownActive: ' + active + ', textLimit: ' + remoteLimitBytes + ', truncateText: true, isHtmlRow: false })\n'
+            + 'property var facts: ({ TEXT: "text" })\n'
+            + 'property bool active: false\nproperty string path: ""\nproperty int size: 0\n'
+            + 'property int maxBytes: ' + defaultReaderLimitBytes + '\nproperty bool truncate: false\nproperty bool compact: false\nproperty bool externalScrollBars: false\nproperty string view: "rendered"\n'
+            + 'property var seen: []\nreadonly property bool tooLarge:' + tooLarge + '\n'
+            + 'readonly property string readerPath:' + readerPath + '\n'
+            + 'onReaderPathChanged: seen.push(readerPath)\n'
+            + 'function apply() {' + callback.replace(/Facts\./g, "facts.")
+            + '} }', gate.sandbox)
+        // Evaluate the observer before installing bindings so intermediate reader paths are recorded.
+        var initialPath = probe.readerPath
+        probe.apply()
+        // The row is over the limit from the start, so any path the reader saw on the way is an exposure.
+        var safe = probe.seen.every(function (path) { return path === "" })
+        var sized = probe.size === remoteRowBytes
+        var guarded = initialPath === "" && safe && probe.active && sized
+            && probe.maxBytes === remoteLimitBytes && probe.readerPath === ""
+        probe.size = remoteLimitBytes
+        var allowed = probe.readerPath === probe.root.path && probe.seen.length > 0
+        probe.destroy()
+        return { guarded: guarded, allowed: allowed, sized: sized, exposed: !safe }
+    }
+
+    function bindingChecks(source) {
+        var column = readSource("../ui/PreviewColumn.qml")
+        var shipped = readerGate(source, column)
+        check(shipped.guarded, "F47 oversized remote row never exposes FileView path")
+        // The column always requests rendered documents and reads no Quick Look flip or stored choice.
+        var wiring = body(column.slice(column.indexOf("id: markdownLoader")), "onLoaded:")
+        check(wiring.indexOf("item.view") < 0 && wiring.indexOf("markdownSource") < 0 && wiring.indexOf("ViewState") < 0,
+            "F51 the column sets no document view and reads no Quick Look flip or stored choice")
+        check(shipped.allowed, "F47 allowed row exposes reader path")
+        var unguardedPath = source.replace("(root.active && !root.tooLarge) ? root.path", "root.active ? root.path")
+        check(unguardedPath !== source && !readerGate(unguardedPath, column).guarded,
+            "F47 control: a reader path without the tooLarge guard is caught")
+        var blindLimit = source.replace("readonly property bool tooLarge: root.size > root.maxBytes",
+            "readonly property bool tooLarge: false")
+        check(blindLimit !== source && !readerGate(blindLimit, column).guarded,
+            "F47 control: a tooLarge without its comparison is caught")
+        var sizeLine = "item.size = Qt.binding(function () { return root.row ? root.row.s : 0 })"
+        var lastLine = "item.truncate = Qt.binding(function () { return root.truncateText })"
+        var lateSize = column.replace(sizeLine, "").replace(lastLine, lastLine + "\n" + sizeLine)
+        var late = readerGate(source, lateSize)
+        // The moved binding still ran, so the row reached its size and only the path seen on the way fails the gate.
+        check(lateSize.indexOf(sizeLine) > lateSize.indexOf(lastLine) && late.sized && late.exposed && !late.guarded,
+            "F47 control: a size bound after active is caught")
+    }
+
+    function commentChecks(source) {
+        var quick = readSource("../ui/Preview.qml")
+        var column = readSource("../ui/PreviewColumn.qml")
+        check(!/\/\/ The worker owns[^\n]*\n\s*\/\//.test(source)
+            && !/\/\/ The Markdown bar[^\n]*\n\s*\/\//.test(quick)
+            && !/\/\/ The lazy Markdown pane[^\n]*\n\s*\/\//.test(column)
+            && quick.indexOf("cost nothing") < 0, "F45 comments state one-line constraints and null assertion")
+    }
+
+    function geometryChecks() {
+        // The runner supplies the shipped list and text components beside a local Theme for pure qml6.
+        var module = Qt.resolvedUrl(Qt.application.arguments[Qt.application.arguments.length - 1])
+        var probe = Qt.createQmlObject('import QtQuick\nimport "' + module + '" as Flea\nFlea.MarkdownList {\nwidth: ' + geometryWidth + '\n'
+            + 'list: ({ type: "list", ordered: true, start: 9, items: ["nine", "ten"] })\n}', gate.sandbox)
+        Qt.callLater(function () {
+            var rows = Array.prototype.filter.call(probe.children, function (child) {
+                return child.objectName === "listRow"
+            })
+            check(rows.length === 2 && rows[0].children[1].x > 0
+                && rows[0].children[1].x === rows[1].children[1].x, "F44 ordered items 9 and 10 share text x")
+            probe.destroy()
+            console.log("MARKDOWN_PREVIEW_STATE " + checks + " checks, " + failures + " failed")
+            Qt.exit(failures ? 1 : 0)
+        })
+    }
+
+    Component.onCompleted: Qt.callLater(run)
+
+    function run() {
+        var source = readSource("../ui/PreviewMarkdown.qml")
+        stateChecks(source)
+        holdChecks(source)
+        blockPlaceChecks(source)
+        endChecks(source)
+        reentryChecks(source)
+        lazyChecks()
+        bindingChecks(source)
+        commentChecks(source)
+        geometryChecks()
+    }
+}

@@ -1,0 +1,136 @@
+name: Candidate
+
+# Replays release.yml's verify and build jobs, up to publication, on a release candidate before it is tagged.
+# A controller pushes the candidate as candidate/<version> with the VPS token, which cannot push workflow files.
+on:
+  push:
+    branches: ['candidate/**']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: candidate-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  # release.yml's verify, minus the tag checks: Cargo.toml's version stands in for the tag's.
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # A command this replay runs that release.yml no longer runs means the two have drifted apart.
+      - name: The replay still matches release.yml
+        run: |
+          set -euo pipefail
+          for line in \
+            'sudo apt-get install -y -o Acquire::Retries=3 libarchive-tools libglib2.0-bin libvulkan1 bubblewrap' \
+            'run: cargo test --release --locked' \
+            'run: cargo build --release --locked' \
+            'run: packaging/flea-bin-tarball target/release/flea "$VERSION" "$ARCH" dist' \
+            'versioned_pkgbuilds=(PKGBUILD packaging/flea-bin/PKGBUILD packaging/flea/PKGBUILD)' \
+            'aur_pkgbuilds=(packaging/flea-bin/PKGBUILD packaging/flea/PKGBUILD packaging/flea-git/PKGBUILD)'; do
+            grep -qF -- "$line" .github/workflows/release.yml \
+              || { echo "::error::release.yml no longer runs: $line; update candidate.yml with it"; exit 1; }
+          done
+
+      - id: check
+        name: Cargo.toml and every PKGBUILD agree
+        run: |
+          set -euo pipefail
+          # Sample input: Cargo.toml line `version = "0.3.3"`.
+          version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Cargo.toml version '$version' is not X.Y.Z"; exit 1; }
+          fail=0
+          check() { # check <what> <actual> <expected>
+            if [ "$2" != "$3" ]; then
+              echo "::error::$1 is '$2' but Cargo.toml says '$3'"; fail=1
+            fi
+          }
+          versioned_pkgbuilds=(PKGBUILD packaging/flea-bin/PKGBUILD packaging/flea/PKGBUILD)
+          aur_pkgbuilds=(packaging/flea-bin/PKGBUILD packaging/flea/PKGBUILD packaging/flea-git/PKGBUILD)
+          for pkgbuild in "${versioned_pkgbuilds[@]}"; do
+            # Sample input: PKGBUILD line `pkgver=0.3.3`.
+            check "$pkgbuild pkgver" "$(grep -m1 '^pkgver=' "$pkgbuild" | cut -d= -f2)" "$version"
+          done
+          closure() {
+            bash -c 'source "./$1"; printf "%s\n" "depends:" "${depends[@]}" "optdepends:" "${optdepends[@]}"' _ "$1"
+          }
+          # Sample input: from `package() {` to the next line that is exactly `}`, minus comments, blank lines, the cd line and the binary line.
+          body() { sed -n '/^package() {/,/^}/p' "$1" | grep -v -E '^[[:space:]]*(#|$)|^  cd |/usr/bin/flea"$'; }
+          for pkgbuild in "${aur_pkgbuilds[@]}"; do
+            if ! diff <(closure PKGBUILD) <(closure "$pkgbuild"); then
+              echo "::error::$pkgbuild's depends or optdepends differ from PKGBUILD's"; fail=1
+            fi
+            if ! diff <(body PKGBUILD) <(body "$pkgbuild"); then
+              echo "::error::$pkgbuild's package() has drifted from PKGBUILD's"; fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ] || exit 1
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "verified candidate $version at $GITHUB_SHA"
+
+  # release.yml's build job without the artifact upload: the same runners, packages, tests and tarball check.
+  build:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        with:
+          toolchain: stable
+
+      - name: Install what the test suite shells out to
+        run: |
+          set -eu
+          sudo apt-get update -o Acquire::Retries=3
+          sudo apt-get install -y -o Acquire::Retries=3 libarchive-tools libglib2.0-bin libvulkan1 bubblewrap
+
+      - name: Test
+        run: cargo test --release --locked
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Stage the flea-bin tarball
+        run: packaging/flea-bin-tarball target/release/flea "$VERSION" "$ARCH" dist
+
+      - name: The tarball holds every path flea-bin's package() installs
+        run: |
+          set -euo pipefail
+          unpacked=$(mktemp -d)
+          tar -xzf "dist/flea-v$VERSION-linux-$ARCH.tar.gz" -C "$unpacked"
+          cd "$unpacked/flea-$VERSION-linux-$ARCH"
+          # Sample input: `  install -Dm644 packaging/flea.portal -t "$pkgdir/usr/share/xdg-desktop-portal/portals"`.
+          # shellcheck disable=SC2016 # the pattern matches a literal $pkgdir
+          sources=$(sed -n '/^package() {/,/^}/p' "$GITHUB_WORKSPACE/packaging/flea-bin/PKGBUILD" \
+            | grep -E '^[[:space:]]*install ' | tr -s ' ' '\n' | grep -vE '^(|install|-[A-Za-z0-9]+|"?\$pkgdir.*)$') \
+            || { echo "::error::no install path could be read from packaging/flea-bin/PKGBUILD's package()"; exit 1; }
+          missing=0
+          while read -r source; do
+            compgen -G "$source" >/dev/null || {
+              echo "::error::flea-bin's package() installs $source, which packaging/flea-bin-tarball did not stage"; missing=1; }
+          done <<< "$sources"
+          echo "checked $(wc -l <<< "$sources") paths flea-bin's package() installs"
+          exit "$missing"

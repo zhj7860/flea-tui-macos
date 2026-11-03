@@ -1,0 +1,227 @@
+#!/usr/bin/python3
+
+# Flea's MPRIS player: the name a desktop's media keys and media widgets find while a preview plays.
+
+# Fed one JSON state line per status, track or seek change on stdin, it answers the bus and prints one command per line on stdout (Play, Pause, PlayPause, Stop, Seek <ms>, SetPosition <ms>); EOF ends it, and the name is taken on the first line.
+
+# Python and gi, alongside tools/flea-filemanager1: python-gobject is already a Flea dependency.
+
+# State line, times in milliseconds: {"status":"Playing","title":"a.mp4","url":"file:///a.mp4","length":6000,"position":0,"seeked":false}
+
+import json
+import os
+import sys
+
+import gi
+
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio, GLib
+
+BUS_PREFIX = "org.mpris.MediaPlayer2.flea.instance"
+OBJECT_PATH = "/org/mpris/MediaPlayer2"
+ROOT_IFACE = "org.mpris.MediaPlayer2"
+PLAYER_IFACE = "org.mpris.MediaPlayer2.Player"
+TRACK_PREFIX = "/com/thisisgm/flea/track/"
+STATUSES = ("Playing", "Paused", "Stopped")
+
+INTROSPECTION = """
+<node>
+  <interface name='org.mpris.MediaPlayer2'>
+    <method name='Raise'/>
+    <method name='Quit'/>
+    <property name='CanQuit' type='b' access='read'/>
+    <property name='CanRaise' type='b' access='read'/>
+    <property name='HasTrackList' type='b' access='read'/>
+    <property name='Identity' type='s' access='read'/>
+    <property name='DesktopEntry' type='s' access='read'/>
+    <property name='SupportedUriSchemes' type='as' access='read'/>
+    <property name='SupportedMimeTypes' type='as' access='read'/>
+  </interface>
+  <interface name='org.mpris.MediaPlayer2.Player'>
+    <method name='Next'/>
+    <method name='Previous'/>
+    <method name='Pause'/>
+    <method name='PlayPause'/>
+    <method name='Stop'/>
+    <method name='Play'/>
+    <method name='Seek'><arg type='x' name='Offset' direction='in'/></method>
+    <method name='SetPosition'>
+      <arg type='o' name='TrackId' direction='in'/>
+      <arg type='x' name='Position' direction='in'/>
+    </method>
+    <method name='OpenUri'><arg type='s' name='Uri' direction='in'/></method>
+    <signal name='Seeked'><arg type='x' name='Position'/></signal>
+    <property name='PlaybackStatus' type='s' access='read'/>
+    <property name='Rate' type='d' access='read'/>
+    <property name='Metadata' type='a{sv}' access='read'/>
+    <property name='Position' type='x' access='read'/>
+    <property name='MinimumRate' type='d' access='read'/>
+    <property name='MaximumRate' type='d' access='read'/>
+    <property name='CanGoNext' type='b' access='read'/>
+    <property name='CanGoPrevious' type='b' access='read'/>
+    <property name='CanPlay' type='b' access='read'/>
+    <property name='CanPause' type='b' access='read'/>
+    <property name='CanSeek' type='b' access='read'/>
+    <property name='CanControl' type='b' access='read'/>
+  </interface>
+</node>
+"""
+
+
+def say(text):
+    sys.stderr.write("flea-mpris: %s\n" % text)
+
+
+def send(line):
+    os.write(1, (line + "\n").encode())
+
+
+class Player:
+    def __init__(self, loop):
+        self.loop = loop
+        self.connection = None
+        self.owner = 0
+        self.pending = b""
+        self.status = "Stopped"
+        self.title = ""
+        self.url = ""
+        self.length = 0
+        self.position = 0
+        self.stamp = GLib.get_monotonic_time()
+        self.track = 0
+        self.nodes = Gio.DBusNodeInfo.new_for_xml(INTROSPECTION)
+
+    # Microseconds, as the interface counts: the last reported position plus the time since, while playing.
+    def now(self):
+        elapsed = (GLib.get_monotonic_time() - self.stamp) if self.status == "Playing" else 0
+        position = self.position * 1000 + elapsed
+        return min(position, self.length * 1000) if self.length > 0 else position
+
+    def metadata(self):
+        data = {
+            "mpris:trackid": GLib.Variant("o", TRACK_PREFIX + str(self.track)),
+            "mpris:length": GLib.Variant("x", self.length * 1000),
+            "xesam:title": GLib.Variant("s", self.title),
+            "xesam:url": GLib.Variant("s", self.url),
+        }
+        return GLib.Variant("a{sv}", data)
+
+    def properties(self, iface):
+        if iface == ROOT_IFACE:
+            return {
+                "CanQuit": GLib.Variant("b", False),
+                "CanRaise": GLib.Variant("b", False),
+                "HasTrackList": GLib.Variant("b", False),
+                "Identity": GLib.Variant("s", "Flea"),
+                "DesktopEntry": GLib.Variant("s", "com.thisisgm.flea"),
+                "SupportedUriSchemes": GLib.Variant("as", ["file"]),
+                "SupportedMimeTypes": GLib.Variant("as", []),
+            }
+        return {
+            "PlaybackStatus": GLib.Variant("s", self.status),
+            "Rate": GLib.Variant("d", 1.0),
+            "Metadata": self.metadata(),
+            "Position": GLib.Variant("x", self.now()),
+            "MinimumRate": GLib.Variant("d", 1.0),
+            "MaximumRate": GLib.Variant("d", 1.0),
+            "CanGoNext": GLib.Variant("b", False),
+            "CanGoPrevious": GLib.Variant("b", False),
+            "CanPlay": GLib.Variant("b", True),
+            "CanPause": GLib.Variant("b", True),
+            "CanSeek": GLib.Variant("b", True),
+            "CanControl": GLib.Variant("b", True),
+        }
+
+    def on_get(self, _connection, _sender, _path, iface, name):
+        return self.properties(iface).get(name)
+
+    def on_call(self, _connection, _sender, _path, iface, method, params, invocation):
+        if iface == PLAYER_IFACE:
+            args = params.unpack()
+            if method in ("Play", "Pause", "PlayPause", "Stop"):
+                send(method)
+            elif method == "Seek":
+                send("Seek %d" % (args[0] // 1000))
+            elif method == "SetPosition" and args[0] == TRACK_PREFIX + str(self.track):
+                send("SetPosition %d" % (args[1] // 1000))
+        invocation.return_value(None)
+
+    def emit(self, iface, changed):
+        if self.connection is None:
+            return
+        body = GLib.Variant("(sa{sv}as)", (iface, changed, []))
+        self.connection.emit_signal(None, OBJECT_PATH, "org.freedesktop.DBus.Properties",
+                                    "PropertiesChanged", body)
+
+    # One state line: what changed is announced, and a seek is announced as one.
+    def on_line(self, line):
+        try:
+            state = json.loads(line)
+            status = state["status"]
+            title, url = str(state.get("title", "")), str(state.get("url", ""))
+            length, position = int(state.get("length", 0)), int(state.get("position", 0))
+        except (ValueError, KeyError, TypeError):
+            say("a state line was refused: %s" % line[:120])
+            return
+        if status not in STATUSES:
+            say("a state line named the status %r, which is not one" % status)
+            return
+        changed = {}
+        if status != self.status:
+            changed["PlaybackStatus"] = GLib.Variant("s", status)
+        if (title, url, length) != (self.title, self.url, self.length):
+            if (title, url) != (self.title, self.url):
+                self.track += 1
+            self.title, self.url, self.length = title, url, length
+            changed["Metadata"] = self.metadata()
+        self.status = status
+        self.position = position
+        self.stamp = GLib.get_monotonic_time()
+        if self.owner == 0:
+            self.owner = Gio.bus_own_name(Gio.BusType.SESSION, BUS_PREFIX + str(os.getpid()),
+                                          Gio.BusNameOwnerFlags.NONE, self.on_bus_acquired, None,
+                                          self.on_name_lost)
+            return
+        if changed:
+            self.emit(PLAYER_IFACE, changed)
+        if state.get("seeked") is True and self.connection is not None:
+            self.connection.emit_signal(None, OBJECT_PATH, PLAYER_IFACE, "Seeked",
+                                        GLib.Variant("(x)", (position * 1000,)))
+
+    def on_bus_acquired(self, connection, _name):
+        self.connection = connection
+        for iface in (ROOT_IFACE, PLAYER_IFACE):
+            connection.register_object(OBJECT_PATH, self.nodes.lookup_interface(iface),
+                                       self.on_call, self.on_get, None)
+
+    def on_name_lost(self, _connection, _name):
+        say("the name was lost, so there is no player to keep")
+        self.loop.quit()
+
+    def on_input(self, _fd, condition):
+        data = os.read(0, 65536) if condition & GLib.IOCondition.IN else b""
+        if not data:
+            self.loop.quit()
+            return GLib.SOURCE_REMOVE
+        *lines, self.pending = (self.pending + data).split(b"\n")
+        for line in lines:
+            if line:
+                self.on_line(line.decode("utf-8", "replace"))
+        return GLib.SOURCE_CONTINUE
+
+
+def main():
+    loop = GLib.MainLoop()
+    player = Player(loop)
+    GLib.io_add_watch(0, GLib.PRIORITY_DEFAULT, GLib.IOCondition.IN | GLib.IOCondition.HUP,
+                      player.on_input)
+    try:
+        loop.run()
+    finally:
+        if player.owner:
+            Gio.bus_unown_name(player.owner)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,147 @@
+#!/bin/bash
+. "$(dirname "$0")/headless-commons.sh"
+# The preview swap keeps the old picture until the new preview is whole, in the
+# columns view and in Quick Look; a hold past the cap falls back to loading.
+# Before it, a cursor move drew the next preview half-built: v0.3.4 shows 145 to 151
+# mid frames over 18 column moves and 13 to 15 over 16 Quick Look moves, measured
+# headless through the atomic-evidence harness (see preview-moves.txt in the plan).
+# Offscreen, so it needs no display and no lock.
+set -u
+cd "$(dirname "$0")/.." || exit 1
+
+pass=0
+fail=0
+ok()  { printf 'ok   %s\n' "$*"; pass=$((pass+1)); }
+bad() { printf 'FAIL %s\n' "$*"; fail=$((fail+1)); }
+
+for tool in qs; do
+    command -v "$tool" >/dev/null || { echo "preview-swap.sh: $tool is not installed"; exit 1; }
+done
+
+. "$PWD/tools/flea-sandbox-guard"
+sandbox_forbidden /tmp && sandbox_refuse "preview-swap: /tmp is inside a forbidden test target"
+swap_root=$(mktemp -d /tmp/flea-preview-swap.XXXXXXXX) || exit 1
+FIXTURE_ROOT=$swap_root
+sandbox_root_ok
+swap_root=$SANDBOX_ROOT
+readonly swap_root
+printf 'Flea preview swap sandbox\n' > "$swap_root/$SANDBOX_MARKER" || exit 1
+swap_work="$swap_root/work"
+readonly swap_work
+cleanup() {
+    local result=$?
+    trap - EXIT
+    sandbox_remove "$swap_work"
+    exit "$result"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+sandbox_scratch "$swap_work"
+mkdir -p "$swap_work"/{config,home,runtime,tmp} "$swap_work"/frames-column "$swap_work"/frames-quicklook || exit 1
+chmod 700 "$swap_work/runtime" || exit 1
+ln -s "$PWD/tests/preview-swap.qml" "$swap_work/config/shell.qml" || exit 1
+headless_commons "$swap_work" || exit 1
+ln -s /usr/share/omarchy/shell/Ui "$swap_work/config/Ui" || exit 1
+
+run_surface() {
+    # One local per line: bash expands every word of a local before assigning any, so out would read an unset surface.
+    local surface="$1" direct="${2:-0}" early="${3:-0}" status
+    local out="$swap_work/frames-$surface" log="$swap_root/$surface.log"
+    [ "$direct" == 1 ] && out="$swap_work/frames-$surface-direct" && log="$swap_root/$surface-direct.log"
+    [ "$early" == 1 ] && out="$swap_work/frames-$surface-early" && log="$swap_root/$surface-early.log"
+    mkdir -p "$out" || exit 1
+    # Software rendering with a 16 ms update interval samples about one frame per vsync.
+    # The harness ends itself with a kill, so the subshell keeps bash's "Terminated" notice out of the report.
+    ( env -u DISPLAY -u WAYLAND_DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE \
+        HOME="$swap_work/home" XDG_RUNTIME_DIR="$swap_work/runtime" TMPDIR="$swap_work/tmp" \
+        XDG_CONFIG_HOME="$swap_work/home/.config" XDG_STATE_HOME="$swap_work/home/.local/state" \
+        XDG_CACHE_HOME="$swap_work/home/.cache" \
+        QT_QPA_PLATFORM=offscreen QT_QPA_PLATFORMTHEME=generic QT_QUICK_BACKEND=software QT_QPA_UPDATE_IDLE_TIME=16 \
+        QT_FORCE_STDERR_LOGGING=1 \
+        PREVIEW_SWAP_UI="$PWD/ui" PREVIEW_SWAP_SURFACE="$surface" PREVIEW_SWAP_OUT="$out" \
+        PREVIEW_SWAP_DIRECT="$direct" PREVIEW_SWAP_EARLY="$early" \
+        timeout 90 qs -p "$swap_work/config" > "$log" 2>&1; exit $? ) 2>/dev/null
+    status=$?
+    if grep -q 'PREVIEWSWAP FAIL' "$log" || ! grep -q 'PREVIEWSWAP DONE' "$log"; then
+        bad "$surface: the harness did not finish (qs exit $status): $(grep -a 'PREVIEWSWAP FAIL' "$log" | head -1)"
+        return
+    fi
+    judge "$surface" "$direct" "$early" "$out" "$log"
+}
+
+# Sample input, one harness line: 'PREVIEWSWAP DONE holds=18 fallbacks=0 bursts=0 held=210 mid=0 loading=0 early=18'.
+judge() {
+    local surface="$1" direct="$2" early="$3" out="$4" log="$5" done holds fallbacks bursts held mid loading wanted earlyReleased
+    done=$(grep -a 'PREVIEWSWAP DONE' "$log" | tail -1)
+    [ -n "$done" ] || { bad "$surface: no DONE line to judge"; return; }
+    holds=$(printf '%s' "$done" | sed -n 's/.*holds=\([0-9]*\).*/\1/p')
+    fallbacks=$(printf '%s' "$done" | sed -n 's/.*fallbacks=\([0-9]*\).*/\1/p')
+    bursts=$(printf '%s' "$done" | sed -n 's/.*bursts=\([0-9]*\).*/\1/p')
+    held=$(printf '%s' "$done" | sed -n 's/.*held=\([0-9]*\).*/\1/p')
+    mid=$(printf '%s' "$done" | sed -n 's/.*mid=\([0-9]*\).*/\1/p')
+    loading=$(printf '%s' "$done" | sed -n 's/.*loading=\([0-9]*\).*/\1/p')
+    earlyReleased=$(printf '%s' "$done" | sed -n 's/.*early=\([0-9]*\).*/\1/p')
+    printf '  %s direct=%s early=%s holds=%s fallbacks=%s bursts=%s held=%s mid=%s loading=%s earlyReleased=%s\n' \
+        "$surface" "$direct" "$early" "$holds" "$fallbacks" "$bursts" "$held" "$mid" "$loading" "$earlyReleased"
+    if [ "$direct" == 1 ]; then
+        # The control: mutating without a hold draws half-built frames, the defect itself.
+        if [ "${mid:-0}" -gt 0 ]; then ok "$surface: mutating without a hold drew $mid mid frame(s), so the harness sees the defect";
+        else bad "$surface: mutating without a hold drew no mid frame, so the harness cannot see the defect"; fi
+        return
+    fi
+    # The column holds 17 file moves by picture and 1 folder move by data; Quick Look holds all 18.
+    if [ "$surface" == column ]; then wanted=17; else wanted=18; fi
+    [ "${holds:-0}" -eq "$wanted" ] || { bad "$surface: took $holds hold(s), expected $wanted (folder moves take none)"; return; }
+    if [ "${mid:-1}" -eq 0 ]; then ok "$surface: file moves drew no half-built frame (folder step simulated, real proof in columnsfolder)";
+    else bad "$surface: file moves drew $mid half-built frame(s)"; fi
+    if [ "${fallbacks:-1}" -eq 0 ]; then ok "$surface: no hold ran past the cap";
+    else bad "$surface: $fallbacks hold(s) fell back on fast decodes"; fi
+    if [ "$early" == 1 ]; then
+        if [ "${earlyReleased:-0}" -eq "$wanted" ] && [ "${mid:-1}" -eq 0 ]; then
+            ok "$surface: all $wanted holds released early on the ready-at-start path with no half-built frame"
+        else bad "$surface: early releases $earlyReleased of $wanted with $mid mid frame(s)"; fi
+    fi
+    [ -f "$out/settled.png" ] || bad "$surface: the settled grab never landed"
+}
+
+# Sample input, one harness line: 'PREVIEWSWAP FOLDERGUARD DONE check=held cap=held positive=expired'.
+run_folderguard() {
+    # Offscreen platform mask warning is the platform's, never the guard's.
+    local platform_warning='This plugin does not support setting window masks'
+    local log="$swap_root/folderguard.log"
+    local status
+    local done_count
+    local fail_count
+    local warnings
+    ( env -u DISPLAY -u WAYLAND_DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE \
+        HOME="$swap_work/home" XDG_RUNTIME_DIR="$swap_work/runtime" TMPDIR="$swap_work/tmp" \
+        XDG_CONFIG_HOME="$swap_work/home/.config" XDG_STATE_HOME="$swap_work/home/.local/state" \
+        XDG_CACHE_HOME="$swap_work/home/.cache" \
+        QT_QPA_PLATFORM=offscreen QT_QPA_PLATFORMTHEME=generic QT_QUICK_BACKEND=software QT_QPA_UPDATE_IDLE_TIME=16 \
+        QT_FORCE_STDERR_LOGGING=1 \
+        PREVIEW_SWAP_UI="$PWD/ui" PREVIEW_SWAP_SURFACE="column" PREVIEW_SWAP_OUT="$swap_work/frames-column" \
+        PREVIEW_SWAP_DIRECT="0" PREVIEW_SWAP_FOLDERGUARD="1" \
+        timeout 90 qs -p "$swap_work/config" > "$log" 2>&1; exit $? ) 2>/dev/null
+    status=$?
+    done_count=$(grep -a -c 'FOLDERGUARD DONE' "$log")
+    fail_count=$(grep -a -c 'FOLDERGUARD FAIL' "$log")
+    warnings=$(grep -aE 'TypeError|ReferenceError|ERROR|WARN|Cannot|is not a type|failed to load' "$log" | grep -vF "$platform_warning" || true)
+    if [ "$done_count" -ne 1 ] || [ "$fail_count" -ne 0 ] || [ -n "$warnings" ]; then
+        bad "folderguard: want one DONE, no FAIL and no warnings (qs exit $status, done=$done_count fail=$fail_count)"
+        printf '%s\n' "$warnings"
+        cat "$log"
+        return
+    fi
+    ok "folderguard: held check and held cap stayed holding, positive control expired"
+}
+
+run_surface column 0
+run_surface quicklook 0
+run_surface quicklook 0 1
+run_surface column 1
+run_surface quicklook 1
+run_folderguard
+
+printf 'preview-swap: %s check(s), %s failed\n' "$((pass + fail))" "$fail"
+[ "$fail" -eq 0 ]

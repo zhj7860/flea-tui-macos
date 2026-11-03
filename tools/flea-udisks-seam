@@ -1,0 +1,19 @@
+# The flasher's bench seam for tools/flea-udisks: kept beside it in the source tree, never installed by packaging.
+import os
+
+# The marker a bench root carries, the one the backend's own seam reads.
+LOOP_MARKER = ".flea-test-sandbox"
+
+
+def loop_allowed(dev, root, sys_root="/sys"):
+    # A loop is a bench drive only when its backing file is a regular file strictly inside a marked root.
+    if not root or not dev.startswith("loop") or not os.path.isfile(os.path.join(root, LOOP_MARKER)):
+        return False
+    try:
+        with open(os.path.join(sys_root, "block", dev, "loop", "backing_file")) as source:
+            backing = source.read().strip()
+    except OSError:
+        return False
+    if not backing or os.path.islink(backing) or not os.path.isfile(backing):
+        return False
+    return os.path.realpath(backing).startswith(os.path.realpath(root) + os.sep)

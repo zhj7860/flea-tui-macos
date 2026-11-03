@@ -1,0 +1,42 @@
+# The pid of the one Flea running a given ui tree, because a path is not an instance selector.
+#
+#   . tools/flea-ipc-pid
+#   pid=$(flea_ipc_pid "$PWD/ui") || exit 1
+#   qs ipc --pid "$pid" call flea tokens
+#
+# qs ipc -p <path> resolves a path only as far as the config's ShellId, and every tree's shell.qml
+# declares the same "//@ pragma ShellId flea", so one namespace holds every Flea this box has run.
+# A path-addressed call answers from the oldest live instance in that namespace, whatever tree it is
+# running: measured 2026-09-02, `qs ipc -p ~/Work/claude/flea/ui call flea path` answered from an
+# instance of /usr/share/flea/ui that had had no window for two hours. This build of qs has no
+# --newest, so --pid is its only exact selector, and it is also the only one that works from a
+# session with no WAYLAND_DISPLAY, which -p and --id silently refuse.
+
+# Sample input, one block per instance from `qs list --all`:
+#   Instance fgf81k9vqkt:
+#     Process ID: 2072895
+#     Shell ID: flea
+#     Config path: /usr/share/flea/ui/boot/shell.qml
+flea_ipc_pids() {
+  local want="$1/boot/shell.qml" pid= line
+  while IFS= read -r line; do
+    case $line in
+      "Instance "*) pid= ;;
+      *"Process ID: "*) pid=${line##*": "} ;;
+      *"Config path: "*) [ "${line##*": "}" = "$want" ] && printf '%s\n' "$pid" ;;
+    esac
+  done < <(qs list --all 2>/dev/null)
+}
+
+# Refuses rather than picks: two instances at one path is the exact state that produced a wrong
+# reading, so the caller is told instead of being handed whichever one qs happened to reach first.
+flea_ipc_pid() {
+  local ui="$1" pids
+  pids=$(flea_ipc_pids "$ui" | tr '\n' ' ')
+  set -- $pids
+  case $# in
+    0) echo "flea-ipc-pid: no Flea is running from $ui" >&2; return 1 ;;
+    1) printf '%s\n' "$1" ;;
+    *) echo "flea-ipc-pid: $# Flea instances run from $ui (pids $pids), so no reading is attributable" >&2; return 1 ;;
+  esac
+}

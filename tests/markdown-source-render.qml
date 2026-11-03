@@ -1,0 +1,126 @@
+//@ pragma ShellId flea-markdown-source-render-test
+import QtQuick
+import Quickshell
+import "flea" as Flea
+
+ShellRoot {
+    id: shell
+    property bool done: false
+    property int checks: 0
+    property int failures: 0
+    property int step: 0
+    property string output: Quickshell.env("XDG_RUNTIME_DIR") + "/markdown-source.png"
+    Component.onCompleted: Flea.ViewState.state = { display: { textSize: { mode: 14 } } }
+    function quit() { Quickshell.execDetached(["kill", String(Quickshell.processId)]) }
+    function check(ok, label) {
+        checks++
+        if (!ok) failures++
+        console.log("MARKDOWN_SOURCE " + (ok ? "CHECK " : "FAIL ") + label)
+    }
+    FloatingWindow {
+        implicitWidth: 1120
+        implicitHeight: 240
+        color: "#101315"
+        Flea.PreviewMarkdown {
+            id: sourcePane
+            anchors { left: parent.left; top: parent.top; bottom: parent.bottom }
+            width: 560
+            active: true
+            view: "source"
+            path: Quickshell.env("FLEA_MARKDOWN_FIXTURE")
+            size: 1
+        }
+        Loader {
+            id: reference
+            x: sourcePane.width
+            width: sourcePane.width
+            height: sourcePane.height
+            sourceComponent: Flea.PreviewMarkdown {
+                active: true
+                path: sourcePane.path
+                size: 1
+            }
+        }
+    }
+    // The Source list and its first row: the list sits inside the insets, and the row's body is the file's first line.
+    function sourceParts() {
+        var flick = sourcePane.sourceItem
+        for (var j = 0; j < flick.contentItem.children.length; j++) {
+            var row = flick.contentItem.children[j]
+            if (row.index === 0 && row.children.length === 2)
+                return { flick: flick, row: row, text: row.children[1] }
+        }
+        return null
+    }
+    // Sample input: '<font color="#ffffff">&lt;img&gt; &amp;</font>' reads back as '<img> &'.
+    function readBack(markup) {
+        return String(markup).replace(/<[^>]*>/g, "").replace(/&nbsp;/g, " ").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&")
+    }
+    function geometry() {
+        var rendered = reference.item
+        var parts = sourceParts()
+        var block = rendered.blockItem(0)
+        if (!parts || !block) {
+            check(false, "source and rendered live text exist")
+            return
+        }
+        var at = parts.flick.mapToItem(sourcePane, 0, 0)
+        var first = block.mapToItem(rendered, 0, 0)
+        var label = " at body " + Flea.Theme.font.body
+        check(at.x === first.x && at.x === sourcePane.insetX, "source left equals rendered inset" + label)
+        check(at.y === sourcePane.insetY, "source top equals rendered inset" + label + " (" + at.y + "/" + sourcePane.insetY + ")")
+        check(sourcePane.width - at.x - parts.flick.width === sourcePane.insetX
+            && sourcePane.height - at.y - parts.flick.height === sourcePane.insetY, "source right and bottom insets" + label)
+        var header = parts.flick.headerItem ? parts.flick.headerItem.height : 0
+        check(parts.flick.contentHeight === header + parts.flick.count * parts.row.height, "source holds one row per line" + label)
+        check(parts.row.children[0].text === "1" && parts.text.textFormat === Text.StyledText
+            && readBack(parts.text.text) === sourcePane.rawText.split("\n")[0], "source numbered first line reads back verbatim" + label)
+        // The bar and the wheel belong to the frame, so the bar is a child of the Source item, beside the list.
+        var holder = parts.flick.parent.parent
+        var scrollbars = 0
+        for (var i = 0; i < holder.children.length; i++) {
+            var bar = holder.children[i]
+            if (bar.knobItem === undefined || bar.flickable !== parts.flick || bar.width <= 0)
+                continue
+            scrollbars++
+            check(bar.mapToItem(sourcePane, bar.width, 0).x === sourcePane.width, "source scrollbar stays on frame edge" + label)
+        }
+        check(scrollbars === 1, "exactly one Source scrollbar belongs to flickable with positive width" + label)
+    }
+    Timer {
+        interval: 600
+        repeat: true
+        running: !shell.done
+        onTriggered: {
+            if (!sourcePane.contentReady || !sourcePane.firstScreen || (reference.active && (!reference.item || !reference.item.contentReady)))
+                return
+            if (shell.step === 0) {
+                shell.geometry()
+                sourcePane.grabToImage(function(result) {
+                    shell.check(result.saveToFile(shell.output), "source capture saved")
+                    Flea.ViewState.state = { display: { textSize: { mode: 16 } } }
+                    reference.active = false
+                    shell.step = 1
+                })
+                shell.step = -1
+            } else if (shell.step === 1) {
+                // A fresh rendered reference measures initial insets without a previous font's scroll offset.
+                reference.active = true
+                shell.step = 2
+            } else if (shell.step === 2) {
+                shell.geometry()
+                shell.done = true
+                console.log("MARKDOWN_SOURCE " + shell.checks + " checks, " + shell.failures + " failed")
+                shell.quit()
+            }
+        }
+    }
+    Timer {
+        interval: 10000
+        running: !shell.done
+        onTriggered: {
+            console.log("MARKDOWN_SOURCE FAIL watchdog")
+            shell.quit()
+        }
+    }
+}

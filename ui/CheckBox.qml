@@ -1,0 +1,73 @@
+import QtQuick
+import "." as Flea
+
+// The one checkbox every surface draws, Containers rule 14. The box is the control and every member
+// wears it; state is filled against empty, so no palette has to separate accent from foreground.
+Item {
+    id: root
+
+    // "off", "on", or "some", which is a group heading's state and never a row's.
+    property string value: "off"
+    // Availability is not an off value: an unavailable box keeps whatever it holds and dims.
+    property bool available: true
+    // The keyboard turns an empty box's own frame foreground; a filled box, whose frame is already foreground, gains the keyline below.
+    property bool focused: false
+
+    readonly property bool filled: root.value !== "off"
+    // The board's mixed bar is 8 x 2 in an 18 px box, and the box scales from bodySmall 13 as its check does.
+    readonly property int barBaseWidth: 8
+    readonly property int barBaseHeight: 2
+    readonly property real boxScale: Theme.font.bodySmall / 13
+    readonly property Item barItem: bar
+    readonly property Item frameItem: frame
+    readonly property int borderWidth: 2 * Theme.spacing.hairline
+
+    // A 14px interior inside two 2px borders, so 18px outer at bodySmall 13.
+    implicitHeight: Math.round(14 * Theme.font.bodySmall / 13) + 2 * root.borderWidth
+    implicitWidth: root.implicitHeight
+    opacity: root.available ? 1 : Theme.disabledOpacity
+
+    Accessible.role: Accessible.CheckBox
+    Accessible.checked: root.value === "on"
+
+    Rectangle {
+        id: frame
+        anchors.fill: parent
+        color: root.filled ? Theme.color.foreground : "transparent"
+        border.width: root.borderWidth
+        border.color: root.filled || root.focused ? Theme.color.foreground : Theme.color.mutedFrame
+
+        // The mark is the fill cut away, so the control needs no third colour and no accent at all.
+        Flea.Glyph {
+            anchors.centerIn: parent
+            width: Theme.font.bodySmall * 10 / 13
+            height: width
+            strokeWidth: 3
+            visible: root.value === "on"
+            name: "check"
+            color: Theme.color.background
+        }
+
+        // A mixed box cuts the board's bar, a rectangle on whole pixels and not a glyph stroke spread over two rows.
+        Rectangle {
+            id: bar
+            width: Math.round(root.barBaseWidth * root.boxScale)
+            height: Math.max(1, Math.round(root.barBaseHeight * root.boxScale))
+            x: Math.round((parent.width - width) / 2)
+            y: Math.round((parent.height - height) / 2)
+            visible: root.value === "some"
+            color: Theme.color.background
+        }
+    }
+
+    // A focused filled box shows a foreground hairline past a one-hairline gap outside its frame; an empty box draws focus in its frame.
+    Rectangle {
+        objectName: "checkRing"
+        anchors.fill: parent
+        anchors.margins: -2 * Theme.spacing.hairline
+        color: "transparent"
+        border.width: Theme.spacing.hairline
+        border.color: Theme.color.foreground
+        visible: root.focused && root.filled
+    }
+}

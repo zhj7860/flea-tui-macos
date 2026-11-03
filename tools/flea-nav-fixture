@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+"""Nav and preview fixtures for tools/flea-field-nav, built inside a root the plan names.
+
+  flea-nav-fixture ROOT   build nav500, enter/big, nav10k, nav100k, preview, qltable and print facts JSON
+
+Layout: nav500 holds NAV500 empty files (one Down step each); enter holds only big, which holds
+ENTER1000 empty files (Enter enters it, the back key leaves it); nav10k and nav100k hold that many
+empty files (the launch columns); preview holds one file of each preview kind in cursor order
+(jpg, png, pdf, md, txt, video); qltable holds one folder per Quick Look document (ql_md_table_first,
+ql_md_plain, ql_md_plain_b), each a single 4096 byte Markdown file, the first opening with a 40-row table. A PDF
+and Markdown are written by hand; jpg, png and mp4 need ImageMagick and ffmpeg, and a kind with no maker is skipped
+loudly in the facts rather than faked.
+Sample facts: {"root": "R", "nav500": 500, "enter1000": 1000}.
+"""
+import json
+import os
+import shutil
+import struct
+import subprocess
+import sys
+import zlib
+
+NAV500 = 500  # Down steps of one run, one file per step
+ENTER1000 = 1000  # rows the Enter column enters
+NAV10K = 10000  # rows of the small launch folder
+NAV100K = 100000  # rows of the large launch folder
+JPG_W = 640  # pixels of the photo fixture
+JPG_H = 480  # pixels of the photo fixture
+MP4_W = 320  # pixels of the clip fixture
+MP4_H = 240  # pixels of the clip fixture
+MP4_SECS = 1  # seconds of the clip fixture
+MARKER = ".flea-nav-fixture"  # refusal guard: never rm -rf a root without one
+
+
+def have(tool):
+    return shutil.which(tool) is not None
+
+
+def write_png(path, w, h):
+    """A valid PNG of w by h plasma-ish rows, zlib from the stdlib, no encoder needed."""
+    raw = bytearray()
+    for y in range(h):
+        raw.append(0)
+        for x in range(w):
+            raw += bytes((x * 255 // w, y * 255 // h, 128))
+    def chunk(tag, body):
+        c = struct.pack(">I", len(body)) + tag + body
+        return c + struct.pack(">I", zlib.crc32(tag + body) & 0xFFFFFFFF)
+    with open(path, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(bytes(raw), 1)) + chunk(b"IEND", b""))
+
+
+# Sample bytes: b"<< /Length 105 >>\nstream\nBT /F1 18 Tf 40 140 Td (Nav fixture PDF) Tj ET\n...".
+def check_pdf_length(path):
+    """The declared /Length equals the stream bytes; raises on mismatch."""
+    raw = open(path, "rb").read()
+    declared = int(raw.split(b"/Length ", 1)[1].split(b" ", 1)[0])
+    stream = raw.split(b"stream\n", 1)[1].rsplit(b"\nendstream", 1)[0]
+    if declared != len(stream):
+        raise SystemExit("flea-nav-fixture: %s declares /Length %d, stream holds %d"
+                         % (path, declared, len(stream)))
+
+
+def write_pdf(path):
+    """A one page PDF: a title line and a second line, xref offsets computed, not guessed."""
+    stream = (b"BT /F1 18 Tf 40 140 Td (Nav fixture PDF) Tj ET\n"
+              b"BT /F1 12 Tf 40 110 Td (second line for the preview) Tj ET")
+    objs = [b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Contents 4 0 R "
+            b"/Resources << /Font << /F1 5 0 R >> >> >>",
+            b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"\nendstream",
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"]
+    out = bytearray(b"%PDF-1.4\n")
+    offs = []
+    for i, body in enumerate(objs, 1):
+        offs.append(len(out))
+        out += b"%d 0 obj\n" % i + body + b"\nendobj\n"
+    xref = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objs) + 1)
+    for o in offs:
+        out += b"%010d 00000 n \n" % o
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objs) + 1, xref)
+    with open(path, "wb") as f:
+        f.write(bytes(out))
+    check_pdf_length(path)
+
+
+MD_TEXT = """# Nav fixture
+
+A paragraph with **bold** and `code`, then a list:
+
+- first item
+- second item
+
+| Name | Size |
+| ---- | ---- |
+| alpha | 3 |
+"""
+
+
+QL_BYTES = 4096  # bytes of each Quick Look Markdown fixture, the table one and its controls alike
+QL_TABLE_ROWS = 40  # body rows of the table the first fixture opens with
+QL_KINDS = ("ql_md_table_first", "ql_md_plain", "ql_md_plain_b")  # folder and file stem of each, plain_b the negative control's twin
+QL_TAIL = "Body text that follows the opening block and is the same in every document.\n"
+
+
+def ql_texts():
+    """The three Quick Look documents, name to text: a 40-row table first, then two byte-identical tableless controls of the same size."""
+    lines = ["| Item   | Label            | Count |", "| ------ | ---------------- | ----- |"]
+    lines += ["| Row %02d | alpha beta gamma | %5d |" % (i, i * 7) for i in range(1, QL_TABLE_ROWS + 1)]
+    table = "\n".join(lines) + "\n\n"
+    # Same bytes line for line: pipes become commas and dashes become x, so the control opens with one plain paragraph.
+    plain = table.translate(str.maketrans("|-", ",x"))
+    pad = QL_BYTES - len(table)
+    tail = (QL_TAIL * (pad // len(QL_TAIL) + 1))[:pad - 1] + "\n"
+    out = {"ql_md_table_first": table + tail, "ql_md_plain": plain + tail, "ql_md_plain_b": plain + tail}
+    sizes = {len(v.encode()) for v in out.values()}
+    if sizes != {QL_BYTES}:
+        raise SystemExit("flea-nav-fixture: the Quick Look documents differ in size: %s" % sorted(sizes))
+    return out
+
+
+def refuse_tmpfs(root):
+    """Refuse a root findmnt calls tmpfs or cannot name; cold pages on tmpfs are unevictable."""
+    target = os.path.abspath(root)
+    while not os.path.exists(target):
+        parent = os.path.dirname(target)
+        if parent == target:
+            break
+        target = parent
+    try:
+        fs = subprocess.run(["findmnt", "-no", "FSTYPE", "--target", target],
+                            capture_output=True, text=True).stdout.strip()
+    except OSError:
+        fs = ""
+    if not fs:
+        raise SystemExit("flea-nav-fixture: findmnt could not name the filesystem holding %s" % target)
+    if fs == "tmpfs":
+        raise SystemExit("flea-nav-fixture: %s would be on tmpfs, where a cold run measures nothing" % root)
+
+
+def build(root):
+    """Create the three folders under root; refuse a non-empty root without the marker."""
+    refuse_tmpfs(root)
+    if os.path.exists(root) and os.listdir(root) and not os.path.exists(os.path.join(root, MARKER)):
+        raise SystemExit("flea-nav-fixture: refusing to fill %s without %s" % (root, MARKER))
+    os.makedirs(root, exist_ok=True)
+    open(os.path.join(root, MARKER), "w").close()
+    gaps = []
+    d500 = os.path.join(root, "nav500")
+    os.makedirs(d500, exist_ok=True)
+    for i in range(NAV500):
+        open(os.path.join(d500, "f_%04d.txt" % i), "w").close()
+    big = os.path.join(root, "enter", "big")
+    os.makedirs(big, exist_ok=True)
+    for i in range(ENTER1000):
+        open(os.path.join(big, "g_%04d.txt" % i), "w").close()
+    for name, count, fmt in (("nav10k", NAV10K, "h_%05d.txt"), ("nav100k", NAV100K, "k_%06d.txt")):
+        d = os.path.join(root, name)
+        os.makedirs(d, exist_ok=True)
+        for i in range(count):
+            open(os.path.join(d, fmt % i), "w").close()
+    prev = os.path.join(root, "preview")
+    os.makedirs(prev, exist_ok=True)
+    magick = "magick" if have("magick") else ("convert" if have("convert") else None)
+    if magick:
+        subprocess.run([magick, "-size", "%dx%d" % (JPG_W, JPG_H), "plasma:fractal",
+                        os.path.join(prev, "a_photo.jpg")], check=True)
+        subprocess.run([magick, "-size", "%dx%d" % (JPG_W, JPG_H), "plasma:fractal",
+                        os.path.join(prev, "b_graphic.png")], check=True)
+    else:
+        write_png(os.path.join(prev, "b_graphic.png"), JPG_W, JPG_H)
+        gaps.append("jpg skipped: no ImageMagick convert or magick on PATH")
+    write_pdf(os.path.join(prev, "c_doc.pdf"))
+    with open(os.path.join(prev, "d_notes.md"), "w") as f:
+        f.write(MD_TEXT)
+    with open(os.path.join(prev, "e_text.txt"), "w") as f:
+        f.write("plain text fixture\nsecond line\n")
+    for name, text in ql_texts().items():
+        os.makedirs(os.path.join(root, "qltable", name), exist_ok=True)
+        with open(os.path.join(root, "qltable", name, name + ".md"), "w") as f:
+            f.write(text)
+    if have("ffmpeg"):
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                        "-i", "testsrc=duration=%d:size=%dx%d:rate=10" % (MP4_SECS, MP4_W, MP4_H),
+                        "-pix_fmt", "yuv420p", os.path.join(prev, "f_clip.mp4")], check=True)
+    else:
+        gaps.append("video skipped: no ffmpeg on PATH")
+    # Cursor order of the preview kinds, the names that sort them there.
+    order = ["a_photo.jpg", "b_graphic.png", "c_doc.pdf", "d_notes.md", "e_text.txt", "f_clip.mp4"]
+    kinds = {"a_photo.jpg": "jpg", "b_graphic.png": "png", "c_doc.pdf": "pdf",
+             "d_notes.md": "md", "e_text.txt": "txt", "f_clip.mp4": "video"}
+    got = sorted(os.listdir(prev))
+    facts = {"root": root, "nav500": len(os.listdir(d500)), "enter1000": len(os.listdir(big)),
+             "nav10k": len(os.listdir(os.path.join(root, "nav10k"))),
+             "nav100k": len(os.listdir(os.path.join(root, "nav100k"))),
+             "enter_children": sorted(os.listdir(os.path.join(root, "enter"))),
+             "preview": got, "preview_order": [n for n in order if n in got],
+             "preview_kinds": {n: kinds[n] for n in order if n in got},
+             "qltable": {n: QL_BYTES for n in QL_KINDS}, "gaps": gaps}
+    return facts
+
+
+def main(argv):
+    if len(argv) != 1 or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0 if argv and argv[0] in ("-h", "--help") else 2
+    print(json.dumps(build(argv[0]), indent=1))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

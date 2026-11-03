@@ -1,0 +1,399 @@
+#!/usr/bin/python3
+
+# The backend half of omarchy-file-select: this owns org.freedesktop.impl.portal.desktop.flea and
+# answers org.freedesktop.impl.portal.FileChooser with Flea's own picker window, so every portal
+# caller on the box gets the same chooser.
+#
+# Python and gi rather than Rust, alone in this tree with tools/flea-gio-auth: a portal backend is a
+# D-Bus service that must own a name, export objects, answer method calls out of order and stay
+# reachable while a window is open. glib is already a Flea dependency and python-gobject is already
+# on any Omarchy box, because omarchy-file-select, the client this serves, is written against it.
+# The alternative was a hand-rolled D-Bus marshaller inside a crate with no dependencies at all.
+
+import json
+import os
+import shutil
+import sys
+import tempfile
+from urllib.parse import unquote_to_bytes, urlsplit
+
+import gi
+
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio, GLib
+
+BUS_NAME = "org.freedesktop.impl.portal.desktop.flea"
+# The path every portal backend exports on, and the one xdg-desktop-portal builds its proxy against.
+OBJECT_PATH = "/org/freedesktop/portal/desktop"
+CHOOSER_IFACE = "org.freedesktop.impl.portal.FileChooser"
+REQUEST_IFACE = "org.freedesktop.impl.portal.Request"
+
+# The portal response codes. 1 is the user's own no, 2 is everything else, and the two are never mixed.
+RESPONSE_OK = 0
+RESPONSE_CANCELLED = 1
+RESPONSE_OTHER = 2
+
+# With no window open there is nothing to keep this process for, and D-Bus starts it again on the
+# next call. Long enough that a caller opening two choosers in a row does not pay activation twice.
+IDLE_EXIT_SEC = 30
+
+INTROSPECTION = """
+<node>
+  <interface name='org.freedesktop.impl.portal.FileChooser'>
+    <property name='version' type='u' access='read'/>
+    <method name='OpenFile'>
+      <arg type='o' name='handle' direction='in'/>
+      <arg type='s' name='app_id' direction='in'/>
+      <arg type='s' name='parent_window' direction='in'/>
+      <arg type='s' name='title' direction='in'/>
+      <arg type='a{sv}' name='options' direction='in'/>
+      <arg type='u' name='response' direction='out'/>
+      <arg type='a{sv}' name='results' direction='out'/>
+    </method>
+    <method name='SaveFile'>
+      <arg type='o' name='handle' direction='in'/>
+      <arg type='s' name='app_id' direction='in'/>
+      <arg type='s' name='parent_window' direction='in'/>
+      <arg type='s' name='title' direction='in'/>
+      <arg type='a{sv}' name='options' direction='in'/>
+      <arg type='u' name='response' direction='out'/>
+      <arg type='a{sv}' name='results' direction='out'/>
+    </method>
+    <method name='SaveFiles'>
+      <arg type='o' name='handle' direction='in'/>
+      <arg type='s' name='app_id' direction='in'/>
+      <arg type='s' name='parent_window' direction='in'/>
+      <arg type='s' name='title' direction='in'/>
+      <arg type='a{sv}' name='options' direction='in'/>
+      <arg type='u' name='response' direction='out'/>
+      <arg type='a{sv}' name='results' direction='out'/>
+    </method>
+  </interface>
+  <interface name='org.freedesktop.impl.portal.Request'>
+    <method name='Close'/>
+  </interface>
+</node>
+"""
+
+
+def say(message):
+    print("flea-portal: %s" % message, file=sys.stderr, flush=True)
+
+
+def flea_binary():
+    # FLEA_BIN is the dev seam ui/Backend.qml already reads; the dev tree keeps target/ beside tools/.
+    chosen = os.environ.get("FLEA_BIN", "")
+    if chosen:
+        return chosen
+    here = os.path.dirname(os.path.abspath(__file__))
+    dev = os.path.join(os.path.dirname(here), "target", "release", "flea")
+    if os.access(dev, os.X_OK):
+        return dev
+    return "/usr/bin/flea"
+
+
+def text_option(options, key):
+    value = options.get(key)
+    return value if isinstance(value, str) else ""
+
+
+def flag_option(options, key):
+    return options.get(key) is True
+
+
+# current_folder, current_file and each files element are D-Bus `ay`, which PyGObject 3.56.3 on
+# Python 3.14 unpacks as a list of ints and older ones as bytes; anything else is refused, not guessed.
+def bytestring(value):
+    if isinstance(value, bytes):
+        raw = value
+    elif isinstance(value, list):
+        # bytes() is the range and type check: a non-int raises TypeError, one outside 0-255 ValueError.
+        try:
+            raw = bytes(value)
+        except (TypeError, ValueError):
+            return ""
+    else:
+        return ""
+    return raw.split(b"\0", 1)[0].decode("utf-8", "replace")
+
+
+def path_option(options, key):
+    return bytestring(options.get(key))
+
+
+# Sample input: [('Images', [(0, '*.png'), (1, 'image/jpeg')])], where 0 is a glob and 1 a mime type.
+def filters_option(options, key):
+    value = options.get(key)
+    if not isinstance(value, list):
+        return []
+    out = []
+    for entry in value:
+        if not isinstance(entry, tuple) or len(entry) != 2:
+            continue
+        label, rules = entry
+        if not isinstance(label, str) or not isinstance(rules, list):
+            continue
+        rules = [rule for rule in rules if isinstance(rule, tuple) and len(rule) == 2
+                 and type(rule[0]) is int and isinstance(rule[1], str)]
+        globs = [rule[1] for rule in rules if rule[0] == 0]
+        mimes = [rule[1] for rule in rules if rule[0] == 1]
+        out.append({"label": label, "globs": globs, "mimes": mimes})
+    return out
+
+
+def current_filter_label(options):
+    value = options.get("current_filter")
+    if not isinstance(value, tuple) or len(value) != 2:
+        return ""
+    return value[0]
+
+
+def request_for(method, title, app_id, options):
+    # One shape for all three methods: the picker reads mode and ignores the fields that mode has no use for.
+    mode = {"OpenFile": "open", "SaveFile": "save", "SaveFiles": "savefiles"}[method]
+    files = options.get("files")
+    filters = options.get("filters")
+    request = {
+        "mode": mode,
+        "title": title,
+        "app": app_id,
+        "accept": text_option(options, "accept_label"),
+        "multiple": flag_option(options, "multiple"),
+        "directory": flag_option(options, "directory"),
+        "folder": path_option(options, "current_folder"),
+        "file": path_option(options, "current_file"),
+        "name": text_option(options, "current_name"),
+        "files": [bytestring(name) for name in files] if isinstance(files, list) else [],
+        "filters": filters_option(options, "filters"),
+        "current": current_filter_label(options),
+        "currentIndex": next((index for index, value in enumerate(filters if isinstance(filters, list) else [])
+                              if value == options.get("current_filter")), -1),
+    }
+    # Visibility is optional: missing or malformed values leave the picker's saved default intact.
+    if type(options.get("show_hidden")) is bool:
+        request["hidden"] = flag_option(options, "show_hidden")
+    if mode == "save" and os.path.isabs(request["file"]):
+        request["folder"], request["name"] = os.path.split(request["file"])
+    return request
+
+
+class Pick:
+    """One portal request: one picker window, one answer, one temporary directory."""
+
+    def __init__(self, service, handle, invocation, request):
+        self.service = service
+        self.handle = handle
+        self.invocation = invocation
+        self.request = request
+        self.answered = False
+        self.closed = False
+        self.child = None
+        self.registration = 0
+        self.dir = tempfile.mkdtemp(prefix="flea-picker-", dir=GLib.get_user_runtime_dir())
+        self.reply = os.path.join(self.dir, "reply.json")
+
+    def start(self):
+        launcher = Gio.SubprocessLauncher.new(Gio.SubprocessFlags.NONE)
+        launcher.setenv("FLEA_PICKER", json.dumps(self.request), True)
+        try:
+            self.child = launcher.spawnv([flea_binary(), "--pick", self.reply])
+        except GLib.Error as error:
+            say("the picker did not start (%s)" % error.message)
+            self.answer(RESPONSE_OTHER, [])
+            return
+        self.child.wait_async(None, self.on_child_exit)
+
+    # The window is gone, so whatever it left in the reply file is the whole answer.
+    # PyGObject calls an async callback with user data only when it was given, so the third
+    # parameter defaults rather than making the arity a guess.
+    def on_child_exit(self, child, result, _data=None):
+        try:
+            child.wait_finish(result)
+        except GLib.Error as error:
+            say("the picker could not be waited on (%s)" % error.message)
+        if self.closed:
+            self.answer(RESPONSE_OTHER, [])
+            return
+        answer = self.read_reply()
+        if answer is None:
+            say("the picker exited without an answer, so the request is a fault and not a refusal")
+            self.answer(RESPONSE_OTHER, [])
+            return
+        response, uris = answer.get("response"), answer.get("uris", [])
+        if type(response) is not int or response not in (RESPONSE_OK, RESPONSE_CANCELLED):
+            self.answer(RESPONSE_OTHER, [])
+            return
+        if response == RESPONSE_OK and (not isinstance(uris, list) or not uris or not all(valid_uri(uri) for uri in uris)):
+            self.answer(RESPONSE_OTHER, [])
+            return
+        index = answer.get("filter", -1)
+        if type(index) is not int or index < -1 or index >= len(self.request["filters"]):
+            self.answer(RESPONSE_OTHER, [])
+            return
+        self.answer(response, uris, index)
+
+    def read_reply(self):
+        try:
+            with open(self.reply, "r", encoding="utf-8") as handle:
+                answer = json.load(handle)
+        except (OSError, ValueError):
+            return None
+        if not isinstance(answer, dict):
+            return None
+        return answer
+
+    def answer(self, response, uris, filter_index=None):
+        if self.answered:
+            return
+        self.answered = True
+        results = {}
+        # Only a success carries URIs, and xdg-desktop-portal drops anything that is not a file URI.
+        if response == RESPONSE_OK:
+            results["uris"] = GLib.Variant("as", uris)
+            filters = self.request["filters"]
+            if filters:
+                chosen = filters[filter_index] if type(filter_index) is int and 0 <= filter_index < len(filters) else {"label": "All files", "globs": ["*"], "mimes": []}
+                rules = [(0, glob) for glob in chosen["globs"]] + [(1, mime) for mime in chosen["mimes"]]
+                results["current_filter"] = GLib.Variant("(sa(us))", (chosen["label"], rules))
+        self.invocation.return_value(GLib.Variant("(ua{sv})", (response, results)))
+        self.service.finished(self)
+
+    # The application withdrew its own request, which is neither a pick nor the user's refusal.
+    def close(self):
+        self.closed = True
+        if self.child is not None:
+            self.child.force_exit()
+        else:
+            self.answer(RESPONSE_OTHER, [])
+
+    def clean(self):
+        try:
+            shutil.rmtree(self.dir)
+        except OSError as error:
+            say("could not remove picker runtime directory %s (%s)" % (self.dir, error))
+
+
+def valid_uri(uri):
+    if not isinstance(uri, str) or any(ord(char) <= 32 or ord(char) == 127 for char in uri):
+        return False
+    try:
+        parsed = urlsplit(uri)
+    except ValueError:
+        return False
+    if parsed.scheme != "file" or parsed.netloc or not parsed.path.startswith("/") or parsed.query or parsed.fragment:
+        return False
+    # A literal percent is encoded by the picker; malformed escapes and encoded NUL cannot name its reviewed file.
+    for suffix in parsed.path.split("%")[1:]:
+        if len(suffix) < 2 or any(char not in "0123456789abcdefABCDEF" for char in suffix[:2]):
+            return False
+    return b"\0" not in unquote_to_bytes(parsed.path)
+
+
+class Service:
+    def __init__(self, loop):
+        self.loop = loop
+        self.owner = 0
+        self.connection = None
+        self.picks = {}
+        self.idle_source = 0
+        node = Gio.DBusNodeInfo.new_for_xml(INTROSPECTION)
+        self.chooser_info = node.lookup_interface(CHOOSER_IFACE)
+        self.request_info = node.lookup_interface(REQUEST_IFACE)
+
+    def on_bus_acquired(self, connection, _name):
+        self.connection = connection
+        connection.register_object(OBJECT_PATH, self.chooser_info, self.on_call, self.on_get_property, None)
+        self.arm_idle_exit()
+
+    def on_name_lost(self, _connection, _name):
+        say("another process owns %s, so this one has nothing to answer" % BUS_NAME)
+        self.loop.quit()
+
+    def on_get_property(self, _connection, _sender, _path, _iface, name):
+        # The one property xdg-desktop-portal's proxy reads when it caches this interface.
+        return GLib.Variant("u", 3) if name == "version" else None
+
+    def on_call(self, connection, _sender, path, iface, method, params, invocation):
+        if iface == REQUEST_IFACE and method == "Close":
+            pick = self.picks.get(path)
+            if pick is not None:
+                pick.close()
+            invocation.return_value(None)
+            return
+        if iface != CHOOSER_IFACE or method not in ("OpenFile", "SaveFile", "SaveFiles"):
+            invocation.return_dbus_error("org.freedesktop.DBus.Error.UnknownMethod", "flea-portal answers FileChooser only")
+            return
+        handle, app_id, _parent, title, options = params.unpack()
+        if handle in self.picks:
+            invocation.return_value(GLib.Variant("(ua{sv})", (RESPONSE_OTHER, {})))
+            return
+        try:
+            pick = Pick(self, handle, invocation, request_for(method, title, app_id, options))
+            pick.registration = connection.register_object(handle, self.request_info, self.on_call, None, None)
+        except (OSError, GLib.Error) as error:
+            say("could not prepare picker request (%s)" % error)
+            if "pick" in locals():
+                pick.clean()
+            invocation.return_value(GLib.Variant("(ua{sv})", (RESPONSE_OTHER, {})))
+            return
+        self.picks[handle] = pick
+        # Exported before the window opens, because a caller can withdraw a request it just made.
+        self.cancel_idle_exit()
+        pick.start()
+
+    def finished(self, pick):
+        if pick.registration:
+            self.connection.unregister_object(pick.registration)
+            pick.registration = 0
+        pick.clean()
+        self.picks.pop(pick.handle, None)
+        self.arm_idle_exit()
+
+    def arm_idle_exit(self):
+        self.cancel_idle_exit()
+        if not self.picks:
+            self.idle_source = GLib.timeout_add_seconds(IDLE_EXIT_SEC, self.on_idle)
+
+    def cancel_idle_exit(self):
+        if self.idle_source:
+            GLib.source_remove(self.idle_source)
+            self.idle_source = 0
+
+    # The name goes back before the process does, and the quit waits half a second behind it: a call
+    # that arrives after the release activates a fresh instance instead of reaching a dead one.
+    def on_idle(self):
+        self.idle_source = 0
+        if self.picks:
+            return GLib.SOURCE_REMOVE
+        if self.owner:
+            Gio.bus_unown_name(self.owner)
+            self.owner = 0
+        GLib.timeout_add(500, self.on_quit)
+        return GLib.SOURCE_REMOVE
+
+    def on_quit(self):
+        self.loop.quit()
+        return GLib.SOURCE_REMOVE
+
+
+def main():
+    loop = GLib.MainLoop()
+    service = Service(loop)
+    service.owner = Gio.bus_own_name(
+        Gio.BusType.SESSION,
+        BUS_NAME,
+        Gio.BusNameOwnerFlags.NONE,
+        service.on_bus_acquired,
+        None,
+        service.on_name_lost,
+    )
+    try:
+        loop.run()
+    finally:
+        if service.owner:
+            Gio.bus_unown_name(service.owner)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

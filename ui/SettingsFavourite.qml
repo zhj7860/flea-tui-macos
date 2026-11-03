@@ -1,0 +1,122 @@
+import QtQuick
+import "." as Flea
+import "js/Format.js" as Format
+
+// Favourite records keep their exact label/path; only the drag handle initiates reordering.
+Item {
+    id: root
+    property var row: ({})
+    signal activated()
+    signal moved(int to)
+    signal removed()
+    readonly property Item dragItem: grip
+    readonly property Item removeItem: remove
+    implicitHeight: Theme.railRowHeight
+    // The remove button's accessible name, filled by Format.fill.
+    readonly property string removeWord: "Remove %1"
+
+    Flea.Glyph {
+        id: icon
+        anchors.left: parent.left
+        anchors.leftMargin: Theme.spacing.rowPaddingX
+        anchors.verticalCenter: parent.verticalCenter
+        // Sidebar040: the Built in rows' own 19 px mark slot, so every label in the pane starts on one column.
+        width: Theme.markSize
+        height: width
+        name: root.row.glyph || "folder"
+        color: root.row.error ? Theme.color.error : Theme.color.mutedFrame
+    }
+    Text {
+        anchors.left: icon.right
+        anchors.leftMargin: Theme.spacing.gap
+        anchors.right: path.left
+        anchors.rightMargin: Theme.spacing.gap
+        anchors.verticalCenter: parent.verticalCenter
+        text: root.row.label || ""
+        font.family: Theme.font.family
+        font.pixelSize: Theme.font.body
+        color: root.row.error ? Theme.color.error : Theme.color.foreground
+        elide: Text.ElideRight
+        textFormat: Text.PlainText
+    }
+    Text {
+        id: path
+        anchors.right: grip.left
+        anchors.rightMargin: Theme.spacing.gap
+        anchors.verticalCenter: parent.verticalCenter
+        width: Math.min(implicitWidth, root.width * 0.46)
+        // Sidebar040: a favourite reads as the person writes it; row.value stays the stored path for every action.
+        text: root.row.display !== undefined ? root.row.display : (root.row.value || "")
+        font.family: Theme.font.family
+        font.pixelSize: Theme.font.caption
+        color: root.row.error ? Theme.color.error : Theme.color.muted
+        elide: Text.ElideMiddle
+        textFormat: Text.PlainText
+    }
+    // SettingsRest rule 4: an action that acts on one row reads as a mark on that row, where a button
+    // under the list leaves its target to be inferred from a cursor somewhere above it.
+    // Sidebar040: the handle and the remove mark draw at the mark size inside flush 24 px boxes.
+    Item {
+        id: remove
+        anchors.right: parent.right
+        anchors.rightMargin: Theme.spacing.rowPaddingX
+        anchors.verticalCenter: parent.verticalCenter
+        width: Theme.hitMin
+        height: Theme.hitMin
+        Accessible.role: Accessible.Button
+        Accessible.name: Format.fill(root.removeWord, root.row.label || "")
+        Accessible.onPressAction: root.removed()
+        HoverHandler { cursorShape: Qt.PointingHandCursor }
+        TapHandler {
+            acceptedButtons: Qt.LeftButton
+            gesturePolicy: TapHandler.ReleaseWithinBounds
+            onTapped: root.removed()
+        }
+        Flea.Glyph {
+            anchors.centerIn: parent
+            width: Theme.markSize
+            height: Theme.markSize
+            name: "x"
+            color: Theme.color.mutedFrame
+        }
+    }
+
+    Item {
+        id: grip
+        anchors.right: remove.left
+        anchors.rightMargin: 0
+        anchors.verticalCenter: parent.verticalCenter
+        width: Theme.hitMin
+        height: Theme.hitMin
+        Flea.Glyph {
+            anchors.centerIn: parent
+            width: Theme.markSize
+            height: Theme.markSize
+            name: "list"
+            color: Theme.color.mutedFrame
+        }
+        DragHandler {
+            id: drag
+            target: null
+            xAxis.enabled: false
+            property real startY: 0
+            onActiveChanged: {
+                if (active) { startY = persistentTranslation.y; return }
+                // A pin is a favourite-shaped row ordered inside the shelf's own pile, so the drag
+                // counts rows in whichever list this one came from.
+                var from = root.row.pinIndex !== undefined ? root.row.pinIndex : root.row.favouriteIndex
+                var last = (root.row.pinIndex !== undefined ? root.row.pinCount : Favourites.records.length) - 1
+                // Qt clears active translation before this release callback.
+                var to = Math.max(0, Math.min(last,
+                    from + Math.round((persistentTranslation.y - startY) / Theme.railRowHeight)))
+                if (to !== from) root.moved(to)
+            }
+        }
+    }
+    TapHandler {
+        // Exclusive on press so the listing row under the card cannot tap as well; the remove mark
+        // owns its corner, so the row still reads where the press landed before it opens anything.
+        gesturePolicy: TapHandler.ReleaseWithinBounds
+        onTapped: function (point) { if (point.position.x < remove.x) root.activated() }
+    }
+}

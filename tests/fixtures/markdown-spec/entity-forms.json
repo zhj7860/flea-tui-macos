@@ -1,0 +1,224 @@
+[
+ {
+  "example": "link-syntax",
+  "section": "Entity forms",
+  "markdown": "&#91;x&#93;&#40;javascript&#58;alert&#40;1&#41;&#41;\n",
+  "html": "<p>[x](javascript:alert(1))</p>\n"
+ },
+ {
+  "example": "emphasis-marks",
+  "section": "Entity forms",
+  "markdown": "&ast;a&ast; &#42;&#42;b&#42;&#42; &#95;c&#95;\n",
+  "html": "<p>*a* **b** _c_</p>\n"
+ },
+ {
+  "example": "image-syntax",
+  "section": "Entity forms",
+  "markdown": "&#33;&#91;a&#93;&#40;p.png&#41;\n",
+  "html": "<p>![a](p.png)</p>\n"
+ },
+ {
+  "example": "heading-and-code-marks",
+  "section": "Entity forms",
+  "markdown": "&#35; h &#96;c&#96; &#126;&#126;s&#126;&#126;\n",
+  "html": "<p># h `c` ~~s~~</p>\n"
+ },
+ {
+  "example": "spaces-are-not-indent",
+  "section": "Entity forms",
+  "markdown": "&#32;&#32;&#32;&#32;code\n",
+  "html": "<p>    code</p>\n"
+ },
+ {
+  "example": "spaces-are-not-a-break",
+  "section": "Entity forms",
+  "markdown": "a&#32;&#32;\nb\n",
+  "html": "<p>a  \nb</p>\n"
+ },
+ {
+  "example": "space-run-is-not-a-break",
+  "section": "Entity forms",
+  "markdown": "x&#32;&#32;&#32;\ny\n",
+  "html": "<p>x   \ny</p>\n"
+ },
+ {
+  "example": "literal-spaces-then-run-is-not-a-break",
+  "section": "Entity forms",
+  "markdown": "x  &#32;\ny\n",
+  "html": "<p>x   \ny</p>\n"
+ },
+ {
+  "example": "run-then-one-space-is-not-a-break",
+  "section": "Entity forms",
+  "markdown": "x&#32; \ny\n",
+  "html": "<p>x  \ny</p>\n"
+ },
+ {
+  "example": "run-then-two-spaces-is-a-break",
+  "section": "Entity forms",
+  "markdown": "x&#32;  \ny\n",
+  "html": "<p>x <br />\ny</p>\n"
+ },
+ {
+  "example": "run-then-spaces-is-not-indent",
+  "section": "Entity forms",
+  "markdown": "&#32;    code\n",
+  "html": "<p>     code</p>\n"
+ },
+ {
+  "example": "space-line-is-not-blank",
+  "section": "Entity forms",
+  "markdown": "a\n&#32;\nb\n",
+  "html": "<p>a\n \nb</p>\n"
+ },
+ {
+  "example": "space-line-then-two-spaces-is-a-break",
+  "section": "Entity forms",
+  "markdown": "a\n&#32;  \nb\n",
+  "html": "<p>a\n <br />\nb</p>\n"
+ },
+ {
+  "example": "quote-and-list-marks",
+  "section": "Entity forms",
+  "markdown": "&#62; q\n\n&#45; i\n",
+  "html": "<p>&gt; q</p>\n<p>- i</p>\n"
+ },
+ {
+  "example": "long-indented-space-line",
+  "section": "Entity forms",
+  "markdown": "a\n          &#32;\nb\n",
+  "html": "<p>a\n \nb</p>\n"
+ },
+ {
+  "example": "decoded-ordered-dot",
+  "section": "Entity forms",
+  "markdown": "a\n\n&#49;. ol\n",
+  "html": "<p>a</p>\n<p>1. ol</p>\n"
+ },
+ {
+  "example": "decoded-ordered-paren",
+  "section": "Entity forms",
+  "markdown": "&#49;) ol\n",
+  "html": "<p>1) ol</p>\n"
+ },
+ {
+  "example": "decoded-ordered-many-digits",
+  "section": "Entity forms",
+  "markdown": "&#49;&#48;. ten\n\n&#52;&#50;) answer\n",
+  "html": "<p>10. ten</p>\n<p>42) answer</p>\n"
+ },
+ {
+  "example": "decoded-ordered-in-paragraph",
+  "section": "Entity forms",
+  "markdown": "a\n&#49;. b\n",
+  "html": "<p>a\n1. b</p>\n"
+ },
+ {
+  "example": "decoded-ordered-after-break",
+  "section": "Entity forms",
+  "markdown": "a  \n&#49;. b\n",
+  "html": "<p>a<br />\n1. b</p>\n"
+ },
+ {
+  "example": "decoded-ordered-in-item",
+  "section": "Entity forms",
+  "markdown": "- &#49;. ol\n",
+  "html": "<ul>\n<li>1. ol</li>\n</ul>\n"
+ },
+ {
+  "example": "decoded-ordered-in-quote",
+  "section": "Entity forms",
+  "markdown": "> &#49;. ol\n",
+  "html": "<blockquote>\n<p>1. ol</p>\n</blockquote>\n"
+ },
+ {
+  "example": "decoded-ordered-named-digit",
+  "section": "Entity forms",
+  "markdown": "&#x31;. hex\n",
+  "html": "<p>1. hex</p>\n"
+ },
+ {
+  "example": "decoded-bullets",
+  "section": "Entity forms",
+  "markdown": "&#45; a\n\n&#43; b\n\n&#42; c\n",
+  "html": "<p>- a</p>\n<p>+ b</p>\n<p>* c</p>\n"
+ },
+ {
+  "example": "decoded-heading-and-quote",
+  "section": "Entity forms",
+  "markdown": "&#35; h\n\n&#62; q\n",
+  "html": "<p># h</p>\n<p>&gt; q</p>\n"
+ },
+ {
+  "example": "decoded-fences",
+  "section": "Entity forms",
+  "markdown": "&#96;&#96;&#96;\nx\n\n&#126;&#126;&#126;\ny\n",
+  "html": "<p>```\nx</p>\n<p>~~~\ny</p>\n"
+ },
+ {
+  "example": "decoded-breaks",
+  "section": "Entity forms",
+  "markdown": "a\n\n&#45;&#45;&#45;\n\n&#42;&#42;&#42;\n\n&#95;&#95;&#95;\n",
+  "html": "<p>a</p>\n<p>---</p>\n<p>***</p>\n<p>___</p>\n"
+ },
+ {
+  "example": "decoded-underlines",
+  "section": "Entity forms",
+  "markdown": "a\n&#61;&#61;&#61;\n\nb\n&#45;&#45;&#45;\n",
+  "html": "<p>a\n===</p>\n<p>b\n---</p>\n"
+ },
+ {
+  "example": "decoded-table-pipe",
+  "section": "Entity forms",
+  "markdown": "&#124; a &#124; b &#124;\n&#124; &#45;&#45; &#124; &#45;&#45; &#124;\n",
+  "html": "<p>| a | b |\n| -- | -- |</p>\n"
+ },
+ {
+  "example": "escaped-ordered-dot",
+  "section": "Entity forms",
+  "markdown": "1\\. ol\n",
+  "html": "<p>1. ol</p>\n"
+ },
+ {
+  "example": "escaped-ordered-paren",
+  "section": "Entity forms",
+  "markdown": "a\n\n1\\) ol\n",
+  "html": "<p>a</p>\n<p>1) ol</p>\n"
+ },
+ {
+  "example": "decoded-ordered-item-continuation",
+  "section": "Entity forms",
+  "markdown": "- a\n  &#49;. x\n",
+  "html": "<ul>\n<li>a\n1. x</li>\n</ul>\n"
+ },
+ {
+  "example": "decoded-ordered-quote-continuation",
+  "section": "Entity forms",
+  "markdown": "> a\n> &#49;. x\n",
+  "html": "<blockquote>\n<p>a\n1. x</p>\n</blockquote>\n"
+ },
+ {
+  "example": "decoded-ordered-heading",
+  "section": "Entity forms",
+  "markdown": "## &#49;. x\n",
+  "html": "<h2>1. x</h2>\n"
+ },
+ {
+  "example": "decoded-ordered-setext",
+  "section": "Entity forms",
+  "markdown": "&#49;. x\n===\n",
+  "html": "<h1>1. x</h1>\n"
+ },
+ {
+  "example": "decoded-ordered-emphasis",
+  "section": "Entity forms",
+  "markdown": "*&#49;. x*\n",
+  "html": "<p><em>1. x</em></p>\n"
+ },
+ {
+  "example": "decoded-ordered-table-cell",
+  "section": "Entity forms",
+  "markdown": "| a |\n| - |\n| &#49;. x |\n",
+  "html": "<table>\n<thead>\n<tr>\n<th>a</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td>1. x</td>\n</tr>\n</tbody>\n</table>\n"
+ }
+]

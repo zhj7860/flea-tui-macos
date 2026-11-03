@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Flea
+GenericName=File Manager
+Comment=Fast, keyboard-first file manager
+# --gui states the mode rather than choosing it: bare flea opens the window too, so the flag is a contract, not a correction.
+Exec=flea --gui %f
+Icon=com.thisisgm.flea
+Terminal=false
+Categories=System;FileTools;FileManager;
+MimeType=inode/directory;
+Keywords=files;folder;manager;browser;flea;
+StartupWMClass=com.thisisgm.flea

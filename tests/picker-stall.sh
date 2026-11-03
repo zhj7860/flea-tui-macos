@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# A blocked read must be reaped, its stale partial line discarded, the replacement paged, and both read-only children reaped on cancel.
+set -eu
+. "$(dirname "$0")/../tools/flea-sandbox-guard"
+cd "$(dirname "$0")/.."
+command -v qs >/dev/null
+fixture="$FIXTURE_ROOT/picker-stall-$$"
+sandbox_make "$fixture"
+cleanup() {
+    # On a failed assertion the owned helper may still be blocked; never signal a recycled PID.
+    python3 - "$fixture" <<'PYEND' || true
+import os
+from pathlib import Path
+import signal
+import sys
+root = Path(sys.argv[1])
+assert (root / '.flea-test-sandbox').is_file()
+for text in (root / 'pids').read_text().splitlines() if (root / 'pids').exists() else []:
+    process = Path('/proc') / text
+    try:
+        if os.stat(process).st_uid == os.getuid() and os.fsencode(root / 'helper') in (process / 'cmdline').read_bytes().split(b'\0'):
+            os.kill(int(text), signal.SIGKILL)
+    except FileNotFoundError:
+        pass
+PYEND
+    sandbox_remove "$fixture"
+}
+trap cleanup EXIT
+mkdir -p "$fixture/flea/js"
+cp ui/PickerListing.qml ui/PickerLifecycle.qml ui/Backend.qml "$fixture/flea/"
+# The js files import each other (FolderSorts.js imports Sort.js), so the fixture takes the whole folder.
+cp ui/js/*.js "$fixture/flea/js/"
+# A test-only method fixes the rare cancel-before-FailedToStart event order, never the handler under test.
+python3 - "$fixture/flea/Backend.qml" <<'PYEND'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+anchor = '    function send(object) {'
+before = path.read_text()
+text = before.replace(anchor, '''
+    function testFailedStartDuringQuit() {
+        if (child.running) throw new Error("Failed-start fixture unexpectedly has a child")
+        root.queueing = true
+        root.quitting = true
+        child.runningChanged()
+    }
+    function send(object) {
+''', 1)
+if text == before:
+    print(f"FAIL: {path} has no anchor {anchor!r}", file=sys.stderr)
+    sys.exit(1)
+path.write_text(text)
+PYEND
+printf 'module flea\nsingleton ViewState 1.0 ViewState.qml\n' > "$fixture/flea/qmldir"
+printf 'pragma Singleton\nimport QtQuick\nQtObject { property var state: ({}) }\n' > "$fixture/flea/ViewState.qml"
+cp tests/picker-stall.qml "$fixture/shell.qml"
+cp tests/picker-stall-helper.py "$fixture/helper"
+chmod +x "$fixture/helper"
+mkfifo "$fixture/stall.fifo"
+for scenario in navigate cancel early missing early-missing missing-order; do
+    : > "$fixture/pids"
+    : > "$fixture/requests"
+    helper="$fixture/helper"
+    [[ $scenario != *missing* ]] || helper="$fixture/missing"
+    if ! QT_QPA_PLATFORM=offscreen QT_QPA_PLATFORMTHEME=generic FLEA_BIN="$helper" FLEA_PICKER_CASE="$scenario" FLEA_PICKER_FIXTURE="$fixture" \
+        timeout 6 qs -p "$fixture/shell.qml" > "$fixture/output" 2>&1; then
+        cat "$fixture/output"; exit 1
+    fi
+    grep -F "picker-stall $scenario PASS" "$fixture/output" || { cat "$fixture/output"; exit 1; }
+    if [[ $scenario == navigate ]] && [[ $(wc -l < "$fixture/pids") != 3 ]]; then
+        echo "FAIL: superseded navigation launched an extra worker"; exit 1
+    fi
+    while read -r pid; do
+        # A recycled PID counts only with this uid and the fixture helper on its cmdline.
+        if [[ -e "/proc/$pid/cmdline" ]] && [[ "$(stat -c %u "/proc/$pid" 2>/dev/null)" == "$(id -u)" ]] \
+            && grep -q -F "$fixture/helper" "/proc/$pid/cmdline" 2>/dev/null; then
+            echo "FAIL: owned helper $pid survived"; exit 1
+        fi
+    done < "$fixture/pids"
+    if grep -q '"c":"transfer"' "$fixture/requests"; then echo 'FAIL: picker sent a write'; exit 1; fi
+done
+printf 'picker-stall: 6 process lifecycle scenarios passed\n'

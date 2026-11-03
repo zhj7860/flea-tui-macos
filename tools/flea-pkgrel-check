@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Fails when a fresh pkgver does not start at pkgrel 1; docs/release.md states the usage and exit codes.
+set -u
+
+die() {
+  printf 'flea-pkgrel-check: ERROR %s\n' "$*" >&2
+  exit 2
+}
+
+[ "$#" -le 1 ] || die "usage: flea-pkgrel-check [COMMIT]"
+commit=${1:-HEAD}
+
+. "$(dirname "$0")/flea-pkgrel-field"
+
+command -v git >/dev/null 2>&1 || die "git is not on PATH"
+
+sha=$(git rev-parse --verify "$commit^{commit}" 2>/dev/null) || die "commit '$commit' is not a commit in this checkout"
+short=$(git rev-parse --short "$sha" 2>/dev/null) || die "cannot shorten $sha"
+
+# A shallow checkout holds no tags and no real parents, so any answer from it is a guess.
+shallow=$(git rev-parse --is-shallow-repository 2>/dev/null) || die "cannot tell whether this checkout is shallow"
+[ "$shallow" = true ] && die "this checkout is shallow, fetch tags before tagging a release"
+
+# The parent is the base: a tag sitting on the candidate itself is the release being cut, not the previous one.
+if ! git rev-parse --verify --quiet "$sha^" >/dev/null 2>&1; then
+  printf 'flea-pkgrel-check: PASS %s has no parent, so no previous release version to compare\n' "$short"
+  exit 0
+fi
+prevtag=$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' "$sha^" 2>/dev/null) \
+  || die "no vX.Y.Z tag reachable from $short, fetch tags before tagging a release"
+
+flea_file=packaging/flea/PKGBUILD
+bin_file=packaging/flea-bin/PKGBUILD
+cur_flea_ver=$(field "$sha" "$flea_file" pkgver) || die "cannot read pkgver from $flea_file at $short"
+cur_bin_ver=$(field "$sha" "$bin_file" pkgver) || die "cannot read pkgver from $bin_file at $short"
+cur_flea_rel=$(field "$sha" "$flea_file" pkgrel) || die "cannot read pkgrel from $flea_file at $short"
+cur_bin_rel=$(field "$sha" "$bin_file" pkgrel) || die "cannot read pkgrel from $bin_file at $short"
+prev_ver=$(field "$prevtag" "$flea_file" pkgver) || die "cannot read pkgver from $flea_file at $prevtag"
+
+if [ "$cur_flea_ver" != "$cur_bin_ver" ]; then
+  printf 'flea-pkgrel-check: FAIL %s says pkgver %s but %s says pkgver %s at %s\n' \
+    "$flea_file" "$cur_flea_ver" "$bin_file" "$cur_bin_ver" "$short"
+  exit 1
+fi
+if [ "$cur_flea_ver" = "$prev_ver" ]; then
+  printf 'flea-pkgrel-check: PASS pkgver %s unchanged since %s, pkgrel %s/%s\n' \
+    "$cur_flea_ver" "$prevtag" "$cur_flea_rel" "$cur_bin_rel"
+  exit 0
+fi
+if [ "$cur_flea_rel" != 1 ]; then
+  printf 'flea-pkgrel-check: FAIL %s has pkgrel %s, want 1 for the pkgver change %s to %s (%s to %s)\n' \
+    "$flea_file" "$cur_flea_rel" "$prev_ver" "$cur_flea_ver" "$prevtag" "$short"
+  exit 1
+fi
+if [ "$cur_bin_rel" != 1 ]; then
+  printf 'flea-pkgrel-check: FAIL %s has pkgrel %s, want 1 for the pkgver change %s to %s (%s to %s)\n' \
+    "$bin_file" "$cur_bin_rel" "$prev_ver" "$cur_flea_ver" "$prevtag" "$short"
+  exit 1
+fi
+printf 'flea-pkgrel-check: PASS pkgver %s to %s since %s, pkgrel 1 in both PKGBUILDs\n' \
+  "$prev_ver" "$cur_flea_ver" "$prevtag"

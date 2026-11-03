@@ -1,0 +1,474 @@
+#!/usr/bin/env bash
+# What was benched, recorded beside the numbers, so a result stays citable after the box moves on.
+#   printf '%s\n' "${ENTRANTS[@]}" | cut -d'|' -f1,2,4 | flea-bench-manifest <manifest> <fixture>
+# One "id|kind|comm" line per entrant on stdin. Every version here is read off the installed
+# artefact rather than typed, because a hand-kept table is wrong the first time anything upgrades.
+set -uo pipefail
+
+OUT=${1:-}
+FIXTURE=${2:-}
+[ -n "$OUT" ] && [ -n "$FIXTURE" ] || { echo "usage: flea-bench-manifest <manifest> <fixture>|close <csv>" >&2; exit 2; }
+
+FLEA_REPO=${FLEA_REPO:-$HOME/Work/claude/flea}
+FLEA_BIN=${FLEA_BIN:-$FLEA_REPO/target/release/flea}
+STRATA_SRC=${STRATA_SRC:-$HOME/Work/strata}
+# The terminal the TUI group runs in, named here because a TUI's image capability is the
+# terminal's before it is the program's.
+TUI_TERMINAL=${TUI_TERMINAL:-kitty}
+# A run long after the last upgrade is benching something other than "the latest version of each".
+UPGRADE_STALE_HOURS=${UPGRADE_STALE_HOURS:-24}
+
+say() { printf '%s\n' "$*" >> "$OUT"; }
+
+# The harness that ran: its sha256 and whether it matches the arm's committed copy.
+harness_marker() {
+  local tool=${HARNESS_TOOL:-} sum sha blob
+  [ -n "$tool" ] && [ -r "$tool" ] || { printf 'not recorded by the caller'; return; }
+  sum=$(sha256sum "$tool" | cut -d' ' -f1)
+  sha=$(git -C "$FLEA_REPO" rev-parse --short HEAD 2>/dev/null) || sha=unreadable
+  if git -C "$FLEA_REPO" cat-file -e HEAD:tools/flea-field-bench 2>/dev/null; then
+    blob=$(git -C "$FLEA_REPO" show HEAD:tools/flea-field-bench | sha256sum | cut -d' ' -f1)
+    if [ "$blob" = "$sum" ]; then
+      printf 'sha256 %s, identical to tools/flea-field-bench at %s, unpatched' "$sum" "$sha"
+    else
+      printf 'sha256 %s, PATCHED: differs from tools/flea-field-bench at %s' "$sum" "$sha"
+    fi
+  else
+    printf 'sha256 %s, no committed tools/flea-field-bench at %s to compare, so patched status is unknown' "$sum" "$sha"
+  fi
+}
+
+# The manifest tool that wrote: its absolute path and sha256, so a stale sibling never passes silently.
+manifest_tool_marker() {
+  local tool=${MANIFEST_TOOL:-} sum
+  [ -n "$tool" ] && [ -r "$tool" ] || { printf 'not recorded by the caller'; return; }
+  sum=$(sha256sum "$tool" | cut -d' ' -f1)
+  printf '%s sha256 %s' "$tool" "$sum"
+}
+
+# The anchor arm's tree, sha and tag, or the fact that no anchor arm ran in this run.
+anchor_line() {
+  local sha tag anchor=${ANCHOR_REPO:-} flea=${FLEA_REPO:-}
+  if [ -n "$anchor" ]; then
+    anchor=$(readlink -f "$anchor") || { printf '%s at unreadable untagged' "$ANCHOR_REPO"; return; }
+  fi
+  if [ -n "$flea" ]; then flea=$(readlink -f "$flea") || flea=""; fi
+  if [ -z "$anchor" ] || [ "$anchor" = "$flea" ]; then
+    printf 'no anchor arm ran in this run'; return
+  fi
+  sha=$(git -C "$anchor" rev-parse --short HEAD 2>/dev/null) || sha=unreadable
+  tag=$(git -C "$anchor" describe --tags --exact-match HEAD 2>/dev/null) || tag=untagged
+  printf '%s at %s %s' "$anchor" "$sha" "$tag"
+}
+
+# Entries in Quickshell's QML disk cache; arms run from sandbox paths add to it, and a cold launch pays for its size.
+qmlcache_count() {
+  local d="${XDG_CACHE_HOME:-$HOME/.cache}/quickshell/qmlcache"
+  if [ -d "$d" ]; then ls -U "$d" | wc -l; else printf 'absent'; fi
+}
+
+# Entries in Flea's own QML cache; an unset variable or a missing directory reads absent, never a 0 that looks measured.
+flea_qmlcache_entries() {
+  if [ -n "${FLEA_QMLCACHE:-}" ] && [ -d "$FLEA_QMLCACHE" ]; then ls -A "$FLEA_QMLCACHE" | wc -l; else printf 'absent'; fi
+}
+
+# What the run turned out to be, appended when it ends. Capability is stated from what each entrant
+# actually produced rather than inferred from the library table, and a refusal to rank is written
+# down, because a gap in a table gets filled in by whoever reads it next.
+if [ "$FIXTURE" = close ]; then
+  csv=${3:-}
+  [ -s "$OUT" ] || { echo "flea-bench-manifest: no manifest at $OUT to close" >&2; exit 1; }
+  [ -s "$csv" ] || { echo "flea-bench-manifest: no results at $csv" >&2; exit 1; }
+  # Closing twice appends a second set of blocks rather than replacing the first, and a manifest
+  # carrying two Run close sections is a document a reader has to reconcile. Refuse instead.
+  grep -q '^## Run close' "$OUT" \
+    && { echo "flea-bench-manifest: $OUT is already closed, refusing to append a second close" >&2; exit 1; }
+  KEYS_DIR="${csv%.csv}.keys"
+  KEY_MAP="$KEYS_DIR/fixture.map"
+  KEYS_TOOL="$(dirname "$0")/flea-bench-keys"
+
+  # Field positions come from the header, never from a count somebody remembers. Appending
+  # preview_ms as a sixteenth column silently invalidated a test that assumed ranked was last, and
+  # this file then printed "every row in this run is comparable" across a 21x gap in work.
+  header=$(head -1 "$csv")
+  col_of() {
+    local want=$1 i=0 f
+    while IFS= read -r f; do
+      i=$(( i + 1 ))
+      [ "$f" = "$want" ] && { printf '%s' "$i"; return 0; }
+    done < <(printf '%s\n' "$header" | tr ',' '\n')
+    return 1
+  }
+  need_col() {
+    local c
+    c=$(col_of "$1") || { echo "flea-bench-manifest: the CSV header has no '$1' column" >&2; exit 1; }
+    printf '%s' "$c"
+  }
+  id_col=$(need_col id)
+  run_col=$(need_col run)
+  thumbs_col=$(need_col thumbs_n)
+  fmt_col=$(need_col thumbs_by_format)
+  ranked_col=$(need_col ranked)
+  preview_col=$(need_col preview_ms)
+
+  # "jpg=601;png=189;unknown=0" and "png" gives 189, and a format the string does not mention is 0.
+  fmt_count() {
+    local blob=$1 ext=$2 v
+    v=$(printf '%s\n' "$blob" | tr ';' '\n' | grep "^$ext=" | cut -d= -f2)
+    printf '%s' "${v:-0}"
+  }
+
+  say ""
+  say "## Run close"
+  say ""
+  say "- ended: $(date -Is)"
+  say "- load average at end: $(cut -d' ' -f1-3 /proc/loadavg)"
+  say "- Quickshell QML cache at end: $(qmlcache_count) entries"
+  say "- tested Flea's own QML cache at end: $(flea_qmlcache_entries) entries in ${FLEA_QMLCACHE:-an unset path}"
+  say ""
+
+  # The entrant ids in the order the run produced them, without awk cleverness: a seen-list is one
+  # line longer and obvious to the next reader.
+  ids=""
+  while IFS=, read -r rid _rest; do
+    case " $ids " in *" $rid "*) continue ;; esac
+    ids="$ids $rid"
+  done < <(tail -n +2 "$csv")
+
+  say "## Formats produced, refused, and never attempted"
+  say ""
+  say "The formats come from the fixture's own key map, not from any one run's output, so a format"
+  say "an entrant never reached still gets a line. Produced is a thumbnail written. Refused is a"
+  say "failure marker the thumbnailer left. Never attempted is neither, which on this fixture mostly"
+  say "means the entrant settled before reaching those names: they sort by format, clip before image"
+  say "before notes before photo. **A never-attempted count is not a capability claim.**"
+  say ""
+  if [ -s "$KEY_MAP" ]; then
+    exts=$(cut -d' ' -f2 "$KEY_MAP" | LC_ALL=C sort -u)
+    tmp_fail=$(mktemp) || exit 1
+    for id in $ids; do
+      rows=$(grep "^$id," "$csv")
+      first_fmt=$(printf '%s\n' "$rows" | cut -d, -f"$fmt_col" | head -1)
+      case $first_fmt in
+        n/a) say "- $id: a TUI previews the cursor file and fills no grid, so it writes no thumbnails at all"; continue ;;
+        -) say "- $id: this run did not drop the thumbnail cache, so nothing here was measured"; continue ;;
+        unmeasurable) say "- $id: nothing reached the thumbnail cache, so this run makes no format claim about it either way; tools/flea-bench-capability is the instrument that answers what it can draw"; continue ;;
+      esac
+      : > "$tmp_fail"
+      for f in "$KEYS_DIR/$id"-run*.fail.keys; do
+        [ -s "$f" ] && cat "$f" >> "$tmp_fail"
+      done
+      LC_ALL=C sort -u -o "$tmp_fail" "$tmp_fail"
+      refused_fmt=$("$KEYS_TOOL" classify "$KEY_MAP" "$tmp_fail" 2>/dev/null)
+      produced=""
+      refused=""
+      untried=""
+      for ext in $exts; do
+        total=$(grep -c " $ext\$" "$KEY_MAP")
+        made=0
+        for v in $(printf '%s\n' "$rows" | cut -d, -f"$fmt_col" | tr ';' '\n' | grep "^$ext=" | cut -d= -f2); do
+          [ "$v" -gt "$made" ] && made=$v
+        done
+        ref=$(fmt_count "$refused_fmt" "$ext")
+        rest=$(( total - made - ref ))
+        [ "$made" -gt 0 ] && produced="${produced:+$produced, }$ext $made"
+        [ "$ref" -gt 0 ] && refused="${refused:+$refused, }$ext $ref"
+        [ "$rest" -gt 0 ] && untried="${untried:+$untried, }$ext $rest"
+      done
+      say "- $id produced ${produced:-nothing}; refused ${refused:-nothing}; never attempted ${untried:-nothing}"
+    done
+    rm -f "$tmp_fail"
+  else
+    say "- no key map for this run, so no format was classified"
+  fi
+
+  say ""
+  say "## The TUI group's preview timing"
+  say ""
+  never=""
+  for id in $ids; do
+    vals=$(grep "^$id," "$csv" | cut -d, -f"$preview_col" | LC_ALL=C sort -u)
+    [ "$vals" = "-1" ] && never="${never:+$never, }$id"
+  done
+  if [ -n "$never" ]; then
+    say "- $never: no image preview feature at all, so nothing was there to time. The -1 in"
+    say "  preview_ms is that fact and not a slow preview."
+  else
+    say "- every TUI entrant in this run produced a preview, or none was timed"
+  fi
+
+  say ""
+  say "## The equal-work column"
+  say ""
+  say "\`cpu_tree_s\` is the column to compare work on, for every entrant and not for Flea alone: a"
+  say "column carrying CPU-seconds for one entrant and wall-seconds for the rest is the incomparable"
+  say "rank this harness now refuses. It is on every row above."
+  say ""
+  say "**It is read from a control group of the run's own.** Each entrant run is a leaf cgroup that"
+  say "the launching shell joins before it forks the entrant, and \`cpu_tree_s\` is that leaf's"
+  say "\`usage_usec\`, plus a declared helper living outside it (thunar's tumblerd). The older sum of"
+  say "reaped ticks is kept as \`cpu_reaped_s\` and is blind to a decode under bwrap: measured, ten"
+  say "sandboxed decodes added 0.01 s to it against 0.95 s run bare. A column from before 0.3.2 is"
+  say "that blind figure and compares only against \`cpu_reaped_s\`. A TUI row's group holds its"
+  say "terminal too, so that group's column includes kitty's own drawing, the same kitty for each."
+  say ""
+  say "**What it does not yet include.** Flea thumbnails the viewport by design and every other entrant"
+  say "thumbnails the directory, so this column is comparable in units and not in work until Flea is"
+  say "driven through the whole listing. When that lands, the residual bias belongs here too: the"
+  say "driver's own cost falls in omarchy-drive's tree and is excluded, while Flea's cost of"
+  say "servicing that drive is included and no other entrant pays it. That biases against Flea, which is the"
+  say "safe direction, and it is not a reason to leave the number out."
+  say ""
+  say "## Rank refusals"
+  say ""
+  refused_rows=0
+  while IFS=, read -r rid rrun rranked; do
+    [ "$rranked" = yes ] && continue
+    printf -- '- %s run %s: %s\n' "$rid" "$rrun" "$rranked" >> "$OUT"
+    refused_rows=$(( refused_rows + 1 ))
+  done < <(tail -n +2 "$csv" | cut -d, -f"$id_col","$run_col","$ranked_col")
+  # The work-difference refusal. Flea thumbnails the viewport by design and another entrant thumbnails the
+  # directory, so a settle time compared across that gap is not a comparison at all.
+  counts=$(tail -n +2 "$csv" | cut -d, -f"$thumbs_col","$ranked_col" | grep ',yes$' \
+           | cut -d, -f1 | grep -E '^[0-9]+$' | grep -v '^0$' | LC_ALL=C sort -n)
+  lo=$(printf '%s\n' "$counts" | head -1)
+  hi=$(printf '%s\n' "$counts" | tail -1)
+  if [ -n "$lo" ] && [ -n "$hi" ] && [ "$hi" -ge $(( lo * 10 )) ]; then
+    say "- the ranked rows differ in thumbnail work by $(( hi / lo ))x, from $lo to $hi, so their settle times are not ranked against each other"
+    refused_rows=$(( refused_rows + 1 ))
+  fi
+  [ "$refused_rows" -gt 0 ] || say "- none: every row in this run is comparable"
+  exit 0
+fi
+
+[ -d "$FIXTURE" ] || { echo "flea-bench-manifest: no fixture at $FIXTURE" >&2; exit 1; }
+mkdir -p "$(dirname "$OUT")" || exit 1
+: > "$OUT" || exit 1
+
+# A version for a package that may not be installed, because an absent library is a capability fact
+# about this field and not a hole in the manifest.
+pkg_version() {
+  local v
+  v=$(pacman -Q "$1" 2>/dev/null | cut -d' ' -f2) || true
+  printf '%s' "${v:-absent}"
+}
+
+say "# Field bench manifest"
+say ""
+say "Written by tools/flea-bench-manifest. Every line below is read off the installed artefact."
+say ""
+say "## Run"
+say ""
+say "- date: $(date -Is)"
+say "- host: $(hostname), kernel $(uname -r)"
+say "- fixture: $FIXTURE"
+say "- fixture kind: ${FIXTURE_KIND:-btrfs}"
+say "- fixture payload: $(ls -U "$FIXTURE" | wc -l) visible entries, filesystem $(findmnt -no FSTYPE -T "$FIXTURE")"
+say "- TUI terminal: $TUI_TERMINAL $(pkg_version "$TUI_TERMINAL")"
+say "- flea launch line: ${FLEA_LAUNCH_LINE:-not recorded by the caller}"
+say "- harness: $(harness_marker)"
+say "- manifest tool: $(manifest_tool_marker)"
+say "- anchor arm (flea-anchor): $(anchor_line)"
+if [ -x "${STRATA_BIN:-}" ]; then
+  say "- strata binary: $STRATA_BIN reports '$("$STRATA_BIN" --version 2>&1 | head -1)', built from ${STRATA_SRC:-an unrecorded source tree}"
+fi
+# Each kind's rows rotate one place a run, so the place an entrant held is recorded beside the numbers.
+say "- launch order: each kind's rows rotate one place a run and reverse every other full cycle; place N is the Nth entrant of its kind that launched in that run, after ONLY and absence"
+if [ -n "${LAUNCH_ORDER:-}" ]; then
+  say '```'
+  printf '%s\n' "$LAUNCH_ORDER" >> "$OUT"
+  say '```'
+fi
+# An idle box is a run condition, so it is recorded rather than assumed. cargo test is a run
+# condition too now: its deadline test asserts three reads are instant, so a suite running inside
+# this window fails there and reads as an archive regression.
+say "- load average at start: $(cut -d' ' -f1-3 /proc/loadavg)"
+say "- waited $(( ${BENCH_IDLE_WAITED:-0} )) seconds for the box to go idle before starting"
+say "- Quickshell QML cache at start: $(qmlcache_count) entries"
+# The settle clock's shape, so a nas or usb row stays comparable to the run that produced it.
+say "- settle gap: ${SETTLE_GAP_MS:-500} ms of quiet ticks"
+say "- settle clock watches the entrant tree plus: ${SETTLE_WATCH_PIDS:-none}"
+if [ -n "${NET_IFACE:-}" ]; then say "- receive bytes counted on: $NET_IFACE"; fi
+say "- TUI preview target: ${PREVIEW_TARGET:-not recorded by the caller}"
+# This line WROTE "PASSED" from the mere presence of EXPECT_FILES and never compared it to the count
+# printed beside it, so it recorded a claim instead of making a check. It was true only because
+# flea-field-bench checks the same thing and fails first, which is a bound resting on something this
+# file does not control. It does its own comparison now.
+if [ -n "${EXPECT_FILES:-}" ]; then
+  payload_now=$(ls -U "$FIXTURE" | wc -l)
+  if [ "$payload_now" = "$EXPECT_FILES" ]; then
+    say "- fixture payload assertion: PASSED, $payload_now visible entries against the expected $EXPECT_FILES"
+  else
+    say "- fixture payload assertion: **FAILED**, $payload_now visible entries against the expected $EXPECT_FILES"
+    echo "flea-bench-manifest: the fixture holds $payload_now entries, not the $EXPECT_FILES expected" >&2
+  fi
+else
+  say "- fixture payload assertion: the caller did not report one, so the fixture is unverified"
+fi
+say ""
+
+# The histogram is counted from the fixture itself. Reading it off the builder script would document
+# what the fixture was meant to hold rather than what it holds.
+say "## Fixture by extension"
+say ""
+say '```'
+ls -U "$FIXTURE" | sed -n 's/.*\.\([A-Za-z0-9]*\)$/\1/p' | sort | uniq -c | sort -rn >> "$OUT"
+# sed drops a name with no dot in it, so those are counted separately rather than vanishing.
+printf '%7s no extension\n' "$(ls -U "$FIXTURE" | grep -c -v '\.')" >> "$OUT"
+say '```'
+say ""
+# The denominator any "N of M" phrasing has to use, derived here so nobody re-derives it by hand.
+# Only txt is excluded and only because no thumbnailer attempts a text file; every other extension
+# in this fixture is somebody's capability question, which is the whole point of the format column.
+total_payload=$(ls -U "$FIXTURE" | wc -l)
+not_thumbnailable=0
+for ext in ${NOT_THUMBNAILABLE:-txt}; do
+  n=$(ls -U "$FIXTURE" | grep -c "\.$ext$")
+  not_thumbnailable=$(( not_thumbnailable + n ))
+  say "- excluded from the denominator: $n .$ext files, which no thumbnailer attempts"
+done
+say "- thumbnailable denominator: $(( total_payload - not_thumbnailable )), from $total_payload visible entries less the $not_thumbnailable above"
+say ""
+
+say "## Package freshness"
+say ""
+# Sample input: [2026-09-01T01:09:31+0200] [PACMAN] starting full system upgrade
+upgrade_line=$(grep 'starting full system upgrade' /var/log/pacman.log 2>/dev/null | tail -1)
+if [ -n "$upgrade_line" ]; then
+  say "- last full system upgrade: $upgrade_line"
+  # "[2026-09-01T01:09:31+0200] [PACMAN] starting..." to "2026-09-01T01:09:31+0200", which date reads.
+  stamp=${upgrade_line%%]*}
+  stamp=${stamp:1}
+  upgrade_epoch=$(date -d "$stamp" +%s 2>/dev/null)
+  if [ -n "$upgrade_epoch" ]; then
+    age_h=$(( ( $(date +%s) - upgrade_epoch ) / 3600 ))
+    say "- age at run time: $age_h hours"
+    [ "$age_h" -gt "$UPGRADE_STALE_HOURS" ] \
+      && say "- WARNING: this run is more than $UPGRADE_STALE_HOURS hours past the last upgrade, so the packaged entrants are not necessarily current"
+  else
+    say "- age at run time: unreadable timestamp '$stamp', so freshness is unproven"
+  fi
+else
+  say "- no 'starting full system upgrade' line in /var/log/pacman.log, so freshness is unproven"
+fi
+say ""
+
+say "## Entrants"
+say ""
+say '```'
+# The whole list first: a loop that reads stdin while calling other programs inside it is one
+# stdin-consuming helper away from skipping an entrant silently.
+mapfile -t ENTRANT_ROWS
+for row in "${ENTRANT_ROWS[@]}"; do
+  IFS='|' read -r id kind comm <<< "$row"
+  # A row grepped out of the bench arrives indented where one expanded from the array does not, and
+  # an untrimmed id misses its own case arm: flea reported itself as quickshell 0.3.1 that way.
+  id=${id//[[:space:]]/}
+  kind=${kind//[[:space:]]/}
+  comm=${comm//[[:space:]]/}
+  [ -n "${id:-}" ] || continue
+  case $id in
+    flea|flea-tui|flea-anchor)
+      # flea-tui is the arm's own binary run with --tui and flea-anchor the anchor arm, never the installed package.
+      repo=$FLEA_REPO bin=$FLEA_BIN
+      [ "$id" = flea-anchor ] && repo=${ANCHOR_REPO:-} bin=${ANCHOR_BIN:-}
+      # An empty repo names no git at all: git -C "" would read the caller's directory.
+      if [ -z "$repo" ]; then
+        sha=absent tag=absent dirty=absent
+      # Product, instrument and package paths count; session-only files elsewhere in the tree do not.
+      elif sha=$(git -C "$repo" rev-parse --short HEAD 2>/dev/null) \
+        && changes=$(git -C "$repo" status --porcelain -- src ui tests tools packaging Cargo.toml Cargo.lock PKGBUILD 2>/dev/null); then
+        tag=$(git -C "$repo" describe --tags --exact-match HEAD 2>/dev/null) || tag="untagged"
+        dirty=clean
+        [ -z "$changes" ] || dirty=DIRTY
+      else
+        # A path git cannot read is said so, never recorded as a blank sha that reads clean.
+        sha=unreadable tag=unreadable dirty=unreadable
+      fi
+      if [ -n "$bin" ] && [ -x "$bin" ]; then
+        built=$(date -Is -r "$bin")
+        size=$(stat -c %s "$bin")
+      else
+        built=absent; size=0
+      fi
+      printf '%-10s %-4s source %s %s (%s), release binary built %s, %s bytes\n' \
+        "$id" "$kind" "${sha:-absent}" "$tag" "$dirty" "$built" "$size" >> "$OUT"
+      ;;
+    strata)
+      # The one unpackaged entrant. A tag is what a user installs, so the tag is what the row records
+      # and a bare sha is called out as not being a release.
+      desc=$(git -C "$STRATA_SRC" describe --tags --always 2>/dev/null)
+      # The prose below names the tag the row records, so the two cannot drift apart.
+      strata_tag=$desc
+      when=$(git -C "$STRATA_SRC" log -1 --format=%cs 2>/dev/null)
+      note=""
+      case $desc in
+        *-g*) note=" NOT A RELEASE, this is a mid-stream commit" ;;
+      esac
+      printf '%-10s %-4s source %s committed %s, built locally from this checkout%s\n' \
+        "$id" "$kind" "${desc:-absent}" "${when:-unknown}" "$note" >> "$OUT"
+      ;;
+    *)
+      path=$(command -v "$comm" 2>/dev/null)
+      if [ -z "$path" ]; then
+        printf '%-10s %-4s NOT INSTALLED\n' "$id" "$kind" >> "$OUT"
+        continue
+      fi
+      line=$(pacman -Qo "$path" 2>/dev/null)
+      if [ -n "$line" ]; then
+        printf '%-10s %-4s %s\n' "$id" "$kind" "${line##* is owned by }" >> "$OUT"
+      else
+        printf '%-10s %-4s unpackaged at %s, built %s\n' \
+          "$id" "$kind" "$path" "$(date -Is -r "$path")" >> "$OUT"
+      fi
+      ;;
+  esac
+done
+say '```'
+say ""
+say "strata is the one entrant pacman did not install. It is built here from the ${strata_tag:-unknown} tag in a"
+say "local checkout. **The project also publishes a prebuilt x86_64 binary for that tag and it was"
+say "not used**: this harness does not download and execute a third-party binary unattended, and"
+say "every packaged entrant is itself built from source by the distribution, so building from the"
+say "tag is more consistent with the field than fetching one binary would be. Build flags may differ"
+say "from the published release, which is equally true of every AUR entrant in the list."
+say ""
+
+# 12e directive 2: every config recorded verbatim beside its version, so a reader reproduces the
+# configuration instead of reconstructing it. These are the materialised files, not the committed
+# templates, because one of them has a path substituted into it at run time.
+if [ -n "${TUI_CONFIG_DIR:-}" ] && [ -d "${TUI_CONFIG_DIR:-}" ]; then
+  say "## The TUI group's configuration, as it ran"
+  say ""
+  say "Provenance per entrant is in \`tools/flea-bench-tui/README.md\`. lf's is AUTHORED HERE"
+  say "because lf ships no image preview at all; every other file came from that project's own docs."
+  say ""
+  while IFS= read -r f; do
+    rel=${f#"$TUI_CONFIG_DIR"/}
+    size=$(stat -c %s "$f")
+    say "### $rel"
+    say ""
+    # A big file here is the nnn plugin, which is nnn's own and is named rather than reprinted.
+    if [ "$size" -gt 4096 ]; then
+      say "$size bytes, not reprinted: this is the file the entrant's own package ships."
+      say ""
+      continue
+    fi
+    say '```'
+    cat "$f" >> "$OUT"
+    say '```'
+    say ""
+  done < <(find "$TUI_CONFIG_DIR" -type f ! -name '.*' | LC_ALL=C sort)
+fi
+
+say "## Libraries the entrants render through"
+say ""
+say "An absent one is a capability fact about this field, not a gap in the record."
+say ""
+say '```'
+for p in qt6-base gtk3 gtk4 glib2 ffmpegthumbnailer libheif webp-pixbuf-loader qt6-imageformats chafa ueberzugpp; do
+  printf '%-22s %s\n' "$p" "$(pkg_version "$p")" >> "$OUT"
+done
+say '```'
+
+exit 0

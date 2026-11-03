@@ -1,0 +1,71 @@
+#!/bin/bash
+# Builds the capability-matched fixture, see AGENTS.md "Fixtures".
+set -u
+# Hard rule 9's guard owns FIXTURE_ROOT and every absolute, root and containment check below. The
+# marker stays this fixture's own name, so a media build can never delete a matched fixture.
+. "$(dirname "$0")/../tools/flea-sandbox-guard"
+
+
+src=${SRC:-$FIXTURE_ROOT/flea-media-btrfs}
+dir=${DIR:-$FIXTURE_ROOT/flea-matched-btrfs}
+
+# The marker is what stands between DIR and rm -rf: no marker, no delete.
+marker=.flea-matched-fixture
+
+fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
+
+sandbox_require "$dir"
+parent=$(dirname "$dir")
+
+# corner: tmpfs pages are the filesystem, so drop_caches cannot evict them, see AGENTS.md "Fixtures".
+fs=$(findmnt -no FSTYPE -T "$parent" 2>/dev/null)
+if [ -z "$fs" ]; then
+  fail "findmnt could not name the filesystem holding $parent"
+fi
+if [ "$fs" = tmpfs ]; then
+  fail "$dir would be on tmpfs, where a cold run measures nothing"
+fi
+
+if [ ! -d "$src" ]; then
+  fail "no media fixture at $src, build it with tools/flea-media-fixture first"
+fi
+
+# Every refusal is above this line, because everything below it destroys or writes.
+if [ -e "$dir" ]; then
+  if [ ! -f "$dir/$marker" ]; then
+    fail "$dir exists and carries no $marker, so this script will not delete it"
+  fi
+  rm -rf "$dir" || fail "could not remove the previous fixture at $dir"
+fi
+mkdir -p "$dir" || fail "could not create $dir"
+touch "$dir/$marker" || fail "could not write the marker $dir/$marker"
+
+# heic goes because dolphin renders none of it and mkv because nautilus and pcmanfm render none.
+# The patterns are literal in the case arm, because a variable holding them would pathname-expand here.
+copied=0
+for f in $(ls "$src"); do
+  case $f in
+    *.heic|*.mkv) continue ;;
+  esac
+  # reflink is safe HERE and not in flea-media-fixture, because this is one copy per source file
+  # rather than 400 copies of one seed, so a cold read still touches a distinct extent per file.
+  cp --reflink=auto "$src/$f" "$dir/$f" || fail "could not copy $f"
+  copied=$(( copied + 1 ))
+done
+
+# ls skips the dotfile marker, so this counts exactly the files that were meant to land.
+built=$(ls "$dir" | wc -l)
+if [ "$built" -ne "$copied" ]; then
+  fail "copied $copied files but $dir holds $built"
+fi
+if [ "$copied" -eq 0 ]; then
+  fail "copied nothing out of $src, so it is not a media fixture"
+fi
+left=$(ls "$dir" | grep -cE '\.(heic|mkv)$')
+if [ "$left" -ne 0 ]; then
+  fail "$left dropped-type files survived into $dir"
+fi
+
+sync
+echo "flea-matched-fixture: $built files in $dir on $(findmnt -no FSTYPE -T "$dir"), EXPECT_FILES=$(ls -A "$dir" | wc -l)"
+ls "$dir" | sed 's/.*\.//' | sort | uniq -c | sort -rn

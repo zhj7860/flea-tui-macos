@@ -1,0 +1,394 @@
+//@ pragma ShellId flea-menu-card-sink-test
+import QtQuick
+import QtTest
+import Quickshell
+import "flea" as Flea
+import "qml-probe.js" as QmlProbe
+
+// tests/menu-card-sink.sh's harness: real pointer events on the real ui/ContextMenu.qml, on the main frame and the flyout.
+ShellRoot {
+    id: shell
+
+    property int checks: 0
+    property var failures: []
+    property int ticks: 0
+    property int scene: -1
+    property bool done: false
+    property var chosenLog: []
+    property var refusedLog: []
+    // Ticks a fresh menu settles before the first scene acts.
+    readonly property int settleTicks: 3
+    // Ticks a scene waits for its rows to stand before it runs anyway and fails by name.
+    readonly property int sceneTickBound: 50
+    // Rows in the overflowing flyout, enough to outgrow the 480 px window at any row height.
+    readonly property int overflowRows: 40
+    // Where the scene's far corner is, clear of both frames, for the click that must close.
+    readonly property point outside: Qt.point(630, 470)
+
+    function log(line) { QmlProbe.log("MENUSINK", line) }
+    function quit() { Quickshell.execDetached(["kill", String(Quickshell.processId)]) }
+    function check(name, actual, expected) { QmlProbe.checkQuiet(shell, name, actual, expected) }
+    function press(item, x, y, button) { driver.mousePress(item, x, y, button, Qt.NoModifier, 1) }
+    function release(item, x, y, button) { driver.mouseRelease(item, x, y, button, Qt.NoModifier, 1) }
+    function click(item, x, y, button) { shell.press(item, x, y, button); shell.release(item, x, y, button) }
+    function clickCentre(item, button) { shell.click(item, item.width / 2, item.height / 2, button) }
+
+    // A row, a separator and the card's top padding, as {name, item, x, y} for one card.
+    function dead(card, rowAt, sepAt, padItem, padY) {
+        var row = card === "main" ? menu.itemFor(rowAt) : menu.submenuItemFor(rowAt)
+        var sep = card === "main" ? menu.itemFor(sepAt) : menu.submenuItemFor(sepAt)
+        return [{ name: "disabled", item: row, x: row.width / 2, y: row.height / 2 },
+                { name: "separator", item: sep, x: sep.width / 2, y: sep.height / 2 },
+                { name: "padding", item: padItem, x: padItem.width / 2, y: padY }]
+    }
+
+    // One press and release on a dead point leaves the menu, the cursors and the chosen log as they were.
+    function sink(card, which, button) {
+        var pad = Flea.Theme.spacing.rowPaddingY / 2
+        var points = card === "main" ? shell.dead("main", 5, 2, menu.frameItem, pad)
+                                     : shell.dead("flyout", 1, 2, menu.submenuFrameItem, pad)
+        var point = points.filter(function (p) { return p.name === which })[0]
+        var tag = card + ":" + which + ":" + (button === Qt.LeftButton ? "left" : "right")
+        var cursor = menu.cursor, sub = menu.submenuCursor, open = menu.openSubmenuRow
+        var chosen = shell.chosenLog.length, refused = shell.refusedLog.length
+        shell.press(point.item, point.x, point.y, button)
+        shell.check(tag + ":press-open", menu.opened, true)
+        shell.release(point.item, point.x, point.y, button)
+        shell.check(tag + ":release-open", menu.opened, true)
+        shell.check(tag + ":cursor", menu.cursor, cursor)
+        shell.check(tag + ":sub-cursor", menu.submenuCursor, sub)
+        shell.check(tag + ":flyout-row", menu.openSubmenuRow, open)
+        shell.check(tag + ":nothing-chosen", shell.chosenLog.length, chosen)
+        shell.check(tag + ":nothing-refused", shell.refusedLog.length, refused)
+    }
+
+    function report() {
+        QmlProbe.reportCard(shell, ticker)
+        shell.quit()
+    }
+
+    FloatingWindow {
+        implicitWidth: 640
+        implicitHeight: 480
+        color: "#303030"
+        // Three bare rows for the hint ink check, under the menu's ground and never pointed at.
+        Column {
+            enabled: false
+            width: 200
+            Flea.MenuRow { id: deadKeyRow; width: parent.width; entry: ({ label: "Paste", glyph: "clipboard", action: "paste", disabled: true, hint: "p" }) }
+            Flea.MenuRow { id: liveKeyRow; width: parent.width; entry: ({ label: "Copy", glyph: "copy", action: "copy", hint: "y" }) }
+            Flea.MenuRow { id: dangerKeyRow; width: parent.width; entry: ({ label: "Move to Trash", glyph: "trash", action: "trash", danger: true, hint: "d" }) }
+            Flea.MenuRow { id: litKeyRow; width: parent.width; current: true; entry: ({ label: "Open", glyph: "folder-open", action: "open", hint: "enter" }) }
+            Flea.MenuRow { id: squareKeyRow; width: parent.width; entry: ({ label: "Update Flea", glyph: "download", action: "updateFlea", hint: "0.3.8", hintSquare: true }) }
+            Flea.MenuRow { id: reasonRow; width: parent.width; entry: ({ label: "Extract", glyph: "archive-out", action: "extract", disabled: true, hint: "bsdtar is not installed", hintWrap: true }) }
+            // A disabled sheet row dims exactly like a dead menu row, cap text and label both.
+            Flea.KeymapSheetResult { id: deadSheetRow; width: parent.width; modelData: ({ keys: "x", label: "Sheet Disabled", disabled: true, where: "Demo" }); index: 0; resultCursor: -1; query: ""; capWidth: 60; capSize: 20; capGap: 8; rowPitch: 30; textInset: 4; whereShare: 0.3 }
+            Flea.KeymapSheetResult { id: liveSheetRow; width: parent.width; modelData: ({ keys: "x", label: "Sheet Live", disabled: false, where: "Demo" }); index: 0; resultCursor: -1; query: ""; capWidth: 60; capSize: 20; capGap: 8; rowPitch: 30; textInset: 4; whereShare: 0.3 }
+        }
+        Flea.Glyph { id: invertGlyph; width: 19; height: 19; name: "contrast"; color: "#ff0000" }
+        Flea.Glyph { id: plainGlyph; width: 19; height: 19; name: "copy"; color: "#ff0000" }
+        Flea.ContextMenu { id: menu; anchors.fill: parent }
+        Item { anchors.fill: parent; TestEvent { id: driver } }
+    }
+    // The rest scene's own window, so the pointer history it starts from is only what that scene gives it.
+    FloatingWindow {
+        implicitWidth: 640
+        implicitHeight: 480
+        color: "#303030"
+        Flea.ContextMenu { id: restMenu; anchors.fill: parent }
+    }
+
+    Connections {
+        target: menu
+        function onChosen(action) { shell.chosenLog.push(action) }
+        function onRefused(reason) { shell.refusedLog.push(reason) }
+    }
+
+    // A file row's menu: open, openWith (flyout), separator, cut, copy, paste (disabled: nothing on the clipboard), ...
+    function openMain(target) {
+        var m = target || menu
+        m.rowMode = 0o100644
+        m.selectionCount = 1
+        m.rowIsFile = true
+        m.openWithLoaded = true
+        m.openWithApps = [{ id: "a", label: "App A" }, { id: "b", label: "App B" }]
+        m.openAt(Qt.point(100, 60))
+        m.cursor = 3
+    }
+    function ready(item) { return item && item.height > 0 }
+    // The card body under a frame, by type name, whatever else the frame holds beside it.
+    function cardUnder(frame) {
+        for (var i = 0; i < frame.children.length; i++)
+            if (String(frame.children[i]).indexOf("CardScroll") >= 0) return frame.children[i]
+        return null
+    }
+    // The ground takes both buttons and closes on release, so a click that leaves the menu open is the card's doing.
+    function outsideClose(tag, button) {
+        var out = menu.mapFromItem(null, shell.outside.x, shell.outside.y)
+        shell.press(menu, out.x, out.y, button)
+        shell.check(tag + ":outside-press-open", menu.opened, true)
+        shell.release(menu, out.x, out.y, button)
+        shell.check(tag + ":outside-release-closes", menu.opened, false)
+    }
+
+    // The Open with flyout carries a disabled row of its own, which the real inventory never does.
+    function openFlyoutWithDisabled() {
+        shell.openMain()
+        var entries = menu.entries.slice()
+        var flyoutRow = Object.assign({}, entries[1])
+        flyoutRow.submenu = [{ id: "a", label: "App A" }, { id: "off", label: "Unavailable", disabled: true },
+                             { separator: true }, { id: "b", label: "App B" }]
+        entries[1] = flyoutRow
+        menu.entries = entries
+        menu.cursor = 1
+        menu.openSubmenu(1)
+    }
+    // An Open with flyout of overflowRows rows (App A, a disabled row, a separator, then enabled rows) taller than its frame.
+    function openOverflowingFlyout(target) {
+        var m = target || menu
+        shell.openMain(m)
+        var entries = m.entries.slice()
+        var flyoutRow = Object.assign({}, entries[1])
+        var rows = [{ id: "a", label: "App A" }, { id: "off", label: "Unavailable", disabled: true }, { separator: true }]
+        for (var i = rows.length; i < shell.overflowRows; i++)
+            rows.push({ id: "r" + i, label: "App " + i })
+        flyoutRow.submenu = rows
+        entries[1] = flyoutRow
+        m.entries = entries
+        m.cursor = 1
+        m.openSubmenu(1)
+    }
+    // The live Open with flyout: App A, App B, a separator, Another application.
+    function openLiveFlyout() {
+        shell.openMain()
+        menu.cursor = 1
+        menu.openSubmenu(1)
+    }
+
+    // Each scene opens a fresh menu, waits for its rows to stand, then runs once, so one failure never hides the next.
+    function sinkScenes() {
+        var out = []
+        var cards = ["main", "flyout"], points = ["disabled", "separator", "padding"]
+        var buttons = [Qt.LeftButton, Qt.RightButton]
+        for (var c = 0; c < cards.length; c++)
+            for (var p = 0; p < points.length; p++)
+                for (var b = 0; b < buttons.length; b++)
+                    out.push(shell.sinkScene(cards[c], points[p], buttons[b]))
+        return out
+    }
+    function sinkScene(card, which, button) {
+        var main = card === "main"
+        return { setup: main ? shell.openMain : shell.openFlyoutWithDisabled,
+                 ready: function () { return main ? menu.itemFor(5) : menu.submenuItemFor(3) },
+                 run: function () { shell.sink(card, which, button) } }
+    }
+    readonly property var scenes: shell.sinkScenes().concat([
+        { setup: shell.openMain, ready: function () { return menu.itemFor(6) }, run: shell.mainWheelHover },
+        { setup: shell.openMain, ready: function () { return menu.itemFor(4) }, run: shell.mainEnabled },
+        { setup: shell.openMain, ready: function () { return menu.itemFor(4) }, run: shell.mainOutside },
+        { setup: shell.openMain, ready: function () { return menu.itemFor(4) }, run: shell.mainOutsideRight },
+        { setup: shell.openOverflowingFlyout, ready: function () { return menu.submenuItemFor(3) }, run: shell.flyoutWheelHover },
+        { setup: shell.openFlyoutWithDisabled, ready: function () { return menu.submenuItemFor(3) }, run: shell.flyoutOutside },
+        { setup: shell.openFlyoutWithDisabled, ready: function () { return menu.submenuItemFor(3) }, run: shell.flyoutOutsideRight },
+        { setup: shell.openLiveFlyout, ready: function () { return menu.submenuItemFor(0) }, run: shell.flyoutEnabled },
+        { setup: shell.openMain, ready: function () { return menu.itemFor(4) }, run: function () { shell.hintInk(); shell.glyphFill(); shell.sheetDim() } },
+        { setup: shell.openRestingFlyout, ready: function () { return restMenu.submenuItemFor(3) }, run: shell.restingPointer }
+    ])
+
+    Timer {
+        id: ticker
+        interval: 100
+        repeat: true
+        running: true
+        onTriggered: shell.advance()
+    }
+
+    function advance() {
+        if (shell.done) return
+        shell.ticks++
+        if (shell.scene < 0) {
+            if (shell.ticks < shell.settleTicks) return
+            shell.scene = 0
+            shell.chosenLog = []
+            shell.scenes[0].setup()
+            shell.ticks = 0
+            return
+        }
+        var current = shell.scenes[shell.scene]
+        if (!shell.ready(current.ready()) && shell.ticks <= shell.sceneTickBound) return
+        current.run()
+        shell.scene++
+        shell.ticks = 0
+        if (shell.scene >= shell.scenes.length) {
+            shell.report()
+            return
+        }
+        shell.chosenLog = []
+        shell.scenes[shell.scene].setup()
+    }
+
+    function mainWheelHover() {
+        var frame = menu.frameItem
+        // The wheel over a disabled row steps the highlight one row and never pixel scrolls.
+        var disabled = menu.itemFor(5)
+        driver.mouseWheel(disabled, disabled.width / 2, disabled.height / 2, Qt.NoButton, Qt.NoModifier, 0, -120, 1)
+        shell.check("main:wheel-steps-one", menu.cursor, 4)
+        shell.check("main:wheel-no-pixel-scroll", shell.cardUnder(frame).contentY, 0)
+        shell.check("main:card-not-interactive", shell.cardUnder(frame).interactive, false)
+        // The highlight still follows the pointer: two moves across an enabled row, the first one arms it.
+        var row = menu.itemFor(6)
+        driver.mouseMove(row, 10, row.height / 2, 1, Qt.NoButton, Qt.NoModifier)
+        driver.mouseMove(row, 20, row.height / 2, 1, Qt.NoButton, Qt.NoModifier)
+        shell.check("main:hover-follows", menu.cursor, 6)
+        // A submenu row opens its flyout and the menu stays open.
+        shell.clickCentre(menu.itemFor(1), Qt.LeftButton)
+        shell.check("main:submenu-click-opens", menu.openSubmenuRow, 1)
+        shell.check("main:submenu-click-open", menu.opened, true)
+    }
+    function mainEnabled() {
+        shell.clickCentre(menu.itemFor(4), Qt.LeftButton)
+        shell.check("main:enabled-once", shell.chosenLog, ["copy"])
+        shell.check("main:enabled-closes", menu.opened, false)
+    }
+    // The Text a row draws a given string in, by its text, whatever else the row holds beside it.
+    function textDrawn(row, text) {
+        for (var i = 0; i < row.children.length; i++)
+            if (row.children[i].text === text) return row.children[i]
+        return null
+    }
+    // The first Text under an item carrying a string, whatever else the row holds beside it.
+    function findText(item, text) {
+        var out = null
+        var walk = function (node) {
+            for (var i = 0; i < node.children.length; i++) {
+                var child = node.children[i]
+                if (out === null && child.text === text) out = child
+                walk(child)
+            }
+        }
+        walk(item)
+        return out
+    }
+    // A disabled sheet row dims its cap text, cap frame and label in the muted ink, a live row stays whole.
+    function sheetDim() {
+        var deadCap = shell.findText(deadSheetRow, "x"), deadLabel = shell.findText(deadSheetRow, "Sheet Disabled")
+        shell.check("sheet:disabled-cap-dims", deadCap ? deadCap.opacity : -1, Flea.Theme.disabledOpacity)
+        shell.check("sheet:disabled-cap-keeps-muted-ink", deadCap ? String(deadCap.color) : "none", String(Flea.Theme.color.muted))
+        shell.check("sheet:disabled-label-dims", deadLabel ? deadLabel.opacity : -1, Flea.Theme.disabledOpacity)
+        shell.check("sheet:disabled-label-keeps-muted-ink", deadLabel ? String(deadLabel.color) : "none", String(Flea.Theme.color.muted))
+        // The cap's frame is the text's parent, and it dims with the row as the text does.
+        shell.check("sheet:disabled-cap-frame-dims", deadCap ? String(deadCap.parent.border.color) : "none", String(Qt.alpha(Flea.Theme.color.mutedFrame, Flea.Theme.disabledOpacity)))
+        var liveCap = shell.findText(liveSheetRow, "x"), liveLabel = shell.findText(liveSheetRow, "Sheet Live")
+        // Every opacity from the frame up to the window: a dim on the row or any container would stack on the alpha.
+        var chain = function (item) { var o = 1; for (var p = item; p; p = p.parent) o *= p.opacity; return o }
+        shell.check("sheet:disabled-cap-frame-dims-once", deadCap ? chain(deadCap.parent) : -1, liveCap ? chain(liveCap.parent) : -2)
+        shell.check("sheet:live-cap-is-full-opacity", liveCap ? liveCap.opacity : -1, 1)
+        shell.check("sheet:live-label-is-full-opacity", liveLabel ? liveLabel.opacity : -1, 1)
+        shell.check("sheet:live-cap-frame-is-whole", liveCap ? String(liveCap.parent.border.color) : "none", String(Flea.Theme.color.mutedFrame))
+        var deadWhere = shell.findText(deadSheetRow, " in Demo"), liveWhere = shell.findText(liveSheetRow, " in Demo")
+        shell.check("sheet:disabled-where-dims", deadWhere ? deadWhere.opacity : -1, Flea.Theme.disabledOpacity)
+        shell.check("sheet:live-where-is-full-opacity", liveWhere ? liveWhere.opacity : -1, 1)
+    }
+    // A dead row dims as a whole, so its key hint takes the label's ink and opacity; a reason sentence stays readable.
+    function hintInk() {
+        var deadLabel = shell.textDrawn(deadKeyRow, "Paste"), deadHint = shell.textDrawn(deadKeyRow, "p")
+        shell.check("hint:dead-label-dims", deadLabel.opacity < 1, true)
+        shell.check("hint:dead-key-hint-ink-is-the-label-ink", String(deadHint.color), String(deadLabel.color))
+        shell.check("hint:dead-key-hint-opacity-is-the-label-opacity", deadHint.opacity, deadLabel.opacity)
+        var liveLabel = shell.textDrawn(liveKeyRow, "Copy"), liveHint = shell.textDrawn(liveKeyRow, "y")
+        // MenuAdditions040 draws every key hint in the muted role, the glyph's own ink, whatever ink the label takes.
+        shell.check("hint:live-label-is-foreground-so-the-test-can-tell", String(liveLabel.color), String(Flea.Theme.color.foreground))
+        shell.check("hint:live-key-hint-is-muted", String(liveHint.color), String(Flea.Theme.color.muted))
+        var dangerLabel = shell.textDrawn(dangerKeyRow, "Move to Trash"), dangerHint = shell.textDrawn(dangerKeyRow, "d")
+        shell.check("hint:danger-label-is-the-error-ink", String(dangerLabel.color), String(Flea.Theme.color.error))
+        shell.check("hint:danger-key-hint-is-muted", String(dangerHint.color), String(Flea.Theme.color.muted))
+        var litLabel = shell.textDrawn(litKeyRow, "Open"), litHint = shell.textDrawn(litKeyRow, "enter")
+        shell.check("hint:lit-row-is-lit", litKeyRow.current, true)
+        shell.check("hint:lit-label-is-not-muted-so-the-test-can-tell", String(litLabel.color) !== String(Flea.Theme.color.muted), true)
+        shell.check("hint:lit-key-hint-is-muted", String(litHint.color), String(Flea.Theme.color.muted))
+        var squareLabel = shell.textDrawn(squareKeyRow, "Update Flea"), squareHint = shell.textDrawn(squareKeyRow, "0.3.8")
+        shell.check("hint:update-label-is-foreground-so-the-test-can-tell", String(squareLabel.color), String(Flea.Theme.color.foreground))
+        shell.check("hint:update-version-keeps-the-row-ink", String(squareHint.color), String(squareLabel.color))
+        shell.check("hint:key-hint-is-caption-size", liveHint.font.pixelSize, Flea.Theme.font.caption)
+        shell.check("hint:live-key-hint-is-full-opacity", liveHint.opacity, 1)
+        var reason = shell.textDrawn(reasonRow, "bsdtar is not installed")
+        shell.check("hint:dead-reason-stays-foreground", String(reason.color), String(Flea.Theme.color.foreground))
+        shell.check("hint:dead-reason-is-full-opacity", reason.opacity, 1)
+    }
+    // Every ShapePath fill a glyph draws, across each Shape it holds: only a mark that names a solid part may have a fill.
+    function fills(glyph) {
+        var out = []
+        for (var c = 0; c < glyph.children.length; c++) {
+            var paths = glyph.children[c].data
+            for (var i = 0; i < paths.length; i++) out.push(paths[i].fillColor)
+        }
+        return out
+    }
+    function glyphFill() {
+        var plain = shell.fills(plainGlyph), invert = shell.fills(invertGlyph)
+        shell.check("glyph:a mark without a solid part holds one shape and one transparent fill", [plainGlyph.children.length, plain.length, plain[0].a], [1, 1, 0])
+        shell.check("glyph:invert selection holds a second shape for its solid part", invertGlyph.children.length, 2)
+        var solid = invert.filter(function (fill) { return fill.a !== 0 })
+        shell.check("glyph:and exactly one fill is drawn", solid.length, 1)
+        shell.check("glyph:in the mark's own color", solid.length ? String(solid[0]) : "none", String(invertGlyph.color))
+    }
+    function mainOutside() { shell.outsideClose("main", Qt.LeftButton) }
+    function mainOutsideRight() { shell.outsideClose("main-right", Qt.RightButton) }
+
+    function flyoutWheelHover() {
+        var sub = menu.submenuFrameItem
+        var card = shell.cardUnder(sub)
+        shell.check("flyout:overflows", card.contentHeight > card.height, true)
+        shell.check("flyout:card-not-interactive", card.interactive, false)
+        // The wheel over a disabled row steps the highlight one row (past the separator) and never pixel scrolls.
+        var disabled = menu.submenuItemFor(1)
+        driver.mouseWheel(disabled, disabled.width / 2, disabled.height / 2, Qt.NoButton, Qt.NoModifier, 0, -120, 1)
+        shell.check("flyout:wheel-steps-one", menu.submenuCursor, 3)
+        shell.check("flyout:wheel-no-pixel-scroll", card.contentY, 0)
+        var row = menu.submenuItemFor(0)
+        driver.mouseMove(row, 10, row.height / 2, 1, Qt.NoButton, Qt.NoModifier)
+        driver.mouseMove(row, 20, row.height / 2, 1, Qt.NoButton, Qt.NoModifier)
+        shell.check("flyout:hover-follows", menu.submenuCursor, 0)
+        // Only reveal moves the body: the last row scrolls into view, then a notch up steps one row and leaves it where it is.
+        var last = shell.overflowRows - 1
+        menu.submenuCursor = last
+        shell.check("flyout:reveal-scrolls", card.contentY > 0, true)
+        var revealed = card.contentY
+        var tail = menu.submenuItemFor(last)
+        driver.mouseWheel(tail, tail.width / 2, tail.height / 2, Qt.NoButton, Qt.NoModifier, 0, 120, 1)
+        shell.check("flyout:wheel-up-steps-one", menu.submenuCursor, last - 1)
+        shell.check("flyout:wheel-up-no-pixel-scroll", card.contentY, revealed)
+    }
+    // A lifted touch drops lastMousePosition, so on either Qt the rows stand and the menu settles before a late first hover.
+    function openRestingFlyout() {
+        var touch = driver.touchEvent(restMenu)
+        touch.press(0, restMenu, shell.outside.x, shell.outside.y).commit()
+        touch.release(0, restMenu, shell.outside.x, shell.outside.y).commit()
+        shell.openOverflowingFlyout(restMenu)
+    }
+    function restingPointer() {
+        shell.check("rest:settled", restMenu.pointerSettling, false)
+        shell.check("rest:pointer-unseen", restMenu.pointerGlobal.x < 0, true)
+        shell.check("rest:flyout-open", restMenu.openSubmenuRow, 1)
+        var row = restMenu.itemFor(6)
+        // The window's first pointer event, on a main row without a flyout: where the pointer rests, never a move.
+        driver.mouseMove(row, 20, row.height / 2, 1, Qt.NoButton, Qt.NoModifier)
+        shell.check("rest:row-hovered", row.hovered, true)
+        shell.check("rest:cursor-stays", restMenu.cursor, 1)
+        shell.check("rest:flyout-stays", restMenu.openSubmenuRow, 1)
+        // Motion from there is answered at once, as on Qt 6.11: the row takes the cursor and the flyout closes.
+        driver.mouseMove(row, 30, row.height / 2, 1, Qt.NoButton, Qt.NoModifier)
+        shell.check("rest:motion-takes-the-row", restMenu.cursor, 6)
+        shell.check("rest:motion-closes-the-flyout", restMenu.openSubmenuRow, -1)
+        // A ground that appears under the pointer takes Qt's point rounded to whole pixels, so under a pixel is that point.
+        shell.check("rest:a-rounded-point-is-rest", liveKeyRow.awayFrom(Qt.point(120.4, 250.6), 120, 251), false)
+        shell.check("rest:a-pixel-is-motion", liveKeyRow.awayFrom(Qt.point(121, 251), 120, 251), true)
+    }
+    function flyoutOutside() { shell.outsideClose("flyout", Qt.LeftButton) }
+    function flyoutOutsideRight() { shell.outsideClose("flyout-right", Qt.RightButton) }
+    function flyoutEnabled() {
+        shell.clickCentre(menu.submenuItemFor(0), Qt.LeftButton)
+        shell.check("flyout:enabled-once", shell.chosenLog, ["openWith:a"])
+        shell.check("flyout:enabled-closes", menu.opened, false)
+    }
+}

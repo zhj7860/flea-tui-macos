@@ -1,0 +1,409 @@
+import QtQuick
+import qs.Commons
+import "." as Flea
+
+// One row of the settings panel's pane, drawn from the object ui/js/Settings.js rows() built. Every
+// kind is one row height, the window's own, except a hint, which wraps and takes the height its
+// wording needs; the Settings board's anatomy note is where the "no metric of its own" rule comes from.
+Item {
+    id: root
+
+    // {kind, label, value?, on?, state?} from ui/js/Settings.js; kind decides what is drawn.
+    property var row: ({})
+    property bool current: false
+    property bool firstRow: false
+
+    signal activated()
+    signal pointerMoved()
+    signal favouriteMoved(int to)
+    signal favouriteRemoved()
+    // Every steppable row steps the same way, so h/l and the two chevrons fire one signal, never two.
+    signal stepped(int direction)
+    // The ruler's own way in: the same writer a step reaches, addressed by stop instead of direction.
+    signal stopPicked(int stop)
+
+    readonly property string kind: root.row.kind || "fact"
+    readonly property bool isGroup: root.kind === "group"
+    readonly property bool firstGroup: root.isGroup && root.firstRow
+    readonly property bool isHint: root.kind === "hint"
+    readonly property bool isFooter: root.isHint && root.row.footer === true
+    readonly property bool isFavourite: root.kind === "favourite"
+    readonly property Item favouriteItem: favourite
+    readonly property bool isHero: root.kind === "hero"
+    readonly property bool isKeyPreview: root.kind === "keyPreview"
+    readonly property bool isLock: root.kind === "lock"
+    readonly property bool isRuler: root.kind === "ruler"
+    readonly property bool hasBox: root.kind === "check"
+    // SettingsMenus rule 3 and SettingsRest rule 3: a heading carrying its group's master or its one action is operated like any other control.
+    readonly property bool isGroupControl: root.isGroup && (root.row.master === true || (root.row.action || "") !== "")
+    // Length and not Array.isArray: a Repeater hands the delegate a QVariantList wrapper, on which
+    // isArray reads false while typeof is "object" and length is right, so the segment never drew.
+    // Which control a choice gets, SettingsGrammar rule 1: a segment when every option fits on the row beside the label, the chevron walk when they do not, and nothing else decides it. A Row reports its own implicitWidth whether or not it is itself visible, so measuring the segment and hiding it on the answer is no loop.
+    readonly property real segmentChrome: 2 * Theme.spacing.rowPaddingX + Theme.markSize + 3 * Theme.spacing.gap
+    readonly property bool hasSegment: root.kind === "choice" && root.row.labels !== undefined && root.row.labels.length > 1
+        && segment.implicitWidth + rowLabel.implicitWidth + root.segmentChrome <= root.width
+    readonly property bool hasSteps: root.kind === "choice" && !root.hasSegment
+    // The hover lift ui/MenuRow.qml uses, so a settings row and a menu row read alike.
+    readonly property real hoverOpacity: Theme.washHover
+    // SettingsGrammar rule 7: a dependent greys in place while its parent is off, and an inert check the same way; the grey takes the row's handlers with it, because a control that cannot act must not answer a tap.
+    readonly property bool greyed: root.row.available === false || root.hasBox && root.row.inert === true
+    readonly property string boxValue: root.row.on === true ? "on" : "off"
+    // SettingsMenus rule 5: the one row that can destroy a file carries the urgent role the model already gives it.
+    readonly property bool isUrgent: root.row.role === "error" && !root.isHint
+
+    enabled: !root.greyed
+    opacity: root.greyed ? Theme.disabledOpacity : 1
+    height: root.isGroup ? groupHead.implicitHeight
+            : root.isFavourite ? favourite.implicitHeight : root.isHero ? hero.implicitHeight + 4 * Theme.spacing.rowPaddingY
+            : root.isKeyPreview ? keyPreview.implicitHeight + 2 * Theme.spacing.rowPaddingY
+            : root.isRuler ? ruler.implicitHeight + 2 * Theme.spacing.rowPaddingY
+            : root.isHint ? hint.y + hint.implicitHeight + (root.isFooter
+                ? Theme.settings.railPaddingY + 2 * Theme.spacing.hairline : SettingsMetrics.hintBottom - SettingsMetrics.hintLead) : Theme.rowHeight
+
+    Grid {
+        id: keyPreview
+        visible: root.isKeyPreview
+        x: Theme.spacing.rowPaddingX
+        y: Theme.spacing.rowPaddingY
+        width: parent.width - 2 * Theme.spacing.rowPaddingX
+        columns: 2
+        spacing: Theme.spacing.gap
+        Repeater {
+            model: root.isKeyPreview ? root.row.items : []
+            delegate: Item {
+                id: binding
+                required property var modelData
+                width: (keyPreview.width - keyPreview.spacing) / 2
+                height: Theme.hitMin
+                Rectangle {
+                    id: cap
+                    width: Math.min(capText.implicitWidth + Theme.spacing.gap, parent.width)
+                    height: parent.height
+                    color: "transparent"
+                    border.width: Theme.spacing.hairline
+                    border.color: Theme.color.mutedFrame
+                    Text {
+                        id: capText
+                        anchors.fill: parent
+                        anchors.margins: Theme.spacing.hairline
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                        text: binding.modelData.keys
+                        font.family: Theme.font.family
+                        font.pixelSize: Theme.font.caption
+                        color: Theme.color.foreground
+                        textFormat: Text.PlainText
+                        elide: Text.ElideRight
+                    }
+                }
+                Flea.Glyph {
+                    id: bindingMark
+                    x: cap.width + Theme.spacing.gap
+                    anchors.verticalCenter: parent.verticalCenter
+                    visible: !!binding.modelData.glyph
+                    width: visible ? Theme.chromeMarkSize : 0
+                    height: width
+                    name: binding.modelData.glyph || "file"
+                    color: Theme.color.mutedFrame
+                }
+                Text {
+                    x: bindingMark.x + bindingMark.width + (bindingMark.visible ? Theme.spacing.gap : 0)
+                    width: Math.max(0, parent.width - x)
+                    height: parent.height
+                    verticalAlignment: Text.AlignVCenter
+                    text: binding.modelData.label
+                    font.family: Theme.font.family
+                    font.pixelSize: Theme.font.caption
+                    color: Theme.color.foreground
+                    textFormat: Text.PlainText
+                    elide: Text.ElideRight
+                }
+            }
+        }
+    }
+
+    Flea.SettingsFavourite {
+        id: favourite
+        anchors.fill: parent
+        visible: root.isFavourite
+        row: root.row
+        onActivated: root.activated()
+        onMoved: function (to) { root.favouriteMoved(to) }
+        onRemoved: root.favouriteRemoved()
+    }
+
+    Column {
+        id: hero
+        visible: root.isHero
+        anchors.centerIn: parent
+        spacing: Theme.spacing.gap
+        Flea.FleaMark {
+            anchors.horizontalCenter: parent.horizontalCenter
+            width: Theme.markSize * 2
+            height: width
+            color: Theme.color.accent
+        }
+        Text {
+            anchors.horizontalCenter: parent.horizontalCenter
+            text: root.row.label || ""
+            font.family: Theme.font.family
+            font.pixelSize: Theme.font.body
+            font.bold: true
+            color: Theme.color.foreground
+            textFormat: Text.PlainText
+        }
+        Text {
+            anchors.horizontalCenter: parent.horizontalCenter
+            text: root.row.value || ""
+            font.family: Theme.font.family
+            font.pixelSize: Theme.font.caption
+            color: Theme.color.foreground
+            textFormat: Text.PlainText
+        }
+    }
+
+    Rectangle {
+        anchors.fill: parent
+        visible: root.current
+        color: Theme.color.foreground
+        opacity: root.hoverOpacity
+    }
+
+    Rectangle {
+        anchors.top: parent.top
+        anchors.topMargin: root.isFooter ? Theme.settings.railPaddingY : groupHead.gap
+        width: parent.width
+        height: Theme.spacing.hairline
+        visible: root.isFooter || root.isGroup && !root.firstGroup
+        color: Theme.color.mutedFrame
+        opacity: 0.4
+    }
+
+    // A heading and a hint are the only two rows that are not a label and a control on one line, so
+    // they draw instead of the pair below rather than beside it.
+    Flea.SettingsGroup {
+        id: groupHead
+        visible: root.isGroup
+        width: parent.width
+        row: root.row
+        first: root.firstGroup
+    }
+
+    Flea.SettingsHint {
+        id: hint
+        visible: root.isHint
+        footer: root.isFooter
+        x: root.isFooter ? Theme.spacing.rowPaddingX : markSlot.x + markSlot.width + Theme.spacing.gap
+        y: root.isFooter ? 2 * Theme.settings.railPaddingY + Theme.spacing.hairline : SettingsMetrics.hintTop + SettingsMetrics.hintLead
+        width: parent.width - x - Theme.spacing.rowPaddingX
+        text: root.row.label || ""
+        color: root.row.role === "error" ? Theme.color.error
+             : root.row.role === "accent" ? Theme.color.accent
+             : root.row.role === "foreground" ? Theme.color.foreground : Theme.color.muted
+        wrapMode: root.row.elide === "right" ? Text.NoWrap : Text.WordWrap
+        elide: root.row.elide === "right" ? Text.ElideRight : Text.ElideNone
+    }
+
+    // Every board row carries a mark in one column, so a section reads as a column and not a ragged
+    // list; a row the boards give no mark keeps the slot open rather than closing it up. ui/MenuRow.qml
+    // is the pattern, brand marks included, and the slot sets the label's indent the same way.
+    Item {
+        id: markSlot
+        visible: !root.isGroup && !root.isHint && !root.isHero && !root.isFavourite && !root.isKeyPreview
+        anchors.left: parent.left
+        anchors.leftMargin: Theme.spacing.rowPaddingX
+        anchors.verticalCenter: parent.verticalCenter
+        width: Theme.markSize
+        height: Theme.markSize
+
+        Flea.Glyph {
+            anchors.fill: parent
+            visible: root.row.glyph !== undefined && root.row.mark === undefined
+            name: root.row.glyph !== undefined ? root.row.glyph : "file"
+            color: root.isUrgent ? Theme.color.error : Theme.color.mutedFrame
+        }
+
+        Flea.TailscaleMark {
+            anchors.centerIn: parent
+            visible: root.row.mark === "tailscale"
+            iconSize: Theme.markSize
+            color: Theme.color.mutedFrame
+        }
+
+        Flea.DropboxMark {
+            anchors.centerIn: parent
+            visible: root.row.mark === "dropbox"
+            iconSize: Theme.markSize
+            color: Theme.color.mutedFrame
+        }
+
+        Flea.LocalSendMark {
+            anchors.centerIn: parent
+            visible: root.row.mark === "localsend"
+            iconSize: Theme.markSize
+            color: Theme.color.mutedFrame
+        }
+
+        Flea.HyprlandMark {
+            anchors.centerIn: parent
+            visible: root.row.mark === "hyprland"
+            iconSize: Theme.markSize
+            color: Theme.color.mutedFrame
+        }
+
+        // The shelf is Flea's own destination, so its switch carries Flea's own mark, the way ui/MenuRow.qml draws the row it governs.
+        Flea.FleaMark {
+            anchors.centerIn: parent
+            visible: root.row.mark === "flea"
+            width: Theme.markSize
+            height: Theme.markSize
+            color: Theme.color.mutedFrame
+        }
+    }
+
+    // A ruler is the row above it continued, so it starts at that row's label column, as a hint
+    // does: HANDOFF rules 3 and 8, nothing is indented and a hint sits under its control's label.
+    Flea.SettingsRuler {
+        id: ruler
+        visible: root.isRuler
+        anchors.left: markSlot.right
+        anchors.leftMargin: Theme.spacing.gap
+        anchors.right: parent.right
+        anchors.rightMargin: Theme.spacing.rowPaddingX
+        anchors.verticalCenter: parent.verticalCenter
+        height: ruler.implicitHeight
+        stops: root.row.stops !== undefined ? root.row.stops : []
+        index: root.row.index !== undefined ? root.row.index : -1
+        active: root.row.on === true
+        onPicked: function (stop) { root.stopPicked(stop) }
+    }
+
+    Text {
+        id: rowLabel
+        visible: !root.isGroup && !root.isHint && !root.isHero && !root.isFavourite && !root.isRuler && !root.isKeyPreview
+        anchors.left: markSlot.right
+        anchors.leftMargin: Theme.spacing.gap
+        anchors.right: trailing.left
+        anchors.rightMargin: Theme.spacing.gap
+        anchors.verticalCenter: parent.verticalCenter
+        text: root.row.label || ""
+        color: root.isUrgent ? Theme.color.error
+             : root.isLock || root.kind === "fact" ? Theme.color.muted : Theme.color.foreground
+        font.family: Theme.font.family
+        font.pixelSize: Theme.font.body
+        textFormat: Text.PlainText
+        elide: Text.ElideRight
+    }
+
+    // Row lays its children out itself, so none of them anchors vertically: each takes the mark
+    // height and centres its own content inside that, which keeps one baseline across four kinds.
+    Row {
+        id: trailing
+        anchors.right: parent.right
+        anchors.rightMargin: Theme.spacing.rowPaddingX
+        anchors.verticalCenter: parent.verticalCenter
+        spacing: Theme.spacing.gap
+
+        // A choice's name, a fact's value and the caption a check row carries are all one thing: the value the row currently holds, drawn on the right the way the boards draw it. SettingsRest rule 6 mutes a fact whole, and the one fact reporting a live number keeps the foreground for it; rule 5 takes the head off a value whose identity is in its tail.
+        Text {
+            visible: root.kind === "fact" || root.kind === "action" || root.hasSteps
+                     || (root.hasBox && (root.row.value || "") !== "")
+            height: Theme.markSize
+            verticalAlignment: Text.AlignVCenter
+            text: root.row.value || ""
+            color: root.row.role === "accent" ? Theme.color.accent
+                 : root.hasSteps || root.row.role === "live" ? Theme.color.foreground : Theme.color.muted
+            font.family: Theme.font.family
+            font.pixelSize: Theme.font.body
+            textFormat: Text.PlainText
+            width: Math.min(implicitWidth, root.width * 0.56)
+            elide: root.row.elide === "head" ? Text.ElideLeft : Text.ElideRight
+        }
+
+        // SettingsRest draws the sentence after the value it explains, so the row reads label, value, sentence; half the row at most, or the label would elide to make space for prose.
+        Text {
+            id: caption
+            visible: !!root.row.caption && width > 0
+            height: Theme.markSize
+            // The boards centre each line box on the row, so the baseline sits a fixed shift from the label's, on a whole pixel; a Row sets x only, so y is ours.
+            y: Math.round(rowLabel.y + rowLabel.baselineOffset) + SettingsMetrics.captionShift - Math.round(caption.baselineOffset) - trailing.y
+            text: root.row.caption || ""
+            color: Theme.color.muted
+            font.family: Theme.font.family
+            font.pixelSize: Theme.font.caption
+            textFormat: Text.PlainText
+            width: Math.min(implicitWidth, Math.round(root.width * 0.5))
+            elide: Text.ElideRight
+        }
+
+        Flea.SettingsSegment {
+            id: segment
+            visible: root.hasSegment
+            options: root.row.labels !== undefined ? root.row.labels : []
+            value: root.row.value || ""
+            glyphs: root.row.id === "view" ? root.row.values : []
+            onPicked: function (i) { root.stopPicked(i) }
+        }
+
+        Flea.Glyph {
+            visible: root.hasSteps || root.kind === "action" && root.row.inert !== true
+            width: visible ? Theme.markSize : 0
+            height: Theme.markSize
+            name: "chevron-right"
+            color: Theme.color.mutedFrame
+
+            TapHandler {
+                enabled: root.hasSteps
+                gesturePolicy: TapHandler.ReleaseWithinBounds
+                onTapped: root.stepped(1)
+            }
+        }
+
+        // A locked row draws the lock mark where the box would be, so the section stays a complete
+        // list of what the menu can contain rather than hiding the two rows nobody can switch off.
+        Flea.Glyph {
+            visible: root.isLock
+            width: root.isLock ? Theme.markSize : 0
+            height: Theme.markSize
+            name: "lock"
+            color: Theme.color.mutedFrame
+        }
+
+        Flea.CheckBox {
+            visible: root.hasBox
+            width: root.hasBox ? implicitWidth : 0
+            value: root.boxValue
+        }
+    }
+
+    HoverHandler {
+        id: pointer
+        enabled: root.hasBox || root.isGroupControl || root.kind === "choice" || root.kind === "action" || root.isFavourite
+        property bool armed: false
+        property point restingAt
+        onHoveredChanged: pointer.armed = false
+        onPointChanged: {
+            if (!pointer.hovered) return
+            if (!pointer.armed) {
+                pointer.armed = true
+                pointer.restingAt = pointer.point.scenePosition
+                return
+            }
+            // Scrolling moves the row beneath a resting pointer; only scene-space motion selects it.
+            if (pointer.point.scenePosition.x !== pointer.restingAt.x || pointer.point.scenePosition.y !== pointer.restingAt.y)
+                root.pointerMoved()
+            pointer.restingAt = pointer.point.scenePosition
+        }
+        cursorShape: Qt.PointingHandCursor
+    }
+
+    // A segment and a ruler each own their own targets, so the row behind them must not also fire:
+    // a tap on the option already showing would otherwise toggle the very setting it names.
+    TapHandler {
+        enabled: (root.hasBox || root.isGroupControl || root.kind === "action") && !root.isLock && !root.hasSteps
+                 && !root.hasSegment && !root.isRuler
+        acceptedButtons: Qt.LeftButton
+        gesturePolicy: TapHandler.ReleaseWithinBounds
+        onTapped: root.activated()
+    }
+}

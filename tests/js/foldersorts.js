@@ -1,0 +1,285 @@
+.import "../../ui/js/FolderSorts.js" as FolderSorts
+.import "../../ui/js/Settings.js" as Settings
+.import "../../ui/js/Menu.js" as Menu
+.import "../../ui/js/Sort.js" as Sort
+.import "../../ui/js/Tabs.js" as Tabs
+.import "../../ui/js/Places.js" as Places
+.import "tabsfixture.js" as Fixture
+.import "sourcefixture.js" as Source
+.import "userdirsfixture.js" as UserDirsFixture
+
+// Per-folder sorts (issue 179) and Hidden files last (issue 70): map, Settings rows, flyout forget row, tab-kept sorts.
+function sortPane(path, sorts) {
+    var p = {
+        path: path,
+        sorts: sorts || {},
+        windowSize: 200,
+        recentMode: "",
+        remembered: [],
+        forgotten: [],
+        sent: []
+    }
+    p.backend = {
+        sortBy: "name",
+        sortDesc: false,
+        sort: function (by, desc) { p.sent.push("sort " + by); this.sortBy = by; this.sortDesc = desc },
+        window: function (start, count) { p.sent.push("window") },
+        // Sample input: rememberFolderSort("/a", "size", false) records "/a|size:false" while remembering is on.
+        rememberFolderSort: function (folder, key, desc) { p.remembered.push(folder + "|" + key + ":" + desc) },
+        forgetFolderSort: function (folder) { p.forgotten.push(folder) }
+    }
+    p.thumbState = {}
+    p.dirSizeState = {}
+    p.clearSelection = function () {}
+    p.setCursor = function () {}
+    p.openWithoutHistory = function (next) { p.sent.push("list " + next); p.path = next }
+    return p
+}
+
+function run(check) {
+    newestDefaults(check)
+    // One key table: Sort.ORDERS is the same array FolderSorts owns, in backend order.
+    check("Sort.ORDERS is the same array FolderSorts owns", Sort.ORDERS === FolderSorts.ORDERS, true)
+    check("the supported order stays name,size,mtime,kind", Sort.ORDERS.join(","), "name,size,mtime,kind")
+    // The map holds a folder's sort by path, and nothing else.
+    check("a folder with no entry has no sort", FolderSorts.get({}, "/a"), null)
+    check("and neither does a missing map", FolderSorts.get(null, "/a"), null)
+    var one = FolderSorts.set({}, "/a", "size", true)
+    check("a write records the key and the direction", JSON.stringify(FolderSorts.get(one, "/a")),
+          JSON.stringify({ key: "size", reverse: true }))
+    check("and leaves the other folders alone", FolderSorts.has(one, "/b"), false)
+    check("a second write in another folder keeps the first", FolderSorts.has(FolderSorts.set(one, "/b", "name", false), "/a"), true)
+    // A re-sort moves its folder to the most recent end, so the cap drops the one sorted longest ago.
+    var two = FolderSorts.set(one, "/a", "kind", false)
+    check("a re-sort keeps one entry per folder", FolderSorts.count(two), 1)
+    check("and records the new order", FolderSorts.get(two, "/a").key, "kind")
+    var full = {}
+    for (var i = 0; i < FolderSorts.MAX; i++)
+        full = FolderSorts.set(full, "/d" + i, "name", false)
+    check("the map holds the cap", FolderSorts.count(full), FolderSorts.MAX)
+    var over = FolderSorts.set(full, "/new", "size", false)
+    check("past the cap the oldest entry goes", FolderSorts.has(over, "/d0"), false)
+    check("and the newest stays", FolderSorts.has(over, "/new"), true)
+    check("at exactly the cap", FolderSorts.count(over), FolderSorts.MAX)
+    var touched = FolderSorts.set(full, "/d5", "size", true)
+    check("a re-sort of a held folder evicts nothing", FolderSorts.count(touched), FolderSorts.MAX)
+    var afterTouch = FolderSorts.set(touched, "/new2", "name", false)
+    check("and the oldest entry goes on the next write", FolderSorts.has(afterTouch, "/d0"), false)
+    check("so the touched folder survives the next eviction", FolderSorts.has(afterTouch, "/d5"), true)
+    var retouched = FolderSorts.set(full, "/d0", "size", true)
+    var afterRetouch = FolderSorts.set(retouched, "/new2", "name", false)
+    check("a re-sort moves its folder to the most recent end", FolderSorts.has(afterRetouch, "/d1"), false)
+    check("so the re-sorted oldest survives the next write", FolderSorts.has(afterRetouch, "/d0"), true)
+    check("forgetting drops that folder alone", FolderSorts.has(FolderSorts.forget(two, "/a"), "/a"), false)
+    check("and keeps the rest", FolderSorts.count(FolderSorts.forget(FolderSorts.set(two, "/b", "name", false), "/a")), 1)
+    check("forgetting a folder with no entry changes nothing", FolderSorts.count(FolderSorts.forget({}, "/a")), 0)
+    // The fallback differs from /a's stored size-descending sort, so a branch answering the wrong one fails.
+    var fallback = { key: "name", reverse: false }
+    check("a folder's own sort wins while remembering is on",
+          JSON.stringify(FolderSorts.orderFor(one, "/a", fallback, true)), JSON.stringify({ key: "size", reverse: true }))
+    check("and when the flag is absent, which is how an old file reads",
+          JSON.stringify(FolderSorts.orderFor(one, "/a", fallback)), JSON.stringify({ key: "size", reverse: true }))
+    check("elsewhere the default applies", JSON.stringify(FolderSorts.orderFor(one, "/b", fallback, true)),
+          JSON.stringify({ key: "name", reverse: false }))
+    check("and with remembering off every folder takes the default",
+          JSON.stringify(FolderSorts.orderFor(one, "/a", fallback, false)), JSON.stringify({ key: "name", reverse: false }))
+    check("a stored key no order knows reads as the default",
+          JSON.stringify(FolderSorts.orderFor({ "/a": { key: "mode", reverse: true } }, "/a", fallback, true)),
+          JSON.stringify({ key: "name", reverse: false }))
+    check("and a missing default reads as name ascending",
+          JSON.stringify(FolderSorts.orderFor({}, "/a", null, true)), JSON.stringify({ key: "name", reverse: false }))
+    // Settings stores Modified as "date" while Sort.ORDERS spells it "mtime": either spelling reads as the live order.
+    check("a date default reads as the live mtime order",
+          JSON.stringify(FolderSorts.orderFor({}, "/a", { key: "date", reverse: false }, true)),
+          JSON.stringify({ key: "mtime", reverse: false }))
+    check("and a stored date entry wins while remembering is on",
+          JSON.stringify(FolderSorts.orderFor({ "/a": { key: "date", reverse: true } }, "/a", { key: "name" }, true)),
+          JSON.stringify({ key: "mtime", reverse: true }))
+
+    // A user sort writes its folder; browsing writes nothing.
+    var pane = sortPane("/a", {})
+    Sort.column(pane, "size")
+    check("choosing a sort writes its folder", pane.remembered.join(","), "/a|size:false")
+    check("and still sends the sort and the window", pane.sent.join(","), "sort size,window")
+    var changed = sortPane("/a", {})
+    Sort.resort(changed, "size", true)
+    check("a changed order writes its folder", changed.remembered.join(","), "/a|size:true")
+    check("with remembering off nothing writes", FolderSorts.shouldRemember(false, "/a"), false)
+    check("with remembering on a folder writes", FolderSorts.shouldRemember(true, "/a"), true)
+    check("an empty path writes nothing", FolderSorts.shouldRemember(true, ""), false)
+    check("Backend gates folder writes through FolderSorts",
+          Source.source("ui/Backend.qml").indexOf("if (!FolderSorts.shouldRemember(ViewState.state.rememberSort, path))") >= 0, true)
+    var same = sortPane("/a", {})
+    Sort.resort(same, "name", false)
+    check("asking for the order already shown writes nothing", same.remembered.length, 0)
+    var picked = sortPane("/a", {})
+    Sort.column(picked, "__default__")
+    check("the flyout's forget row forgets its folder", picked.forgotten.join(","), "/a")
+    check("and lists the folder again on the default", picked.sent.join(","), "list /a")
+
+    // A preserved pane skips the reset a list would do, so forget refreshes before it lists.
+    var dualStore = { "/a": { key: "size", reverse: true }, "/b": { key: "size", reverse: true } }
+    var dualDefault = { key: "name", reverse: false }
+    function dualPane(path) {
+        var p = { path: path, sent: [] }
+        p.backend = {
+            sortBy: "size", sortDesc: true, preserveSort: true, hasListed: true,
+            forgetFolderSort: function (folder) { dualStore = FolderSorts.forget(dualStore, folder) },
+            resetSort: function (folder) { var o = FolderSorts.orderFor(dualStore, folder, dualDefault, true); this.sortBy = o.key; this.sortDesc = o.reverse === true }
+        }
+        // Sample input: list "/a" with preserveSort skips reset, so by/desc are the backend's own.
+        p.openWithoutHistory = function (next) {
+            if (!p.backend.preserveSort || !p.backend.hasListed)
+                p.backend.resetSort(next)
+            p.backend.hasListed = true
+            p.sent.push("list " + next + " by=" + p.backend.sortBy + " desc=" + p.backend.sortDesc)
+            p.path = next
+        }
+        return p
+    }
+    var focused = dualPane("/a")
+    var peer = dualPane("/b")
+    Sort.column(focused, "__default__")
+    check("a preserved forget lists the default, not the old order", focused.sent.join(","), "list /a by=name desc=false")
+    check("the saved entry is gone", FolderSorts.has(dualStore, "/a"), false)
+    check("the peer keeps its entry", FolderSorts.has(dualStore, "/b"), true)
+    check("and the peer keeps its order", peer.backend.sortBy + ":" + peer.backend.sortDesc, "size:true")
+
+    // The flyout gains its forget row only where the folder has its own sort, and marks nothing.
+    var plain = Menu.sortEntries(false)
+    check("without a folder sort the flyout lists the four orders alone",
+          plain.map(function (r) { return r.label || "sep" }).join(","), "Name,Size,Modified,Kind")
+    var owned = Menu.sortEntries(true)
+    check("with one it gains Use the default sort after a separator",
+          owned.map(function (r) { return r.separator === true ? "sep" : r.label }).join(","),
+          "Name,Size,Modified,Kind,sep,Use the default sort")
+    check("and the flyout marks no current sort, as shipped",
+          owned.filter(function (r) { return r.selected || r.current || r.checked }).length, 0)
+
+    // A tab keeps its own sort across a switch, and neither opening nor switching writes a folder sort.
+    var tabs = Fixture.pane("/home/gm/Work")
+    tabs.remembered = []
+    tabs.backend.rememberFolderSort = function (folder, key, desc) { tabs.remembered.push(folder + "|" + key + ":" + desc) }
+    check("a snapshot carries its tab's sort", tabs.backend.sortBy + ":" + tabs.backend.sortDesc, "name:false")
+    Tabs.openNew(tabs, "/home/gm/Pictures")
+    check("opening a tab writes no folder sort", tabs.remembered.length, 0)
+    check("and tabs still count", Tabs.count(tabs), 2)
+    check("and the left tab's snapshot keeps its sort", tabs.tabs.items[0].sortBy + ":" + tabs.tabs.items[0].sortDesc, "name:false")
+    tabs.backend.sortBy = "size"
+    tabs.backend.sortDesc = true
+    Tabs.selectAt(tabs, 0)
+    check("a tab switch writes no folder sort", tabs.remembered.length, 0)
+    Tabs.applyPending(tabs)
+    check("and the switch still writes no folder sort", tabs.remembered.length, 0)
+    check("while the tab's own sort is restored", tabs.backend.sortBy + ":" + tabs.backend.sortDesc, "name:false")
+
+    // Settings View Sorting: Hidden files last sits under Show hidden files with no hint; Remember each folder's sort is last and on.
+    var view = Settings.rows("view", { data: {} })
+    var labels = view.map(function (r) { return r.label || r.id }).join("|")
+    check("Hidden files last sits directly under Show hidden files",
+          labels.indexOf("Show hidden files|Hidden files last") >= 0, true)
+    var hiddenLast = view.filter(function (r) { return r.id === "hiddenLast" })[0] || {}
+    check("it draws no hint of its own",
+          view.filter(function (r) { return r.kind === "hint" && (r.label || "").toLowerCase().indexOf("hidden") >= 0 }).length, 0)
+    check("and it is greyed while hidden files are off", hiddenLast.available, false)
+    var shown = Settings.rows("view", { data: { hidden: true } })
+    var shownLast = shown.filter(function (r) { return r.id === "hiddenLast" })[0] || {}
+    check("and live once they are shown", shownLast.id === "hiddenLast" && shownLast.available !== false, true)
+    var remember = view.filter(function (r) { return r.id === "rememberSort" })[0] || {}
+    var cursorAt = -1
+    for (var c = 0; c < view.length; c++) {
+        if (view[c].kind === "group" && view[c].label === "Cursor")
+            cursorAt = c
+    }
+    check("Remember each folder's sort is the Sorting group's last row", cursorAt > 0 ? view[cursorAt - 1].id : "", "rememberSort")
+    check("and ships on", remember.on, true)
+    peekOrder(check)
+}
+
+function newestDefaults(check) {
+    UserDirsFixture.duplicateRoles(check, FolderSorts.newestPaths, Places.userDirs)
+    var paths = ["/home/test/Inbox", "/home/test/Photos", "/home/test/Clips"]
+    var fallback = { key: "name", reverse: false }
+    var defaults = {}
+    check("fresh Downloads defaults to Modified newest first",
+          JSON.stringify(FolderSorts.orderFor(defaults, paths[0], fallback, true, paths)),
+          JSON.stringify({ key: "mtime", reverse: true }))
+    check("Pictures also defaults to Modified newest first",
+          JSON.stringify(FolderSorts.orderFor({}, paths[1], fallback, true, paths)),
+          JSON.stringify({ key: "mtime", reverse: true }))
+    check("Videos also defaults to Modified newest first",
+          JSON.stringify(FolderSorts.orderFor({}, paths[2], fallback, true, paths)),
+          JSON.stringify({ key: "mtime", reverse: true }))
+    check("Documents keeps the global name order",
+          JSON.stringify(FolderSorts.orderFor({}, "/home/test/Documents", fallback, true, paths)), JSON.stringify(fallback))
+    var own = FolderSorts.set({}, paths[0], "name", false)
+    check("an explicit Name ascending survives serialization",
+          JSON.stringify(FolderSorts.orderFor(JSON.parse(JSON.stringify(own)), paths[0], fallback, true, paths)), JSON.stringify(fallback))
+    check("remember off ignores defaults and saved entries",
+          JSON.stringify(FolderSorts.orderFor(own, paths[0], { key: "size", reverse: true }, false, paths)),
+          JSON.stringify({ key: "size", reverse: true }))
+    check("a Downloads column peek defaults to Modified newest first",
+          JSON.stringify(FolderSorts.peekOrder({}, paths[0], true, paths, paths, fallback)),
+          JSON.stringify({ by: "mtime", desc: true }))
+    check("defaults never occupy a folderSorts slot", FolderSorts.count(defaults), 0)
+    for (var i = 0; i < UserDirsFixture.cases.length; i++) {
+        var sample = UserDirsFixture.cases[i]
+        check("newest paths: " + sample[0],
+              JSON.stringify(FolderSorts.newestPaths(UserDirsFixture.body(sample[1]), "/home/test")),
+              JSON.stringify([sample[2] === null ? "/home/test/Downloads" : sample[2]]))
+    }
+    check("only the three XDG roles get newest-first defaults",
+          FolderSorts.newestPaths('XDG_DOWNLOAD_DIR="$HOME/Inbox"\nXDG_PICTURES_DIR="$HOME/Photos/"\nXDG_VIDEOS_DIR="/media/Clips"\nXDG_DOCUMENTS_DIR="$HOME/Docs"', "/home/test").join("|"),
+          "/home/test/Inbox|/home/test/Photos|/media/Clips")
+    check("missing XDG roles use conventional names", FolderSorts.newestPaths("", "/home/test").join("|"),
+          "/home/test/Downloads|/home/test/Pictures|/home/test/Videos")
+    check("only the absent role uses its conventional name",
+          FolderSorts.newestPaths('XDG_PICTURES_DIR="$HOME/Photos"\nXDG_VIDEOS_DIR="$HOME"', "/home/test").join("|"),
+          "/home/test/Downloads|/home/test/Photos")
+    check("disabled roles pointing at Home do not default Home",
+          FolderSorts.newestPaths('XDG_DOWNLOAD_DIR="$HOME/"\nXDG_PICTURES_DIR="$HOME"\nXDG_VIDEOS_DIR="$HOME"', "/home/test").length, 0)
+    check("localized Downloads does not also default the English folder",
+          JSON.stringify(FolderSorts.orderFor({}, "/home/test/Downloads", fallback, true, paths)), JSON.stringify(fallback))
+    check("a default applies to the folder itself, not its children",
+          JSON.stringify(FolderSorts.orderFor({}, paths[0] + "/child", fallback, true, paths)), JSON.stringify(fallback))
+    check("a trailing separator still identifies the default folder",
+          JSON.stringify(FolderSorts.orderFor({}, paths[0] + "/", fallback, true, paths)), JSON.stringify({ key: "mtime", reverse: true }))
+    check("forgetting an explicit Name restores the default",
+          JSON.stringify(FolderSorts.orderFor(FolderSorts.forget(own, paths[0]), paths[0], fallback, true, paths)),
+          JSON.stringify({ key: "mtime", reverse: true }))
+    check("a default never changes a completion peek",
+          JSON.stringify(FolderSorts.peekOrder({}, paths[0], true, undefined, paths, fallback)), "{}")
+    check("remember off gives column peeks the global order",
+          JSON.stringify(FolderSorts.peekOrder(own, paths[0], false, paths, paths, { key: "size", reverse: true })),
+          JSON.stringify({ by: "size", desc: true }))
+    check("remember off keeps plain Name peeks untagged",
+          JSON.stringify(FolderSorts.peekOrder(own, paths[0], false, paths, paths, fallback)), "{}")
+    check("an explicit Name also wins in a column peek",
+          JSON.stringify(FolderSorts.peekOrder(own, paths[0], true, paths, paths, fallback)), JSON.stringify({ by: "name", desc: false }))
+    var invalid = {}
+    invalid[paths[0]] = { key: "unknown", reverse: false }
+    check("an unknown stored key still uses the folder default",
+          JSON.stringify(FolderSorts.orderFor(invalid, paths[0], fallback, true, paths)), JSON.stringify({ key: "mtime", reverse: true }))
+    var selected = sortPane(paths[0], {})
+    selected.backend.sortBy = "mtime"
+    selected.backend.sortDesc = true
+    Sort.resort(selected, "name", false)
+    check("choosing Name ascending from the default calls the folder writer", selected.remembered.join(","), paths[0] + "|name:false")
+}
+
+// The shipped Backend.peek over stub state: only a column's peek of a folder with its own remembered order carries it.
+function peekOrder(check) {
+    var body = Source.slice(Source.source("ui/Backend.qml"), "function peek(path, first, hidden, hiddenLast, keep)", "// op is \"peers\"")
+    var sent = function (state, keep) {
+        var root = { last: null, send: function (message) { root.last = message } }
+        new Function("root", "ViewState", "FolderSorts", "UserDirs", "return (" + body + ")")(root, { state: state }, FolderSorts, { newestFolders: [] })("/a", 35, false, undefined, keep)
+        return root.last.by === undefined ? "none" : root.last.by + (root.last.desc ? " desc" : " asc")
+    }
+    var sorts = { "/a": { key: "size", reverse: true } }
+    check("a column peek of a size-remembered folder carries that order", sent({ folderSorts: sorts }, ["/a"]), "size desc")
+    check("a remembered Modified order goes as mtime", sent({ folderSorts: { "/a": { key: "date", reverse: false } } }, ["/a"]), "mtime asc")
+    check("a peek that is not a column's carries none", sent({ folderSorts: sorts }, undefined), "none")
+    check("nor one while remembering is off", sent({ folderSorts: sorts, rememberSort: false }, ["/a"]), "none")
+    check("nor one for a folder with no order of its own", sent({ folderSorts: { "/b": { key: "size", reverse: true } } }, ["/a"]), "none")
+    check("nor a kind order, which the backend has none for", sent({ folderSorts: { "/a": { key: "kind", reverse: false } } }, ["/a"]), "none")
+}

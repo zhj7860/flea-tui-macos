@@ -1,0 +1,307 @@
+.pragma library
+
+// MdHtml: one forward scan allowlists raw tags; only sanitized markup reaches md4c.
+.import "MdUrl.js" as MdUrl
+.import "MdEscape.js" as MdEscape
+.import "MdInline.js" as MdInline
+
+var TOKEN_OPEN = 57346
+var TOKEN_CLOSE = 57347
+var MAX_TAG_LENGTH = 4096
+
+// Sample input: "\uE0020\uE003" becomes "\uFFFD0\uFFFD" before document parsing reserves its token markers; "a\r\nb\rc" becomes "a\nb\nc", the line endings CommonMark names.
+function documentText(text) {
+    return String(text).replace(/[\uE002\uE003]/g, "\uFFFD").replace(/\r\n?/g, "\n")
+}
+
+// Held spans use private-use delimiters and one shared token table, restored after escaping.
+function openToken() {
+    return String.fromCharCode(TOKEN_OPEN)
+}
+
+function closeToken() {
+    return String.fromCharCode(TOKEN_CLOSE)
+}
+
+function holdToken(tokens, html) {
+    var token = openToken() + tokens.length + closeToken()
+    tokens.push(html)
+    return token
+}
+
+// Tags whose content is dropped with them: active content and whole-document namespaces a preview must never instantiate.
+var DROP_CONTENT = { script: 1, style: 1, iframe: 1, object: 1, embed: 1,
+    template: 1, noscript: 1, svg: 1, math: 1 }
+
+// Tags re-emitted with the attributes below; any other tag is dropped and its content kept. font carries only the color the parser's own links wrap in.
+var ALLOWED = { a: 1, b: 1, strong: 1, i: 1, em: 1, u: 1, s: 1, del: 1,
+    strike: 1, sub: 1, sup: 1, kbd: 1, code: 1, br: 1, small: 1, mark: 1,
+    span: 1, p: 1, div: 1, h1: 1, h2: 1, h3: 1, h4: 1, h5: 1, h6: 1, hr: 1,
+    img: 1, picture: 1, source: 1, details: 1, summary: 1, table: 1,
+    thead: 1, tbody: 1, tr: 1, th: 1, td: 1, ul: 1, ol: 1, li: 1,
+    blockquote: 1, pre: 1, font: 1 }
+
+// Attributes that survive on any allowed tag. Every style, class, id, background, srcset, poster, data-* and on* attribute is dropped.
+var GLOBAL_ATTRS = { align: 1, alt: 1, width: 1, height: 1, title: 1,
+    colspan: 1, rowspan: 1 }
+
+// Void tags never take a closing tag.
+var VOID = { br: 1, hr: 1, img: 1, source: 1 }
+
+// The chip kbd and code tags wear, the same recipe as an inline code span.
+var CHROME_PATTERN = /^#[0-9a-f]{6}([0-9a-f]{2})?$/i
+var DISCLOSURE_OPEN = "\u25be"
+
+// Qt draws a raw s tag struck on every build but drops del and strike, so all three are emitted as s.
+var STRIKE_AS = { del: "s", strike: "s" }
+
+function isNameChar(c) {
+    return (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9")
+}
+
+function isHtmlWhitespace(c) {
+    return c === "\t" || c === "\n" || c === "\f" || c === "\r" || c === " "
+}
+
+// Sample: <img src="pic.png" alt="picture">. Quote-check only the candidate; a failed native search marks later openers dead, and oversized tags stay literal.
+function readTag(text, i, dead) {
+    if (dead !== undefined && dead !== null && i < dead.tagDead)
+        return null
+    var cached = dead !== undefined && dead !== null && dead.tagClose > i
+    var gt = cached ? dead.tagClose : text.indexOf(">", i + 1)
+    if (dead !== undefined && dead !== null && gt >= 0)
+        dead.tagClose = gt
+    if (gt < 0) {
+        if (dead !== undefined && dead !== null)
+            dead.tagDead = text.length
+        return null
+    }
+    if (gt - i > MAX_TAG_LENGTH) {
+        if (dead !== undefined && dead !== null)
+            dead.tagDead = gt - MAX_TAG_LENGTH
+        return null
+    }
+    var candidate = text.slice(i, gt + 1)
+    var dq = candidate.indexOf('"')
+    var sq = candidate.indexOf("'")
+    if (dq < 0 && sq < 0)
+        return { tag: candidate, end: gt + 1 }
+    var quote = ""
+    var j = i + 1
+    while (j < gt) {
+        var c = text.charAt(j)
+        if (quote !== "") {
+            if (c === quote)
+                quote = ""
+        } else if (c === '"' || c === "'") {
+            quote = c
+        }
+        j++
+    }
+    if (quote !== "")
+        return null
+    return { tag: candidate, end: gt + 1 }
+}
+
+// Sample input: ' a=b/' keeps the slash in b/; ' ==/' names '=' with value '/'; ' a="b"/' sets the self-closing flag.
+function scanAttributes(rest) {
+    var i = 0
+    var attributes = []
+    var valid = true
+    var selfClose = false
+    while (i < rest.length) {
+        while (i < rest.length && isHtmlWhitespace(rest.charAt(i)))
+            i++
+        if (i >= rest.length)
+            break
+        if (rest.charAt(i) === "/") {
+            selfClose = i === rest.length - 1
+            i++
+            continue
+        }
+        // Before an attribute name, even '=' starts the name; only a later '=' starts its value.
+        var aname = rest.charAt(i).toLowerCase()
+        i++
+        while (i < rest.length && !isHtmlWhitespace(rest.charAt(i))
+                && rest.charAt(i) !== "=" && rest.charAt(i) !== "/" && rest.charAt(i) !== ">") {
+            aname += rest.charAt(i).toLowerCase()
+            i++
+        }
+        if (!/^[A-Za-z_:][-A-Za-z0-9_.:]*$/.test(aname))
+            valid = false
+        while (i < rest.length && isHtmlWhitespace(rest.charAt(i)))
+            i++
+        var value = null
+        if (rest.charAt(i) === "=") {
+            i++
+            while (i < rest.length && isHtmlWhitespace(rest.charAt(i)))
+                i++
+            var q = rest.charAt(i)
+            if (q === '"' || q === "'") {
+                i++
+                var start = i
+                while (i < rest.length && rest.charAt(i) !== q)
+                    i++
+                value = rest.slice(start, i)
+                i++
+            } else {
+                var begin = i
+                while (i < rest.length && !isHtmlWhitespace(rest.charAt(i)) && rest.charAt(i) !== ">")
+                    i++
+                value = rest.slice(begin, i)
+            }
+        }
+        attributes.push({ name: aname, value: value })
+    }
+    return { attributes: attributes, valid: valid, selfClose: selfClose }
+}
+
+// Sample input: '<img src="pic.png"/>' yields name "img", its attributes and a self-closing flag.
+function tagHead(tag) {
+    var i = 1
+    var closing = false
+    if (tag.charAt(i) === "/") {
+        closing = true
+        i++
+    }
+    var name = ""
+    while (i < tag.length && (isNameChar(tag.charAt(i)) || tag.charAt(i) === "-")) {
+        name += tag.charAt(i).toLowerCase()
+        i++
+    }
+    var rest = tag.slice(i, tag.length - 1)
+    var slashFirst = rest.charAt(0) === "/"
+    var whitespaceEnd = slashFirst ? 1 : 0
+    while (whitespaceEnd < rest.length && isHtmlWhitespace(rest.charAt(whitespaceEnd)))
+        whitespaceEnd++
+    var validHead = /^[a-z]/.test(name)
+        && (rest === "" || isHtmlWhitespace(rest.charAt(0)) || slashFirst)
+        && (!closing || (!slashFirst && whitespaceEnd === rest.length))
+        && (!slashFirst || whitespaceEnd === rest.length)
+    // Malformed dropped openers still suppress their bodies; malformed closers cannot end a dropped body.
+    if (!validHead && (closing || !DROP_CONTENT.hasOwnProperty(name)))
+        name = ""
+    var attrs = scanAttributes(rest)
+    return { name: name, closing: closing, rest: rest, selfClose: validHead && attrs.valid && attrs.selfClose,
+        attributes: attrs.attributes, validAttrs: attrs.valid }
+}
+
+// Sample input: " \thttps://a.example/x\n " strips URL padding and embedded tab, CR and LF.
+function normalizedTarget(value) {
+    return MdUrl.strippedTarget(value)
+}
+
+// One attribute value with entities decoded for the safety checks below.
+function attrKept(name, value, tagName) {
+    var seen = normalizedTarget(MdUrl.canonicalUrl(value)).toLowerCase()
+    // CSS url() in any attribute loads, so the attribute goes.
+    if (/url\s*\(/i.test(seen))
+        return false
+    if (name === "href") {
+        if (tagName !== "a")
+            return false
+        // Links never fetch: http, https, mailto, relative and #anchor stay, through every decoding.
+        return MdUrl.targetAllowed(value)
+    }
+    if (name === "src")
+        return tagName === "img" || tagName === "source"
+    if (name === "color")
+        return tagName === "font"
+    return GLOBAL_ATTRS.hasOwnProperty(name)
+}
+
+// The opening of an inline code chip; an unusable chrome leaves a plain code tag.
+function chipOpen(chrome) {
+    return CHROME_PATTERN.test(String(chrome || "")) ? '<code style="background-color:' + chrome + '">' + MdEscape.chipPad() : "<code>"
+}
+function chipClose(chrome) {
+    return CHROME_PATTERN.test(String(chrome || "")) ? MdEscape.chipPad() + "</code>" : "</code>"
+}
+
+function escapeAttr(value) {
+    return String(value).replace(/&/g, "&#38;").replace(/"/g, "&#34;").replace(/</g, "&#60;")
+}
+
+// Sanitize one tag into {emit, drop}; held image tokens carry resolved URLs, and drop names content to skip. chrome fills the key cap, ink colours a link, inked.open counts the links wearing it.
+function sanitizeTag(tag, dir, tokens, chrome, ink, inked) {
+    function hold(html) {
+        return holdToken(tokens, html)
+    }
+    var head = tagHead(tag)
+    var name = STRIKE_AS.hasOwnProperty(head.name) ? STRIKE_AS[head.name] : head.name
+    if (name.length === 0)
+        return { emit: "&#60;", drop: null }
+    if (DROP_CONTENT.hasOwnProperty(name))
+        return { emit: "", drop: head.closing || head.selfClose ? null : name }
+    if (!ALLOWED.hasOwnProperty(name))
+        return { emit: "", drop: null }
+    // details is drawn open: its summary is a bold line led by the open disclosure mark, and its body follows.
+    if (name === "details")
+        return { emit: "", drop: null }
+    if (name === "summary")
+        return { emit: head.closing ? "</b>" : "<b>" + DISCLOSURE_OPEN + " ", drop: null }
+    // kbd and code are the inline code chip, never a bare tag.
+    if (name === "kbd" || name === "code")
+        return { emit: head.closing ? chipClose(chrome) : chipOpen(chrome), drop: null }
+    var wear = name === "a" ? MdInline.linkInk(ink) : null
+    // A closer takes off only ink its own opener put on, so a refused, self-closed or missing opener never ends an enclosing font.
+    if (head.closing) {
+        var worn = wear !== null && inked.open > 0
+        if (worn)
+            inked.open--
+        return { emit: (worn ? wear.close : "") + "</" + name + ">", drop: null }
+    }
+    if (!head.validAttrs)
+        return { emit: "", drop: null }
+    var kept = ""
+    var srcSeen = null
+    var srcsetSeen = null
+    var altSeen = null
+    for (var i = 0; i < head.attributes.length; i++) {
+        var aname = head.attributes[i].name
+        var value = head.attributes[i].value
+        // Every style, class, id, background, srcset, poster, data-* and on* attribute is dropped, whatever its value.
+        if (aname === "style" || aname === "class" || aname === "id"
+                || aname === "background" || aname === "poster"
+                || aname.indexOf("data-") === 0 || aname.indexOf("on") === 0)
+            continue
+        if (aname === "srcset") {
+            if (srcsetSeen === null)
+                srcsetSeen = value === null ? "" : value
+            continue
+        }
+        if (aname === "src" && (name === "img" || name === "source")) {
+            if (srcSeen === null)
+                srcSeen = value === null ? "" : value
+            continue
+        }
+        if (aname === "alt") {
+            if (altSeen !== null)
+                continue
+            altSeen = value === null ? "" : value
+        }
+        if (aname === "href" && value !== null)
+            value = normalizedTarget(value)
+        if (value === null || attrKept(aname, value, name))
+            kept += " " + aname + (value === null ? "" : '="' + escapeAttr(value) + '"')
+    }
+    if (name === "img" || name === "source") {
+        var picked = null
+        if (srcSeen !== null)
+            picked = MdUrl.classifyImage(srcSeen, dir)
+        else if (srcsetSeen !== null)
+            picked = MdUrl.srcsetPick(srcsetSeen, dir)
+        // The importer drops everything after a raw img tag, so a local picture reaches it as a Markdown image.
+        if (picked !== null && picked.kind === "local")
+            return { emit: hold("![" + MdEscape.escapeText(altSeen === null ? "" : altSeen) + "]("
+                + picked.url.replace(/\(/g, "%28").replace(/\)/g, "%29") + ")"), drop: null }
+        if (picked !== null && picked.kind === "remote")
+            return { emit: "\n\n" + MdUrl.placeholder(MdEscape.escapeText(picked.host)) + "\n\n", drop: null }
+        return { emit: MdUrl.canonicalUrl(altSeen).length > 0 ? MdEscape.escapeText(altSeen) : "", drop: null }
+    }
+    var close = (head.selfClose || VOID.hasOwnProperty(name)) ? " /" : ""
+    var wears = wear !== null && close === ""
+    if (wears)
+        inked.open++
+    return { emit: "<" + name + kept + close + ">" + (wears ? wear.open : ""), drop: null }
+}

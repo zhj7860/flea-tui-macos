@@ -1,0 +1,96 @@
+.pragma library
+
+.import "Format.js" as Format
+.import "Menu.js" as Menu
+.import "Nav.js" as Nav
+.import "RailKeys.js" as RailKeys
+.import "Places.js" as Places
+.import "Tabs.js" as Tabs
+
+// The sentence a remote favourite answers a new-tab open with, filled by Format.fill.
+var WORDS = {
+    opensHere: "%1 opens in this tab only"
+}
+
+// MenuAdditions rule 3: the folder menu, opened from a Places or Favorites row and acting on that
+// row's own path. The key carries the path because the rail rebuilds on a five second poll and an
+// index taken when the menu opened can name another row by the time a row inside it is chosen, the
+// same reason ui/js/Mounts.js keys a share's menu by its uri.
+function key(entry, favouriteIndex) {
+    return "place:" + favouriteIndex + ":" + entry.path
+}
+
+// The hidden list is ui/ViewState.qml "menuHidden", handed in by the caller: it is the one reader
+// that falls back to the shipped defaults, and a list derived any other way is empty before the
+// state file lands, which switched this menu on in a fresh home. Anything else fails closed.
+function entries(entry, favouriteIndex, hidden) {
+    if (!Array.isArray(hidden))
+        return []
+    return Menu.placeEntries({ hiddenActions: hidden, hasRow: true, placeFavourite: favouriteIndex >= 0 })
+}
+
+// Every row here takes the path the key carries. Properties is not among them: the dialog snapshots
+// row indices through the backend's own menuaction op, which a place has none of, so the board's
+// sixth row waits for that protocol rather than being faked from the listing's cursor.
+function perform(action, key, sidebar, favourites) {
+    // The rail's older key, which only ever carried Remove: kept exactly, identity check included,
+    // because it is what a favourite's menu still is while the Places row menu is switched off.
+    if (key.indexOf("favourite:") === 0) {
+        var end = key.indexOf(":", 10)
+        var at = Number(key.substring(10, end))
+        if (action !== "removeFavourite") return
+        if (JSON.stringify(favourites.records[at]) === key.substring(end + 1)) favourites.remove(at)
+        else sidebar.message("Favorites changed; reopen the menu before removing this row.", true)
+        return
+    }
+    var rest = key.substring("place:".length)
+    var cut = rest.indexOf(":")
+    var index = Number(rest.substring(0, cut))
+    var path = rest.substring(cut + 1)
+    var pane = sidebar.navigationPane
+    if (!pane || path.length === 0)
+        return
+    if (action === "open") { openPath(path, sidebar, pane); return }
+    else if (action === "openTab") Tabs.openNew(pane, path)
+    else if (action === "openTerminal") pane.openTerminal(path)
+    // The Places row's Copy path row acts on its own path, the way the Locked
+    // tile's does: MenuAdditions040 replaced the file menu's row, not this one.
+    else if (action === "copypath") pane.performMenu("copypath", 0, [path])
+    else if (action === "addFavourite") favourites.add(path, leaf(path))
+    else if (action === "removeFavourite") removeAt(sidebar, favourites, index, path)
+}
+
+// Open reuses the rail's own activation handoff: focus follows a ready folder or a started listing, and a refused busy open stays on the rail.
+function openPath(path, sidebar, pane) {
+    if (pane.listInFlight === true) { Nav.openPlace(pane, path); return }
+    sidebar.focusOnOpen = true
+    RailKeys.openFrom(pane, path, sidebar)
+}
+
+// A favourite is removed by index, so the index is checked against the path the menu was opened on:
+// the rail rebuilds on a five second poll and Favourites can be rewritten by the other front end.
+function removeAt(sidebar, favourites, index, path) {
+    var record = favourites.records[index]
+    if (record && String(record.path) === path) favourites.remove(index)
+    else sidebar.message("Favorites changed; reopen the menu before removing this row.", true)
+}
+
+function leaf(path) {
+    var cut = String(path).replace(/\/+$/, "").lastIndexOf("/")
+    return cut < 0 ? path : path.substring(cut + 1)
+}
+
+// A middle click on a Places or Favorites row: its folder in a new tab, the listing's own middle click
+// (ui/js/Tap.js tappedTab). A favourite resolves as ui/Sidebar.qml openFavourite does, and a remote
+// one, which has to mount before it has a path, says so rather than opening somewhere else.
+function openTabAt(sidebar, index) {
+    var entry = sidebar.entries[index]
+    var pane = sidebar.navigationPane
+    if (!entry || !pane || (entry.kind !== "home" && entry.kind !== "favourite"))
+        return
+    // Places.openEntry with a new-tab port: same record check, message and file:// decode; a remote entry answers through the network port.
+    Places.openEntry(entry, { pane: pane,
+        opened: function (path) { Tabs.openNew(pane, path) },
+        networkHost: function () { sidebar.message(Format.fill(WORDS.opensHere, entry.label), false); return null },
+        message: sidebar.message })
+}

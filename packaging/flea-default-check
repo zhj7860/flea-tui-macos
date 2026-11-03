@@ -1,0 +1,108 @@
+#!/bin/bash
+# Proves an installed Flea package can make itself the default and give it back; docs/release.md has its usage.
+set -euo pipefail
+
+if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+  echo "flea-default-check: expected one package file, got: $*" >&2
+  exit 2
+fi
+package=$1
+user=defaultcheck
+home=/home/$user
+entry=com.thisisgm.flea.desktop
+service=$home/.local/share/dbus-1/services/org.freedesktop.FileManager1.service
+bindings=$home/.config/hypr/bindings.lua
+portals=$home/.config/xdg-desktop-portal/portals.conf
+mimeapps=$home/.config/mimeapps.list
+
+fail() { echo "::error::flea-default-check $(basename "$package"): $1"; exit 1; }
+
+# -dd: only the flea binary runs here, and quickshell is not in Arch's own repositories.
+pacman -Udd --noconfirm --noprogressbar "$package" >/dev/null
+# -y: the container ships no sync databases, and the flea-bin leg syncs nothing before this.
+pacman -Syu --noconfirm --needed --noprogressbar xdg-utils >/dev/null
+useradd -m "$user"
+# Hyprland is not running here, so hyprctl answers nothing and reloads nothing, as on a box whose config loads.
+stub=$(mktemp -d)
+printf '#!/bin/sh\nexit 0\n' > "$stub/hyprctl"
+chmod 755 "$stub" "$stub/hyprctl"
+as_user() { runuser -u "$user" -- env -i HOME="$home" PATH="$stub:/usr/bin" "$@"; }
+as_user mkdir -p "$home/.config/hypr" "$home/.local/share/applications"
+# A binding of the user's own, which the claim must add beside and the release must leave.
+own_binding='bindd = SUPER, T, Terminal, exec, alacritty'
+as_user sh -c 'printf "%s\n" "$1" > "$2"' _ "$own_binding" "$bindings"
+# Another handler holds folders first, as on any box that had a file manager before Flea.
+printf '[Desktop Entry]\nType=Application\nName=Other\nExec=true\nMimeType=inode/directory;\n' > "$home/.local/share/applications/other.desktop"
+chown "$user:" "$home/.local/share/applications/other.desktop"
+as_user xdg-mime default other.desktop inode/directory
+[ "$(as_user xdg-mime query default inode/directory)" = other.desktop ] || fail "the stand-in handler could not be made the default"
+# The FileChooser value xdg-desktop-portal reads: the last one in [preferred], since a key file's later duplicate wins.
+# Sample input, a claimed portals.conf: [preferred] then default=hyprland;gtk then org.freedesktop.impl.portal.FileChooser=flea;gtk
+chooser_route() {
+  local line group="" route=""
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "["*"]") group=$line ;;
+      org.freedesktop.impl.portal.FileChooser=*) [ "$group" = "[preferred]" ] && route=${line#*=} ;;
+    esac
+  done < "$1"
+  printf '%s\n' "$route"
+}
+
+# The reader's own adversarial cases, since a claim alone writes one line: a user's later line wins, and another group's is not a route.
+route_probe=$(mktemp) || fail "mktemp could not make the route reader's probe file"
+# The script's one EXIT trap, so nothing it makes outlives it; add to it rather than setting another.
+trap 'rm -rf "$route_probe" "$stub"' EXIT
+# Written in the script's own shell, so a failed write stops the check here rather than inside a $(...).
+seed_probe() { printf '%b' "$1" > "$route_probe" || fail "could not write the route reader's probe file $route_probe"; }
+seed_probe '[other]\norg.freedesktop.impl.portal.FileChooser=flea\n[preferred]\norg.freedesktop.impl.portal.FileChooser=flea;gtk\norg.freedesktop.impl.portal.FileChooser=gtk\n'
+[ "$(chooser_route "$route_probe")" = gtk ] || fail "chooser_route does not read the last FileChooser line in [preferred]"
+seed_probe '[preferred]\norg.freedesktop.impl.portal.FileChooser=flea;gtk\n[other]\norg.freedesktop.impl.portal.FileChooser=gtk\n'
+[ "$(chooser_route "$route_probe")" = 'flea;gtk' ] || fail "chooser_route reads a FileChooser line from a group after [preferred]"
+seed_probe '[other]\norg.freedesktop.impl.portal.FileChooser=flea\n'
+[ -z "$(chooser_route "$route_probe")" ] || fail "chooser_route reads a FileChooser line outside [preferred]"
+
+# Every claim writes the same four things and every release takes them back.
+claim() {
+  as_user flea --default || fail "flea --default exited $? ($1)"
+  [ "$(as_user xdg-mime query default inode/directory)" = "$entry" ] || fail "folders do not open in Flea after the claim ($1)"
+  [ -f "$service" ] || fail "no Show in folder registration at $service ($1)"
+  # Sample input: the written registration's line `Exec=/usr/lib/flea/flea-filemanager1`.
+  exec_path=$(sed -n 's/^Exec=\([^ ]*\).*/\1/p' "$service")
+  [ -x "$exec_path" ] || fail "Show in folder runs '$exec_path', which the package did not install ($1)"
+  case "$(chooser_route "$portals")" in
+    flea*) ;;
+    *) fail "file dialogs are not routed to Flea under [preferred] in $portals ($1)" ;;
+  esac
+  grep -q '^-- flea --default: begin' "$bindings" || fail "the file manager keys were not written to $bindings ($1)"
+  grep -qxF "$own_binding" "$bindings" || fail "the claim lost the user's own binding in $bindings ($1)"
+}
+release() {
+  as_user flea --default off || fail "flea --default off exited $? ($1)"
+  [ -f "$mimeapps" ] || fail "$mimeapps is gone after off, though it held the stand-in handler's line first ($1)"
+  ! grep -q "=$entry" "$mimeapps" || fail "$mimeapps still names Flea after off ($1)"
+  [ ! -e "$service" ] || fail "$service survived off ($1)"
+  [ -f "$bindings" ] || fail "$bindings is gone after off ($1)"
+  ! grep -q '^-- flea --default: begin' "$bindings" || fail "the file manager keys survived off ($1)"
+  grep -qxF "$own_binding" "$bindings" || fail "off lost the user's own binding in $bindings ($1)"
+}
+
+# A fresh user first: no portal configuration at all, which the claim must create and the release must remove.
+[ ! -e "$(dirname "$portals")" ] || fail "the fresh user already has $(dirname "$portals")"
+claim "fresh user"
+release "fresh user"
+[ ! -e "$portals" ] || fail "off left $portals, which the claim created and nothing else wrote"
+
+# Then a user with an association and a portal routing of their own, which the claim must leave and the release must keep.
+as_user xdg-mime default other.desktop text/plain
+grep -q '^text/plain=other.desktop' "$mimeapps" || fail "the stand-in text/plain association did not land in $mimeapps"
+own_portals=$(printf '[preferred]\ndefault=hyprland;gtk')
+as_user mkdir -p "$(dirname "$portals")"
+as_user sh -c 'printf "%s\n" "$1" > "$2"' _ "$own_portals" "$portals"
+claim "user's own routing"
+grep -q '^default=hyprland;gtk$' "$portals" || fail "the claim lost the user's own portal routing in $portals"
+grep -q '^text/plain=other.desktop' "$mimeapps" || fail "the claim lost the user's own association in $mimeapps"
+release "user's own routing"
+grep -q '^text/plain=other.desktop' "$mimeapps" || fail "off lost the user's own association in $mimeapps"
+[ "$(cat "$portals" 2>/dev/null)" = "$own_portals" ] || fail "off did not give $portals back as the user wrote it: $(cat "$portals" 2>&1)"
+echo "flea-default-check: $(basename "$package") claims and releases the default"

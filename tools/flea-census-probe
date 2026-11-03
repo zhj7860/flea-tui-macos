@@ -1,0 +1,1003 @@
+#!/usr/bin/env python3
+"""Native evidence probe for census rows 2, 3 and 6: the three causes only a real 120 Hz window shows.
+
+  flea-census-probe run PROBE --root ROOT --flea TREE [--samples N] [--out-parent DIR] [--no-stamps] [--dry]
+  flea-census-probe summary JSONL...       the ranges, each with its n, as text
+  flea-census-probe parse STAMPED.log      the Qt timing events of a stamped log, one JSON object a line
+  flea-census-probe clean OUTROOT          remove an output root this probe made, by absolute path, marker checked
+  flea-census-probe selftest               parsers, slots, stats, trash rule and core lists on sample lines, no display
+
+PROBE is one of: held (row 2), ops (row 6), paste (row 6), dual (row 3). ROOT is the census fixture root
+tools/flea-field-instant fixtures built, TREE the Flea tree under test. Run it on minipc in a booked block with the
+display idle, as flea-field-instant is run: it reuses that tool's session, recorder, uinput keys, loads and isolation.
+It writes only under one mktemp -d root of its own (marker .flea-census-probe) and prints the path; clean removes it.
+
+Qt's own timing is the instrument. Every session runs with QT_LOGGING_RULES="qt.scenegraph.time.renderloop=true;
+qt.scenegraph.time.texture=true;qt.scenegraph.time.glyph=true", QSG_RENDER_TIMING=1 and QS_NO_FILTER_QT_LOGS=1. The category
+names and the QSG_RENDER_TIMING variable are in libQt6Quick (strings of 6.8.2 here), and QT_LOGGING_RULES and
+QS_NO_FILTER_QT_LOGS are in the quickshell binary (0.3.0 here), which filters Qt logs unless the second is set. The lines
+the threaded render loop prints, per window, are:
+  [gui thread] polishAndSync: start, elapsed since last call: N ms
+  [gui thread] Frame prepared, polish=N ms, lock=N ms, blockedForSync=N ms, animations=N ms
+  [render thread P] syncAndRender: start, elapsed since last call: N ms
+  [render thread P] syncAndRender: frame rendered in Nms, sync=N, render=N, swap=N
+  [render thread P] syncAndRender: last retrieved GPU frame time was F ms
+and the basic loop prints "[gui thread] syncAndRender: frame rendered in Nms, polish=, sync=, render=, swap=,
+perWindowFrameDelta=". Texture work: "atlastexture upload enqueued in: Nms (WxH)" and the glyph "distancefield:" line.
+Qt prints whole milliseconds, so a 120 Hz frame of 8.3 ms is read to 1 ms: every figure here is a range with its n.
+The lines carry no clock. A tail thread polls the session log every POLL_S and stamps each batch with CLOCK_MONOTONIC, so
+a stamp is up to POLL_S after the line's print; frame times and framecap F lines (presentation ns) share that clock.
+A run that reads no timing line ends with an error row that says so (held stops after its first sweep, ops and dual finish
+their samples first, so those rows carry zero qt figures): the error row, not a zero, is the verdict.
+
+held: j held on the 10k folder in list (control), columns and grid, series_held's hold; per sweep, per repeat slot
+(anchor + k * interval, half an interval either side, the slot rule of held_analysis), drawn or missed, the GUI thread's
+work (polish + animations), the sync handshake (sync, blockedForSync) and the render thread's work (render + swap) that fell
+in it, the frames printed, and the largest gap between GUI frames. A missed slot gets a verdict: no-frame (no loop line
+at all), light (every part under SMALL_MS), or the part that was largest: gui, sync or render.
+ops: op.copy.large, op.copy.long, op.move.cross-fs, op.trash through series_op unchanged, each sample also carrying: the F
+lines around its first changed frame (a miss: the first 40 after the paste), statusActivityState read at STAMP_S after the
+paste (an IPC call each, a small perturbation; --no-stamps drops them), render and GUI work in 100 ms bins for 3 s, and in
+one facts row the device of the sandbox, the op directories, the home Trash Flea sees and the real one, whether Flea's
+trash renames in place (src/backend/hometrash.rs same_filesystem) and the directory GLib picks.
+paste: five fresh op.copy.many sessions of three pastes each, so n=5 cold (the first paste of a session builds
+CollideHost) and n=10 warm. Each paste is followed by a burst of "ready" IPC calls for BURST_S; the GUI thread serves
+them, so the largest round trip over the idle median is the longest the GUI thread was away. Paste takes no stamps: their
+IPC calls would queue the burst's own. The Qt GUI frame gaps and the dest refresh of the 1000 rows ride in the same row.
+dual: nav.dual.down and nav.dual.up (series_pairs) in the p7-load session under: b (the census load b, a Flea copy to the
+USB stick), d (dd direct writes to it, the census load d), pin (Flea pinned to FLEA cores, no load, the control), burn-off
+(pin, plus one CPU burner per BURN core, on cores Flea may not use) and burn-on (pin, plus burners on Flea's own cores).
+If burn-off is as slow as b, the cost is not CPU contention; if burn-on is slow and burn-off is not, it is.
+FLEA cores default to the first half of the allowed cores, BURN to the next ones but the last (left to the compositor and
+this tool); --flea-cores and --burn-cores override. A pinned Flea differs from the census, which is why pin is its own arm.
+"""
+import contextlib
+import io
+import json
+import math
+import os
+import re
+import shutil
+import signal
+import statistics
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import types
+from importlib.machinery import SourceFileLoader
+
+sys.dont_write_bytecode = True  # the loader would leave tools/__pycache__ behind
+HERE = os.path.dirname(os.path.abspath(__file__))
+I = SourceFileLoader("flea_field_instant", os.path.join(HERE, "flea-field-instant")).load_module()
+S, N = I.S, I.N
+MS = I.MS
+MARKER = ".flea-census-probe"
+QT_RULES = ("qt.scenegraph.time.renderloop=true;qt.scenegraph.time.texture=true;qt.scenegraph.time.glyph=true")
+POLL_S = 0.001  # s between tail reads
+SMALL_MS = 2.0  # a missed slot with every part under this is light
+STAMP_S = (0.1, 0.25, 0.5, 1.0, 2.0, 5.0)  # s after a paste or delete that statusActivityState is read
+BURST_S = 1.5  # s of ready calls after a paste
+IDLE_RTTS = 8  # ready round trips read before a paste session, the idle median the burst is judged against
+READ_BYTES = 1 << 20  # bytes a tail read takes at most
+NS_FOREVER = 1 << 62  # an upper bound past any monotonic stamp
+FRAME_TAIL_MS = 250  # ms past a sample's first change that F lines are kept
+FRAME_MISS_NS = 3 * 10**9  # ns of F lines kept after a press that changed nothing
+CHANGED_CAP_NS = 30 * 10**9  # ns after a press in which changed frames are counted, the op cap
+HOLD_TAIL_NS = 500 * MS  # ns past key-up in which a held sweep's last frames still arrive
+FRAME_SLACK_NS = 16 * MS  # one 60 Hz frame past a dual row's first change, so its frame is inside the qt window
+EVENT_LAG_NS = 50 * MS  # ns past a window's end a stamped batch may still hold its lines, POLL_S and the print delay
+DUAL_MISS_MS = 100  # ms a dual row with no first change is given for its qt window
+PIN_TRIES = 2  # taskset attempts per process, one retry for a thread that exits mid-pin
+BURN_START_S = 0.2  # s a burner gets to show CPU ticks before its arm counts as loaded
+BIN_MS, BINS = 100, 30  # the render and GUI work bins after an op's input
+FRAME_LIMIT = 40  # F lines kept around a sample
+PROBES = {"held": ("p2-held", 10), "ops": ("p6-ops", 8), "paste": ("p6-ops", 3), "dual": ("p7-load", 20)}
+OPS_PROBED = ("op.copy.large", "op.copy.long", "op.move.cross-fs", "op.trash")
+HELD_VIEWS = ("list", "columns", "grid")
+ARMS = ("pin", "burn-off", "burn-on")
+PASTE_SESSIONS = 5
+
+
+# Qt timing lines.
+
+NUM = r"(\d+)"
+LINES = [
+    ("gui_start", r"\[window (\w+)\]\[gui thread\] polishAndSync: start, elapsed since last call: " + NUM + " ms", ("gap",)),
+    ("gui", r"\[window (\w+)\]\[gui thread\] Frame prepared, polish=" + NUM + " ms, lock=" + NUM
+     + " ms, blockedForSync=" + NUM + " ms, animations=" + NUM + " ms", ("polish", "lock", "blocked", "anim")),
+    ("rt_start", r"\[window (\w+)\]\[render thread \w+\] syncAndRender: start, elapsed since last call: " + NUM + " ms", ("gap",)),
+    ("render", r"\[window (\w+)\]\[render thread \w+\] syncAndRender: frame rendered in " + NUM + r"ms, sync=" + NUM
+     + ", render=" + NUM + ", swap=" + NUM, ("total", "sync", "render", "swap")),
+    ("gpu", r"\[window (\w+)\]\[render thread \w+\] syncAndRender: last retrieved GPU frame time was ([\d.]+) ms", ("ms",)),
+    ("basic", r"\[window (\w+)\]\[gui thread\] syncAndRender: frame rendered in " + NUM + r"ms, polish=" + NUM + ", sync="
+     + NUM + ", render=" + NUM + ", swap=" + NUM + ", perWindowFrameDelta=" + NUM,
+     ("total", "polish", "sync", "render", "swap", "delta")),
+    ("atlas", r"atlastexture upload enqueued in: " + NUM + r"ms \(" + NUM + "x" + NUM + r"\)", ("ms", "w", "h")),
+    ("glyph", r"distancefield: " + NUM + " glyphs prepared in " + NUM + "ms, rendering=" + NUM + ", upload=" + NUM,
+     ("glyphs", "ms", "rendering", "upload")),
+]
+COMPILED = [(kind, re.compile(pat), names) for kind, pat, names in LINES]
+
+
+def parse_qt_line(line):
+    """The event of one Qt timing line, or None. Sample input: "[window 0x55d0][render thread 0x7f1c] syncAndRender: frame rendered in 3ms, sync=1, render=2, swap=0"."""
+    for kind, rx, names in COMPILED:
+        m = rx.search(line)
+        if not m:
+            continue
+        vals = list(m.groups())
+        ev = {"kind": kind}
+        if kind in ("gui_start", "gui", "rt_start", "render", "gpu", "basic"):
+            ev["win"] = vals.pop(0)
+        for name, v in zip(names, vals):
+            ev[name] = float(v) if name == "ms" and "." in v else int(v) if v.isdigit() else float(v)
+        return ev
+    return None
+
+
+def work_of(ev):
+    """(gui, sync, render, span) ms of one frame event: the GUI thread's own work, the handshake, the render thread's work, and the span the event covers."""
+    k = ev["kind"]
+    if k == "gui":
+        return ev["polish"] + ev["anim"], ev["lock"] + ev["blocked"], 0, ev["polish"] + ev["lock"] + ev["blocked"] + ev["anim"]
+    if k == "render":
+        return 0, ev["sync"], ev["render"] + ev["swap"], ev["total"]
+    if k == "basic":
+        return ev["polish"], ev["sync"], ev["render"] + ev["swap"], ev["total"]
+    return 0, 0, 0, 0
+
+
+def split_window(lo, hi, events):
+    """Work that fell in [lo, hi) ns, prorating each frame event by the share of its span inside: gui, sync, render ms, the frame events, the largest GUI gap."""
+    g = s = r = 0.0
+    frames = gap = 0
+    for ev in events:
+        t, k = ev["t"], ev["kind"]
+        if k == "gui_start" and lo <= t < hi:
+            gap = max(gap, ev["gap"])
+        if k not in ("gui", "render", "basic"):
+            continue
+        eg, es, er, span = work_of(ev)
+        begin = t - span * MS
+        if span > 0:
+            share = max(0, min(hi, t) - max(lo, begin)) / (t - begin)
+        else:
+            share = 1.0 if lo <= t < hi else 0.0
+        if share > 0:
+            frames += 1
+            g, s, r = g + eg * share, s + es * share, r + er * share
+    return {"gui_ms": round(g, 1), "sync_ms": round(s, 1), "render_ms": round(r, 1), "frames": frames, "gap_ms": gap}
+
+
+def verdict(w):
+    """Why a slot with no drawn frame: no-frame, light, or the largest of gui, sync, render."""
+    if w["frames"] == 0:
+        return "no-frame"
+    top = max(w["gui_ms"], w["sync_ms"], w["render_ms"])
+    if top < SMALL_MS:
+        return "light"
+    return "render" if w["render_ms"] == top else "gui" if w["gui_ms"] == top else "sync"
+
+
+def slot_windows(anchor, n_rep, interval_ns):
+    """The (lo, hi) ns of repeat slots 0..n_rep-1: anchor + k * interval, half an interval either side."""
+    half = interval_ns / 2
+    return [(anchor + k * interval_ns - half, anchor + k * interval_ns + half) for k in range(n_rep)]
+
+
+def slot_of(t, anchor, interval_ns, n_rep):
+    """The repeat slot a time falls in (anchor + k * interval, half an interval either side), or None outside 0..n_rep-1."""
+    k = math.floor((t - anchor) / interval_ns + 0.5)
+    return k if 0 <= k < n_rep else None
+
+
+def frame_rows(events, anchor, interval_ns, n_rep):
+    """Every frame and texture event as [slot, kind, ms after the anchor, gui, sync, render, gap or texture ms], slot None outside the hold."""
+    out = []
+    for ev in events:
+        k = ev["kind"]
+        if k in ("gui", "render", "basic"):
+            g, sy, r, _ = work_of(ev)
+            out.append([slot_of(ev["t"], anchor, interval_ns, n_rep), k, round((ev["t"] - anchor) / MS, 1), g, sy, r, 0])
+        elif k in ("gui_start", "atlas"):
+            out.append([slot_of(ev["t"], anchor, interval_ns, n_rep), k, round((ev["t"] - anchor) / MS, 1), 0, 0, 0, ev.get("gap", ev.get("ms"))])
+    return out
+
+
+def held_slots(changes, events, anchor, n_rep, interval_ns):
+    """Per slot: [k, drawn, gui_ms, sync_ms, render_ms, frames, gap_ms, verdict or ""]; slot 0 is the anchor, drawn by definition."""
+    out = []
+    for k, (lo, hi) in enumerate(slot_windows(anchor, n_rep, interval_ns)):
+        drawn = k == 0 or any(lo <= t < hi for t in changes)
+        w = split_window(lo, hi, events)
+        out.append([k, drawn, w["gui_ms"], w["sync_ms"], w["render_ms"], w["frames"], w["gap_ms"], "" if drawn else verdict(w)])
+    return out
+
+
+class Tail:
+    """A log read from its current end, each batch of new timing lines stamped with CLOCK_MONOTONIC ns on arrival."""
+
+    def __init__(self, path, keep=None):
+        self.fd = os.open(path, os.O_RDONLY)
+        os.lseek(self.fd, 0, os.SEEK_END)
+        self.events, self.lines, self.partial = [], 0, b""
+        self.lock, self.quit = threading.Lock(), threading.Event()
+        self.keep = open(keep, "a") if keep else None
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
+
+    def drain(self):
+        data = os.read(self.fd, READ_BYTES)
+        if not data:
+            return False
+        ns = time.monotonic_ns()
+        *whole, self.partial = (self.partial + data).split(b"\n")
+        with self.lock:
+            for raw in whole:
+                self.lines += 1
+                text = raw.decode("utf-8", "replace")
+                ev = parse_qt_line(text)
+                if ev:
+                    ev["t"] = ns
+                    self.events.append(ev)
+                    if self.keep:
+                        self.keep.write("%d\t%s\n" % (ns, text))
+        return True
+
+    def run(self):
+        while not self.quit.is_set():
+            if not self.drain():
+                time.sleep(POLL_S)
+
+    def between(self, lo, hi):
+        with self.lock:
+            return [e for e in self.events if lo <= e["t"] < hi]
+
+    def close(self):
+        self.quit.set()
+        self.thread.join(5)
+        while self.drain():
+            pass
+        os.close(self.fd)
+        if self.keep:
+            self.keep.close()
+
+
+def read_stamped(path):
+    """Events from a stamped log, lines "ns<TAB>text", as the Tail keeps them."""
+    out = []
+    with open(path) as f:
+        for line in f:
+            ns, _, text = line.rstrip("\n").partition("\t")
+            ev = parse_qt_line(text)
+            if ev and ns.isdigit():
+                ev["t"] = int(ns)
+                out.append(ev)
+    return out
+
+
+# Ranges.
+
+def rng(vals, digits=1):
+    """"min-max p50 X (n=N)" of numbers, None skipped."""
+    v = sorted(x for x in vals if x is not None)
+    if not v:
+        return "n=0"
+    p50 = statistics.median(v)
+    p95 = v[min(len(v) - 1, math.ceil(0.95 * len(v)) - 1)]
+    return "%.*f-%.*f p50 %.*f p95 %.*f (n=%d)" % (digits, v[0], digits, v[-1], digits, p50, digits, p95, len(v))
+
+
+# Cores.
+
+def cpulist(cpus):
+    """Cores as a taskset list: [0,1,2,5] gives "0-2,5"."""
+    out, cpus = [], sorted(cpus)
+    i = 0
+    while i < len(cpus):
+        j = i
+        while j + 1 < len(cpus) and cpus[j + 1] == cpus[j] + 1:
+            j += 1
+        out.append(str(cpus[i]) if i == j else "%d-%d" % (cpus[i], cpus[j]))
+        i = j + 1
+    return ",".join(out)
+
+
+def parse_cpulist(text):
+    """The cores a taskset list names: "0-2,5" gives [0,1,2,5]."""
+    out = []
+    for part in text.split(","):
+        a, _, b = part.partition("-")
+        out += range(int(a), int(b or a) + 1)
+    return sorted(set(out))
+
+
+def split_cores(cpus, flea=None, burn=None):
+    """(flea cores, burn cores): the first half, then the next ones but the last; explicit lists win."""
+    cpus = sorted(cpus)
+    if len(cpus) < 4 and not (flea and burn):
+        raise RuntimeError("the pin arms need 4 allowed cores or --flea-cores and --burn-cores, this box has %d" % len(cpus))
+    half = len(cpus) // 2
+    f = parse_cpulist(flea) if flea else cpus[:half]
+    b = parse_cpulist(burn) if burn else cpus[half:-1]
+    if set(f) & set(b):
+        raise RuntimeError("the Flea and burner cores overlap: %s and %s" % (cpulist(f), cpulist(b)))
+    return f, b
+
+
+def stat_ticks(text):
+    """utime + stime of a /proc/PID/stat line. Sample input: "42 (sh -c) S 1 42 42 0 -1 4194304 100 0 0 0 7 5 0 0 20 0 1 0 1 1 1 ...", comm may hold spaces."""
+    rest = text[text.rindex(")") + 2:].split()
+    return int(rest[11]) + int(rest[12])
+
+
+class Burn:
+    """One busy loop per core in a process group pinned to cores; the poll, terminate, wait and kill load_stop calls."""
+
+    def __init__(self, cores):
+        n = len(parse_cpulist(cores))
+        script = "for i in $(seq %d); do (while :; do :; done) & done; wait" % n
+        self.proc = subprocess.Popen(["taskset", "-c", cores, "sh", "-c", script], stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+    def poll(self):
+        return self.proc.poll()
+
+    def wait(self, timeout=None):
+        return self.proc.wait(timeout)
+
+    def terminate(self):
+        self.sig(signal.SIGTERM)
+
+    def kill(self):
+        self.sig(signal.SIGKILL)
+
+    def sig(self, s):
+        try:
+            os.killpg(self.proc.pid, s)
+        except ProcessLookupError:
+            pass
+
+    def ticks(self):
+        total = 0
+        for pid in S.descendants(self.proc.pid):
+            try:
+                with open("/proc/%d/stat" % pid) as f:
+                    total += stat_ticks(f.read())
+            except (OSError, ValueError):
+                pass
+        return total
+
+
+def pin_failure(pid, rc, allowed, cores):
+    """Why a pin of pid did not take, or None: taskset's exit code, or a read-back list that is not cores."""
+    if rc != 0:
+        return "taskset exited %d on pid %d" % (rc, pid)
+    if not allowed or parse_cpulist(allowed) != parse_cpulist(cores):
+        return "pid %d reads Cpus_allowed_list %r, not %s" % (pid, allowed, cores)
+    return None
+
+
+def pin_tree(proc, cores):
+    """Every thread of proc and its descendants onto cores; the (pid, allowed list) read back for the facts, RuntimeError when one did not take."""
+    seen = []
+    for pid in sorted(S.descendants(proc.pid)):
+        for _ in range(PIN_TRIES):
+            rc = subprocess.run(["taskset", "-a", "-p", "-c", cores, str(pid)], capture_output=True).returncode
+            try:
+                # Sample input: "Cpus_allowed_list:\t0-5"
+                with open("/proc/%d/status" % pid) as f:
+                    allowed = next((ln.split(":")[1].strip() for ln in f if ln.startswith("Cpus_allowed_list")), "")
+            except OSError:
+                break  # the process ended during the pin
+            why = pin_failure(pid, rc, allowed, cores)
+            if not why:
+                seen.append((pid, allowed))
+                break
+        else:
+            raise RuntimeError("pin to cores %s failed: %s" % (cores, why))
+    return seen
+
+
+def burn_failure(burn, cores):
+    """Why a burner is not loading cores, or None: it has exited, or it shows no CPU ticks after BURN_START_S."""
+    time.sleep(BURN_START_S)
+    if burn.poll() is not None:
+        return "the burner on cores %s exited %d at once" % (cores, burn.poll())
+    if burn.ticks() == 0:
+        return "the burner on cores %s shows no CPU ticks after %.1f s" % (cores, BURN_START_S)
+    return None
+
+
+# Trash.
+
+def glib_trash_dir(item, home, data_home, uid, devof, usable_global):
+    """The trash directory GLib picks for item: the home Trash on the home device, else TOP/.Trash/UID when TOP/.Trash is usable, else TOP/.Trash-UID (AGENTS.md rule, mount top found as the device edge)."""
+    parent = os.path.dirname(item)
+    if devof(parent) == devof(home):
+        return data_home + "/Trash"
+    top = parent
+    while os.path.dirname(top) != top and devof(os.path.dirname(top)) == devof(parent):
+        top = os.path.dirname(top)
+    top = top.rstrip("/")
+    return "%s/.Trash/%d" % (top, uid) if usable_global(top + "/.Trash") else "%s/.Trash-%d" % (top, uid)
+
+
+def flea_renames(item_dev, parent_dev, trash_dev):
+    """src/backend/hometrash.rs same_filesystem: the item's own device, its folder's and the nearest existing folder above the home Trash must agree."""
+    return item_dev == parent_dev == trash_dev
+
+
+def nearest(path):
+    """The nearest existing path at or above path: "/a/b/new" gives "/a" when /a/b is missing."""
+    while not os.path.exists(path) and os.path.dirname(path) != path:
+        path = os.path.dirname(path)
+    return path
+
+
+def facts(root):
+    """The devices and trash decisions of this box for the ops probe."""
+    home = os.path.expanduser("~")
+    data_home = os.environ.get("XDG_DATA_HOME") or os.path.join(home, ".local/share")
+    uid = os.getuid()
+
+    def devof(p):
+        return os.stat(nearest(p)).st_dev
+
+    def usable(p):
+        return os.path.isdir(p) and not os.path.islink(p) and bool(os.stat(p).st_mode & 0o1000)
+    src = os.path.join(root, "ops", "run", "trash", "b-src")
+    item = os.path.join(src, "t_00.txt")
+    own = os.path.join(root, "data", "Trash")
+    out = {"dev": {"root": devof(root), "real_home": devof(home), "real_home_trash": devof(os.path.join(data_home, "Trash")),
+                   "flea_home_trash": devof(own), "trash_src": devof(src), "sandbox_parent": devof(I.LOCAL_PARENT), "copy_dst": devof(os.path.join(root, "ops", "run", "copy-large", "a-dst"))},
+           "uid": uid}
+    d = out["dev"]
+    out["root_on_real_home_device"] = d["root"] == d["real_home"]
+    out["flea_trash_renames_in_place"] = flea_renames(devof(item), devof(src), d["flea_home_trash"])
+    out["glib_dir_for_item"] = glib_trash_dir(item, home, data_home, uid, devof, usable)
+    out["flea_home_trash_dir"] = own
+    out["cpus"] = sorted(os.sched_getaffinity(0))
+    # Sample input: "Quickshell 0.3.0 (revision , distributed by Debian)"
+    out["qs"] = subprocess.run(["qs", "-V"], capture_output=True, text=True).stdout.strip()
+    return out
+
+
+# Instrumentation of one session.
+
+class Instr:
+    """The tail, the press hooks and the row tags of one session; installed before a series, closed after it."""
+
+    def __init__(self, sess, stamps=True, burst=False):
+        self.sess, self.stamps, self.burst = sess, stamps, burst
+        self.tail = Tail(sess.log.name, os.path.join(sess.ctx["out_dir"], "qt-%s.log" % sess.ctx["tag"]))
+        self.presses, self.threads = {}, []
+        keys, orig = sess.keys, sess.keys.chord
+        self.orig_chord = orig
+
+        def chord(*c):
+            t = orig(*c)
+            if c in (("ctrl", "v"), ("delete",)):
+                self.fire(t)
+            return t
+        keys.chord = chord
+        self.keys = keys
+        self.idle_rtt = [self.rtt() for _ in range(IDLE_RTTS)] if burst else []
+
+    def rtt(self):
+        a = time.monotonic_ns()
+        self.sess.ipc("ready")
+        return round((time.monotonic_ns() - a) / MS, 1)
+
+    def fire(self, t):
+        rec = self.presses[t] = {"stamps": [], "burst": []}
+        if self.stamps:
+            self.spawn(self.stamp_run, t, rec)
+        if self.burst:
+            self.spawn(self.burst_run, t, rec)
+
+    def spawn(self, fn, *a):
+        th = threading.Thread(target=fn, args=a, daemon=True)
+        th.start()
+        self.threads.append(th)
+
+    def stamp_run(self, t, rec):
+        for off in STAMP_S:
+            while time.monotonic_ns() < t + off * 1e9:
+                time.sleep(0.005)
+            b = time.monotonic_ns()
+            st = I.activity_state(self.sess)
+            a = time.monotonic_ns()
+            acts = [[x.get("text"), x.get("running"), x.get("cancelling")] for x in (st or {}).get("activities") or []]
+            rec["stamps"].append({"at_ms": round((b - t) / MS, 1), "rtt_ms": round((a - b) / MS, 1), "read": st is not None,
+                                  "errors": (st or {}).get("errors"), "notice": (st or {}).get("notice"), "activities": acts})
+
+    def burst_run(self, t, rec):
+        while time.monotonic_ns() < t + BURST_S * 1e9:
+            b = time.monotonic_ns()
+            self.sess.ipc("ready")
+            rec["burst"].append([round((b - t) / MS, 1), round((time.monotonic_ns() - b) / MS, 1)])
+
+    def tag_columns(self):
+        """Rows from sess.columns and per_key_rows carry their press time."""
+        sess, orig = self.sess, self.sess.columns
+
+        def columns(journey, t, *a, **kw):
+            out = orig(journey, t, *a, **kw)
+            out["t_press_ns"] = t
+            return out
+        sess.columns = columns
+
+    def events(self, lo, hi):
+        return self.tail.between(lo, hi)
+
+    def check_timing(self):
+        """False when the log holds no Qt frame line, so a run says so instead of timing."""
+        return any(e["kind"] in ("gui", "render", "basic") for e in self.tail.between(0, NS_FOREVER))
+
+    def close(self):
+        self.keys.chord = self.orig_chord
+        for th in self.threads:
+            th.join(10)
+        self.tail.close()
+
+
+NO_TIMING = ("no Qt frame timing line reached the session log: set QT_LOGGING_RULES and QS_NO_FILTER_QT_LOGS in the "
+             "environment and read the log (quickshell may route Qt categories elsewhere); see the header of this tool")
+
+
+def series_held(sess, spec, n):
+    """Held j sweeps as series_held, each with its slots split into GUI, sync and render work."""
+    delay, rate = sess.ctx["repeat"]["delay_ms"], sess.ctx["repeat"]["rate"]
+    interval = 1000.0 / rate
+    hold_ns = int((delay + interval * I.HOLD_REPEATS + interval / 2) * MS)
+    stride = sess.ipc_int("gridColumns") if sess.view == "grid" else 1
+    bound = sess.ctx["repeat"].get("max_events")
+    code, rows = N.keycode("j"), sess.taken
+    ins = Instr(sess, stamps=False)
+    try:
+        for _ in range(n):
+            sess.keys.chord("home")
+            sess.settle(1.0, 5)
+            start = sess.ipc_int("cursor")
+            sess.settle(0.5, 3)
+            t_down = time.monotonic_ns()
+            sess.keys._key(code, 1)
+            while time.monotonic_ns() < t_down + hold_ns - 2 * MS:
+                time.sleep(0.001)
+            while time.monotonic_ns() < t_down + hold_ns:
+                pass
+            t_up = time.monotonic_ns()
+            sess.keys._key(code, 0)
+            sess.rec.wait_quiet(N.NAV_QUIET_NS, t_up, N.NAV_CAP_NS)
+            final = sess.ipc_int("cursor")
+            frames = sess.rec.snapshot()
+            h = I.held_analysis(frames, t_down, t_up, delay, interval)
+            over, behind = I.overshoot(start, final, stride, bound)
+            h.update({"start_index": start, "final_index": final, "stride": stride, "idle_max_events": bound,
+                      "overshoot": over, "steps_behind": behind, "hold_ms": round((t_up - t_down) / MS, 1)})
+            row = {"journey": "nav.%s.held-j-sweep" % sess.view, "row": 2, "view": sess.view, "first_ms": h["max_gap_ms"], "held": h}
+            if not ins.check_timing():
+                rows.append(dict(row, error=NO_TIMING))
+                break
+            anchor = S.first_change_after(S.changes_of(frames), t_down + delay * MS)
+            if anchor is not None:
+                events = ins.events(t_down, t_up + HOLD_TAIL_NS)
+                row["slots"] = held_slots(S.changes_of(frames), events, anchor, h["repeats_due"], int(interval * MS))
+                row["slots_head"] = ["k", "drawn", "gui_ms", "sync_ms", "render_ms", "frames", "gui_gap_ms", "verdict"]
+                row["frame_rows"] = frame_rows(events, anchor, int(interval * MS), h["repeats_due"])
+                row["frame_rows_head"] = ["slot", "kind", "ms_after_anchor", "gui_ms", "sync_ms", "render_ms", "gap_or_texture_ms"]
+            rows.append(row)
+    finally:
+        ins.close()
+    return rows
+
+
+def around(detail, lo, hi, limit=FRAME_LIMIT):
+    """The F lines presented in [lo, hi) as [present ms after lo, received ms, changed rows, ink rows]."""
+    return [[round((d[0] - lo) / MS, 1), round((d[1] - lo) / MS, 1), d[2], d[7]] for d in detail if lo <= d[0] < hi][:limit]
+
+
+def bins_of(events, t):
+    """[render ms, GUI ms, frames] per BIN_MS for BINS bins after t."""
+    out = []
+    for i in range(BINS):
+        w = split_window(t + i * BIN_MS * MS, t + (i + 1) * BIN_MS * MS, events)
+        out.append([w["render_ms"], w["gui_ms"], w["frames"]])
+    return out
+
+
+def attach_op(ins, row):
+    t = row.get("t_press_ns")
+    if t is None:
+        return
+    first = row.get("first_ms")
+    detail = ins.sess.rec.detail_snapshot()
+    press = ins.presses.get(t, {})
+    row["frames"] = (around(detail, t, t + int((first + FRAME_TAIL_MS) * MS)) if first is not None else around(detail, t, t + FRAME_MISS_NS))
+    row["frames_head"] = ["present_ms", "received_ms", "changed_rows", "ink_rows"]
+    row["changed_in_cap"] = len([d for d in detail if t <= d[0] < t + CHANGED_CAP_NS and d[2] > 0])
+    row["stamps"] = press.get("stamps", [])
+    row["qt_bins"] = bins_of(ins.events(t, t + BINS * BIN_MS * MS), t)
+    row["qt_bins_head"] = ["render_ms", "gui_ms", "frames"]
+    row["miss"] = first is None
+    if ins.burst:
+        row["burst"] = press.get("burst", [])
+        row["idle_rtt_ms"] = ins.idle_rtt
+
+
+def series_probe_op(sess, spec, n):
+    """series_op unchanged, with the evidence of attach_op on each sample; paste adds the IPC burst, cold on a session's first sample."""
+    ins = Instr(sess, stamps=spec.get("stamps", True), burst=spec["type"] == "probe-paste")
+    ins.tag_columns()
+    try:
+        rows = I.series_op(sess, {"op": spec["op"]}, n)
+        for i, r in enumerate([r for r in rows if "t_press_ns" in r]):
+            attach_op(ins, r)
+            r["cold"] = spec["type"] == "probe-paste" and i == 0
+        if rows and not ins.check_timing():
+            rows.append({"journey": spec["op"], "row": 6, "error": NO_TIMING})
+    finally:
+        ins.close()
+    return rows
+
+
+def series_probe_dual(sess, spec, n):
+    """series_pairs for down and up, each row with the GUI and render work in its window and the arm's evidence."""
+    if getattr(sess, "arm_error", None):
+        raise RuntimeError(sess.arm_error)
+    ins = Instr(sess, stamps=False)
+    orig = I.per_key_rows
+
+    def per_key(s, times, names, extra=None):
+        rows = orig(s, times, names, extra)
+        for t, r in zip(times, rows):
+            r["t_press_ns"] = t
+        return rows
+    I.per_key_rows = per_key
+    try:
+        rows = I.series_pairs(sess, spec, n)
+        for r in rows:
+            t = r.get("t_press_ns")
+            if t is not None:
+                end = t + int((r["first_ms"] if r["first_ms"] is not None else DUAL_MISS_MS) * MS) + FRAME_SLACK_NS
+                r["qt"] = split_window(t, end, ins.events(t, end + EVENT_LAG_NS))
+        if rows and not ins.check_timing():
+            rows.append({"journey": "nav.dual", "row": 3, "error": NO_TIMING})
+        if rows:
+            rows[0]["pinned"] = getattr(sess, "pinned", None)
+    finally:
+        I.per_key_rows = orig
+        ins.close()
+    return rows
+
+
+# The harness hooks.
+
+def probe_sessions(probe, opts, sess):
+    """The probe's sessions, made from the harness's own sessions of its part."""
+    if probe == "held":
+        sess = [dict(s, series=[{"type": "probe-held"}]) for s in sess if s["view"] in HELD_VIEWS]
+        sess.sort(key=lambda s: HELD_VIEWS.index(s["view"]))
+    elif probe == "ops":
+        sess = [dict(s, series=[{"type": "probe-op", "op": s["op"], "stamps": opts["stamps"]}]) for s in sess if s["op"] in OPS_PROBED]
+    elif probe == "paste":
+        one = next(s for s in sess if s["op"] == "op.copy.many")
+        # no stamps: their IPC calls would queue the ready burst and inflate the GUI away time
+        sess = [dict(one, n=opts["samples"], series=[{"type": "probe-paste", "op": "op.copy.many", "stamps": False}])
+                for _ in range(PASTE_SESSIONS)]
+    else:
+        arms = ("b", "d") + ARMS
+        down_up = [{"type": "probe-dual", "pairs": [(("down",), ("up",))]}]
+        sess = [dict(next(s for s in sess if s.get("load") == "a"), load=a, series=down_up, n=opts["samples"]) for a in arms]
+    return sess
+
+
+def install(probe, opts):
+    """Point flea-field-instant's session table, series table, loads and environment at the probe."""
+    part = PROBES[probe][0]
+    orig_parts, orig_start, orig_right = I.parts, I.load_start, I.load_right
+    orig_env = S.session_env
+    cores = opts["cores"]
+
+    def parts(fx, samples):
+        base = orig_parts(fx, samples)
+        base[part] = probe_sessions(probe, dict(opts, samples=samples), base[part])
+        return base
+
+    def load_right(load, ctx):
+        return os.path.join(ctx["root"], "load", "L") if load in ARMS else orig_right(load, ctx)
+
+    def load_start(sess, load, ctx):
+        if load not in ARMS:
+            return orig_start(sess, load, ctx)
+        flea, burn = cores
+        where = flea if load != "burn-off" else burn
+        sess.arm_error = None  # series_probe_dual raises it as the arm's error row; a raise here would end the whole part
+        try:
+            sess.pinned = pin_tree(sess.proc, cpulist(flea))
+            if load != "pin":
+                sess.load_proc = Burn(cpulist(where))
+                sess.arm_error = burn_failure(sess.load_proc, cpulist(where))
+        except (RuntimeError, OSError) as e:
+            sess.arm_error = str(e)
+        if load == "pin":
+            return (lambda: (0, False)), "Flea pinned to cores %s, no load" % cpulist(flea)
+        note = "Flea pinned to %s, one CPU burner per core on %s" % (cpulist(flea), cpulist(where))
+
+        def probe():
+            burner = getattr(sess, "load_proc", None)
+            return (burner.ticks(), burner.poll() is None) if burner else (0, False)
+        return probe, note
+
+    I.parts, I.load_start, I.load_right = parts, load_start, load_right
+    S.session_env = lambda: dict(orig_env(), QT_LOGGING_RULES=QT_RULES, QSG_RENDER_TIMING="1", QS_NO_FILTER_QT_LOGS="1")
+    I.SERIES.update({"probe-held": series_held, "probe-op": series_probe_op, "probe-paste": series_probe_op,
+                     "probe-dual": series_probe_dual})
+    I.SERIES_ROWS_PER_SAMPLE.update({"probe-held": 1, "probe-op": 1, "probe-paste": 1, "probe-dual": 1})
+
+
+def new_out(parent):
+    """A mktemp -d root of this probe's own, with its marker."""
+    root = tempfile.mkdtemp(prefix="flea-census-probe-", dir=parent)
+    open(os.path.join(root, MARKER), "w").close()
+    return root
+
+
+def clean(path):
+    """Remove an output root by its absolute path when it is one this probe made."""
+    if not os.path.isabs(path) or os.path.realpath(path) != path.rstrip("/") or len(path.split("/")) < 3:
+        print("refusing %r: not an absolute, resolved, deep path" % path, file=sys.stderr)
+        return 2
+    if not os.path.basename(path).startswith("flea-census-probe-") or not os.path.isfile(os.path.join(path, MARKER)):
+        print("refusing %r: not a root with the marker %s" % (path, MARKER), file=sys.stderr)
+        return 2
+    shutil.rmtree(path)
+    return 0
+
+
+def dry(probe, opts, samples):
+    """The sessions a probe would run, from a nominal fixture facts dict; no display, no writes."""
+    fx = {"root": "/nominal/root", "nav": {"nav500": 500, "nav10k": 10000}, "usb": "/nominal/usb", "nas": "/nominal/nas"}
+    install(probe, opts)
+    sessions = I.parts(fx, samples)[PROBES[probe][0]]
+    plan = [{"view": s["view"], "fixture": os.path.basename(s["fixture"]), "load": s.get("load"), "op": s.get("op"), "n": s["n"],
+             "series": [x["type"] for x in s["series"]]} for s in sessions]
+    print(json.dumps({"probe": probe, "part": PROBES[probe][0], "sessions": plan, "flea_cores": cpulist(opts["cores"][0]),
+                      "burn_cores": cpulist(opts["cores"][1]), "qt_rules": QT_RULES}, indent=1))
+    return 0
+
+
+def run(probe, args):
+    sys.setswitchinterval(0.0005)  # the tail thread must not wait out a 5 ms slice behind the sweep's spin
+    root, tree = opt(args, "--root"), opt(args, "--flea")
+    samples = int(opt(args, "--samples", PROBES[probe][1]))
+    if probe == "paste" and samples < 3:
+        raise SystemExit("paste needs 3 pastes a session: one cold, two warm")
+    cpus = sorted(os.sched_getaffinity(0))
+    cores = split_cores(cpus, opt(args, "--flea-cores"), opt(args, "--burn-cores")) if probe == "dual" else ([], [])
+    opts = {"cores": cores, "stamps": "--no-stamps" not in args}
+    if "--dry" in args:
+        return dry(probe, opts, samples)
+    if not root or not tree:
+        raise SystemExit("run needs --root and --flea")
+    work = new_out(opt(args, "--out-parent", tempfile.gettempdir()))
+    print("output root %s" % work, flush=True)
+    out_dir = os.path.join(work, probe)
+    install(probe, opts)
+    rc = I.run_part(PROBES[probe][0], root, tree, out_dir, samples, False, False, None)
+    path = os.path.join(out_dir, "census-%s.jsonl" % PROBES[probe][0])
+    if os.path.exists(path):
+        with open(path, "a") as f:
+            f.write(json.dumps({"probe_facts": facts(os.path.realpath(root))}) + "\n")
+    print("done %s rc=%d, clean it with: %s clean %s" % (path, rc, os.path.abspath(__file__), work))
+    return rc
+
+
+# Summary.
+
+def rows_of(paths):
+    out = []
+    for p in paths:
+        with open(p) as f:
+            out += [json.loads(line) for line in f if line.strip()]
+    return out
+
+
+def summarise(rows):
+    """Text lines: the ranges, each with its n."""
+    out = []
+    held = {}
+    for r in rows:
+        if r.get("error"):
+            out.append("ERROR %s %s: %s" % (r.get("journey"), r.get("view"), r["error"]))
+        h = r.get("held")
+        if h and r.get("slots"):
+            g = held.setdefault(r["view"], {"missed": [], "split": {}, "drawn": [], "miss": []})
+            slots = r["slots"]
+            g["missed"].append(sum(1 for s in slots if not s[1]))
+            for s in slots:
+                (g["drawn"] if s[1] else g["miss"]).append(s)
+                if not s[1]:
+                    g["split"][s[7]] = g["split"].get(s[7], 0) + 1
+    for view, g in held.items():
+        out.append("held %s: slots missed per sweep %s; missed-slot verdicts %s" % (view, rng(g["missed"], 0), json.dumps(g["split"], sort_keys=True)))
+        for name, col in (("gui_ms", 2), ("sync_ms", 3), ("render_ms", 4), ("gui_gap_ms", 6)):
+            out.append("  %s drawn slots %s | missed slots %s" % (name, rng([s[col] for s in g["drawn"]]), rng([s[col] for s in g["miss"]])))
+    ops = {}
+    for r in rows:
+        if r.get("row") == 6 and "t_press_ns" in r:
+            g = ops.setdefault((r["journey"], bool(r.get("cold")), "paste" if "burst" in r else "ops"), [])
+            g.append(r)
+    for (name, cold, kind), g in sorted(ops.items()):
+        firsts = [r["first_ms"] for r in g if r.get("first_ms") is not None]
+        line = "%s%s: first_ms %s, misses %d of %d" % (name, " cold" if cold else " warm" if kind == "paste" else "", rng(firsts), sum(1 for r in g if r.get("miss")), len(g))
+        if kind == "paste":
+            blocks = [max(b[1] for b in r["burst"]) - statistics.median(r["idle_rtt_ms"]) for r in g if r.get("burst") and r.get("idle_rtt_ms")]
+            line += "; GUI away (max ipc round trip over idle median) %s" % rng(blocks)
+        out.append(line)
+        for r in g:
+            if r.get("miss"):
+                out.append("  miss sample %s: changed frames in cap %s, frames %s, stamps %s" % (
+                    r.get("sample"), r.get("changed_in_cap"), r.get("frames")[:6], [(s["at_ms"], s["errors"], s["notice"], s["activities"]) for s in r.get("stamps", [])]))
+    dual = {}
+    for r in rows:
+        # series_pairs rows come from per_key_rows, row 1; the census row 3 is the journey's, not the row's tag
+        if r.get("row") == 1 and r.get("load") and "nav.dual" in r.get("journey", ""):
+            dual.setdefault((r["load"], r["journey"]), []).append(r)
+    for (load, name), g in sorted(dual.items()):
+        firsts = [r["first_ms"] for r in g if r.get("first_ms") is not None]
+        out.append("%s %s: first_ms %s, misses %d, load active %d of %d, gui %s render %s" % (
+            name, load, rng(firsts), sum(1 for r in g if r.get("first_ms") is None), sum(1 for r in g if r.get("load_active")), len(g),
+            rng([r["qt"]["gui_ms"] for r in g if "qt" in r]), rng([r["qt"]["render_ms"] for r in g if "qt" in r])))
+    for r in rows:
+        if "probe_facts" in r:
+            out.append("facts " + json.dumps(r["probe_facts"], sort_keys=True))
+    return out
+
+
+def opt(args, name, default=None):
+    if name in args:
+        i = args.index(name)
+        return args[i + 1] if i + 1 < len(args) else default
+    return default
+
+
+# Selftest.
+
+SAMPLE_QT = [
+    "DEBUG qt.scenegraph.time.renderloop: [window 0x55d0a1][gui thread] polishAndSync: start, elapsed since last call: 8 ms",
+    "DEBUG qt.scenegraph.time.renderloop: [window 0x55d0a1][gui thread] Frame prepared, polish=1 ms, lock=0 ms, blockedForSync=3 ms, animations=0 ms",
+    "DEBUG qt.scenegraph.time.renderloop: [window 0x55d0a1][render thread 0x7f1c] syncAndRender: start, elapsed since last call: 8 ms",
+    "DEBUG qt.scenegraph.time.renderloop: [window 0x55d0a1][render thread 0x7f1c] syncAndRender: frame rendered in 9ms, sync=2, render=5, swap=1",
+    "DEBUG qt.scenegraph.time.renderloop: [window 0x55d0a1][render thread 0x7f1c] syncAndRender: last retrieved GPU frame time was 4.2500 ms",
+    "[window 0x55d0a1][gui thread] syncAndRender: frame rendered in 12ms, polish=2, sync=3, render=6, swap=1, perWindowFrameDelta=9",
+    "DEBUG qt.scenegraph.time.texture: atlastexture upload enqueued in: 3ms (512x512)",
+    "DEBUG qt.scenegraph.time.glyph: distancefield: 12 glyphs prepared in 4ms, rendering=2, upload=1",
+    "INFO scenegraph: something else entirely",
+]
+
+
+def selftest():
+    bad = []
+
+    def check(name, got, want):
+        if got != want:
+            bad.append("%s: got %r, want %r" % (name, got, want))
+    evs = [parse_qt_line(x) for x in SAMPLE_QT]
+    check("kinds", [e and e["kind"] for e in evs], ["gui_start", "gui", "rt_start", "render", "gpu", "basic", "atlas", "glyph", None])
+    check("render", (evs[3]["total"], evs[3]["sync"], evs[3]["render"], evs[3]["swap"]), (9, 2, 5, 1))
+    check("gpu", evs[4]["ms"], 4.25)
+    check("work gui", work_of(evs[1]), (1, 3, 0, 4))
+    check("work render", work_of(evs[3]), (0, 2, 6, 9))
+    # A slot of 25 ms with a render frame of 9 ms ending inside it, a GUI frame of 4 ms, and a drawn neighbour.
+    base = 10**12
+    ev_r = dict(evs[3], t=base + 20 * MS)
+    ev_g = dict(evs[1], t=base + 8 * MS)
+    ev_gap = dict(evs[0], t=base + 5 * MS)
+    w = split_window(base, base + 25 * MS, [ev_r, ev_g, ev_gap])
+    check("split", (w["gui_ms"], w["sync_ms"], w["render_ms"], w["frames"], w["gap_ms"]), (1.0, 5.0, 6.0, 2, 8))
+    check("verdict render", verdict(w), "render")
+    check("verdict none", verdict(split_window(base, base + 25 * MS, [])), "no-frame")
+    check("verdict light", verdict({"frames": 1, "gui_ms": 0.4, "sync_ms": 1.0, "render_ms": 1.9}), "light")
+    check("verdict gui", verdict({"frames": 1, "gui_ms": 9.0, "sync_ms": 1.0, "render_ms": 3.0}), "gui")
+    half = split_window(base + 16 * MS, base + 25 * MS, [ev_r])  # the frame's second half: 4 of 9 ms inside
+    check("prorate", half["render_ms"], 2.7)
+    slots = held_slots([base, base + 25 * MS], [ev_r], base, 3, 25 * MS)
+    check("slot_of", [slot_of(base + x * MS, base, 25 * MS, 3) for x in (-20, -10, 0, 12, 13, 74, 90)], [None, 0, 0, 0, 1, None, None])
+    check("frame_rows", [r[:3] for r in frame_rows([ev_r, ev_gap], base, 25 * MS, 3)], [[1, "render", 20.0], [0, "gui_start", 5.0]])
+    check("slots", [(s[0], s[1], s[7]) for s in slots], [(0, True, ""), (1, True, ""), (2, False, "no-frame")])
+    check("rng", rng([3, 1, 2, None]), "1.0-3.0 p50 2.0 p95 3.0 (n=3)")
+    check("rng empty", rng([]), "n=0")
+    check("cpulist", cpulist([0, 1, 2, 5, 7, 8]), "0-2,5,7-8")
+    check("parse cpulist", parse_cpulist("0-2,5"), [0, 1, 2, 5])
+    check("cores", split_cores(range(12)), ([0, 1, 2, 3, 4, 5], [6, 7, 8, 9, 10]))
+    check("cores explicit", split_cores(range(2), "0", "1"), ([0], [1]))
+    try:
+        split_cores(range(12), "0-6", "5-8")
+        bad.append("overlapping cores accepted")
+    except RuntimeError:
+        pass
+    check("ticks", stat_ticks("42 (sh -c) S 1 42 42 0 -1 4194304 100 0 0 0 7 5 0 0 20 0 1 0 1 1 1"), 12)
+    devs = {"/h": 1, "/h/sbx": 2, "/h/sbx/ops": 2, "/": 1}
+    devof = lambda p: devs[p if p in devs else os.path.dirname(p)]
+    check("glib other device", glib_trash_dir("/h/sbx/ops/t", "/h", "/h/.local/share", 1000, devof, lambda p: False), "/h/sbx/.Trash-1000")
+    check("glib global", glib_trash_dir("/h/sbx/ops/t", "/h", "/h/.local/share", 1000, devof, lambda p: p == "/h/sbx/.Trash"), "/h/sbx/.Trash/1000")
+    check("glib home device", glib_trash_dir("/h/x", "/h", "/h/.local/share", 1000, devof, lambda p: False), "/h/.local/share/Trash")
+    check("glib root top", glib_trash_dir("/etc/x", "/h/sbx", "/h/.local/share", 1000, lambda p: 1 if p in ("/", "/etc") else 2, lambda p: False), "/.Trash-1000")
+    check("renames", (flea_renames(2, 2, 2), flea_renames(2, 2, 1), flea_renames(3, 2, 2)), (True, False, False))
+    with tempfile.TemporaryDirectory() as td:
+        log = os.path.join(td, "s.log")
+        with open(log, "w") as f:
+            f.write("old line\n")
+        t = Tail(log)
+        with open(log, "a") as f:
+            f.write(SAMPLE_QT[3] + "\npartial")
+            f.flush()
+            time.sleep(0.05)
+            f.write(" line\n" + SAMPLE_QT[1] + "\n")
+        time.sleep(0.05)
+        t.close()
+        check("tail", [e["kind"] for e in t.events], ["render", "gui"])
+        check("tail stamps ordered", t.events[0]["t"] <= t.events[1]["t"], True)
+        check("clean refuses unmarked", clean(td), 2)
+        check("clean refuses relative", clean("x"), 2)
+        root = new_out(td)
+        check("clean marked", (clean(root), os.path.exists(root)), (0, False))
+    nominal = [{"op": "op.copy.many", "view": "list", "fixture": "/f"}]
+    pasted = probe_sessions("paste", {"samples": 3, "stamps": True}, nominal)
+    check("paste no stamps", ([x["series"][0]["stamps"] for x in pasted], [x["n"] for x in pasted]), ([False] * PASTE_SESSIONS, [3] * PASTE_SESSIONS))
+    check("ops stamps follow the flag", probe_sessions("ops", {"samples": 3, "stamps": True}, [dict(nominal[0], op="op.trash")])[0]["series"][0]["stamps"], True)
+    check("pin ok", pin_failure(7, 0, "0-2", "0-2"), None)
+    check("pin rc", "exited 1" in (pin_failure(7, 1, "0-2", "0-2") or ""), True)
+    check("pin readback", "Cpus_allowed_list" in (pin_failure(7, 0, "0-5", "0-2") or ""), True)
+    check("pin empty readback", pin_failure(7, 0, "", "0-2") is not None, True)
+    if shutil.which("taskset"):
+        first = cpulist(sorted(os.sched_getaffinity(0))[:1])
+        for cores, want in (("999", "exited"), (first, None)):
+            burner = Burn(cores)
+            why = burn_failure(burner, cores)
+            burner.kill()
+            burner.wait()
+            check("burner %s" % cores, why if why is None else ("exited" if "exited" in why else why), want)
+    idle = types.SimpleNamespace(poll=lambda: None, ticks=lambda: 0)
+    check("burner idle", "no CPU ticks" in (burn_failure(idle, "1") or ""), True)
+    try:
+        series_probe_dual(types.SimpleNamespace(arm_error="pin to cores 0-2 failed"), {}, 1)
+        bad.append("a failed arm ran its series")
+    except RuntimeError:
+        pass
+    dual_row = {"journey": "nav.dual.down", "row": 1, "load": "pin", "first_ms": 5.0, "load_active": False, "qt": {"gui_ms": 1.0, "render_ms": 2.0}}
+    check("summary dual", [x.split(":")[0] for x in summarise([dual_row]) if x.startswith("nav.dual")], ["nav.dual.down pin"])
+    with contextlib.redirect_stdout(io.StringIO()):
+        check("dry", dry("dual", {"cores": ([0], [1]), "stamps": True}, 3), 0)
+    print("\n".join(bad) if bad else "flea-census-probe selftest: ok")
+    return 1 if bad else 0
+
+
+def main(argv):
+    if not argv:
+        print(__doc__)
+        return 2
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "run" and rest and rest[0] in PROBES:
+        return run(rest[0], rest)
+    if cmd == "summary":
+        print("\n".join(summarise(rows_of(rest))))
+        return 0
+    if cmd == "parse":
+        for ev in read_stamped(rest[0]):
+            print(json.dumps(ev, sort_keys=True))
+        return 0
+    if cmd == "clean":
+        return clean(rest[0])
+    if cmd == "selftest":
+        return selftest()
+    print("unknown command %r, want run held|ops|paste|dual, summary, parse, clean or selftest" % cmd, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

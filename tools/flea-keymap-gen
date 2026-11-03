@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""Generate Qt bindings from the same TOML table embedded by the TUI."""
+import json
+import sys
+import tomllib
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+PRESETS = ('default', 'vim', 'mac', 'windows')
+MODS = {'none': (), 'text': (), 'ctrl': ('Control',), 'shift': ('Shift',),
+        'ctrlshift': ('Control', 'Shift'), 'alt': ('Alt',), 'super': ('Meta',),
+        'supershift': ('Meta', 'Shift'), 'superalt': ('Meta', 'Alt')}
+CONTEXTS = ('listing', 'rail', 'menu', 'panel', 'preview', 'pdf', 'media', 'editor', 'all')
+FRONTENDS = ('all', 'gui', 'tui')
+
+
+def fail(message):
+    raise ValueError(message)
+
+
+def scope_overlap(a, b):
+    return bool(set(a.split(',')) & set(b.split(','))) or a == 'all' or b == 'all'
+
+
+def caps(mods, key):
+    if mods == 'text':
+        return key
+    prefix = {'none': '', 'text': '', 'ctrlshift': 'ctrl-shift-',
+              'supershift': 'super-shift-', 'superalt': 'super-alt-'}.get(mods, mods + '-')
+    name = {'Return': 'enter', 'BracketLeft': '[', 'BracketRight': ']', 'Period': '.'}.get(key, key.lower())
+    return prefix + name
+
+
+# ui/js/Keymap.js folds an armed chord onto the action it completes, and the sheet groups the pair
+# as one row, so the group table names the action rather than the arm.
+ARMS = {'copyArm': 'copy', 'cutArm': 'cut', 'pasteArm': 'paste', 'cursorFirstArm': 'cursorFirst',
+        'trashArm': 'trash'}
+
+
+# KeymapSheet.html rule 1: every action the listing binds gets a group, and one only. A missing row
+# would draw a heading nobody wrote; a duplicated one would draw the same key under two.
+# Every action a sheet group claims, which is also what the sheet's own extra table is built from.
+def claimed(data):
+    return {action for actions in data['sheetgroups'].values() for action in actions}
+
+
+def check_groups(data, rows):
+    seen = {}
+    for group, actions in data['sheetgroups'].items():
+        for action in actions:
+            if action in seen:
+                fail(f'{action} is in both the {seen[action]} and {group} sheet groups')
+            seen[action] = group
+    bound = set()
+    # A preview key is listed only when a group names it on purpose, which is how MediaMute's m
+    # reaches the sheet; the listing's own bindings all still have to be claimed.
+    elsewhere = set()
+    for row in rows:
+        if not row['action']:
+            continue
+        contexts = row['context'].split(',')
+        if 'listing' in contexts:
+            bound.add(ARMS.get(row['action'], row['action']))
+        else:
+            elsewhere.add(ARMS.get(row['action'], row['action']))
+    for action in sorted(bound - set(seen)):
+        fail(f'the sheet draws {action} and no group in keys.toml claims it')
+    for action in sorted(set(seen) - bound - elsewhere):
+        fail(f'the {seen[action]} sheet group names {action}, which nothing binds at all')
+
+
+def generate(data):
+    for required in ('preset', 'sheet', 'pointer', 'digits', 'sheetgroups'):
+        if not data.get(required):
+            fail(f'the {required} table is missing or empty')
+    bindings = []
+    for row in data['preset']:
+        row = dict(row)
+        row.setdefault('context', 'listing')
+        row.setdefault('frontend', 'all')
+        if row.get('name') not in PRESETS + ('all',) or row.get('mods') not in MODS:
+            fail(f'invalid preset or modifiers: {row}')
+        if any(c not in CONTEXTS for c in row['context'].split(',')) or row['frontend'] not in FRONTENDS:
+            fail(f'invalid binding context or frontend: {row}')
+        if not isinstance(row.get('key'), str) or not row['key'] or 'action' not in row:
+            fail(f'incomplete preset binding: {row}')
+        for previous in bindings:
+            same = all(row[k] == previous[k] for k in ('name', 'mods', 'key'))
+            if same and scope_overlap(row['context'], previous['context']) and scope_overlap(row['frontend'], previous['frontend']):
+                fail(f"the {row['name']} preset claims {row['keys']} twice, for {previous['action']} and {row['action']} in {row['context']} ({row['frontend']})")
+        bindings.append(row)
+    shared = []
+    for kind, field, mods in [('ctrlshift', 'key', 'ctrlshift'), ('ctrl', 'key', 'ctrl'),
+                              ('shift', 'key', 'shift'), ('code', 'key', 'none'), ('text', 'char', 'text')]:
+        seen = {}
+        for row in data.get(kind, []):
+            key = row[field]
+            if key in seen:
+                fail(f'shared listing key {caps(mods, key)} claims {seen[key]} and {row["action"]}')
+            seen[key] = row['action']
+            shared.append(dict(name='all', mods=mods, key=key, keys=row.get('keys', caps(mods, key)),
+                               action=row['action'], context='listing', frontend='all',
+                               **({} if row.get('sheet', True) else {'sheet': False})))
+    lines = ['.pragma library', '', '// Generated from keys.toml by tools/flea-keymap-gen. Do not edit.']
+    def emit(name, value):
+        lines.append('var ' + name + ' = ' + json.dumps(value, ensure_ascii=True, separators=(',', ':')))
+    emit('PRESETS', PRESETS)
+    emit('preset', 'default')
+    def table(name, rows):
+        lines.append('var ' + name + ' = [')
+        for row in rows:
+            obj = dict(row)
+            obj['preset'] = obj.pop('name')
+            obj['code'] = 'Key_' + obj['key'] if obj['mods'] != 'text' else ''
+            obj['text'] = obj['key'] if obj['mods'] == 'text' else ''
+            for flag, token in [('ctrl', 'Control'), ('shift', 'Shift'), ('alt', 'Alt'), ('super', 'Meta')]:
+                obj[flag] = token in MODS[obj['mods']]
+            encoded = json.dumps(obj, ensure_ascii=True, separators=(',', ':'))
+            keycode = '0' if not obj['code'] else 'Qt.' + obj['code']
+            mask = ' | '.join('Qt.' + token + 'Modifier' for token in MODS[obj['mods']]) or '0'
+            lines.append('    ' + encoded[:-1] + ',"keycode":' + keycode + ',"mask":(' + mask + ')},')
+        lines.append(']')
+    table('PRESET_KEYS', bindings)
+    table('SHARED_KEYS', shared)
+    emit('POINTER', data['pointer'])
+    emit('BASE_SHEET', data['sheet'])
+    emit('SHEET_GROUPS', data['sheetgroups'])
+    # A sheet group may name a binding the listing never sees, the way MediaMute's m is the media
+    # context's alone; the sheet takes those from here rather than filtering the tables again. A row
+    # whose action the listing binds anywhere is already in the sheet and must not arrive twice.
+    listing_actions = {ARMS.get(row['action'], row['action']) for row in bindings + shared
+                       if row['action'] and 'listing' in row['context'].split(',')}
+    emit('SHEET_EXTRA', [dict(preset=row['name'], mods=row['mods'], keys=row['keys'],
+                              action=row['action'], label=row['label'], context=row['context'])
+                         for row in bindings + shared
+                         if row['action'] in claimed(data)
+                         and ARMS.get(row['action'], row['action']) not in listing_actions
+                         and 'listing' not in row['context'].split(',')])
+    emit('DIGITS', data['digits'])
+    check_groups(data, bindings + shared)
+    lines.append(r'''
+function applies(row, context, frontend) {
+    return (row.context.split(",").indexOf(context) >= 0 || row.context === "all")
+           && (row.frontend === frontend || row.frontend === "all")
+}
+function matches(row, key, text, modifiers) {
+    var mask = modifiers & (Qt.ControlModifier | Qt.ShiftModifier | Qt.AltModifier | Qt.MetaModifier)
+    if (row.mods === "text")
+        return (mask & ~Qt.ShiftModifier) === 0 && text === row.text
+    return mask === row.mask && key === row.keycode
+}
+// A matching empty action suppresses fallback, as Mac Ctrl+X requires.
+function presetMatch(name, key, text, modifiers, context, frontend) {
+    for (var pass = 0; pass < 2; pass++) {
+        for (var i = 0; i < PRESET_KEYS.length; i++) {
+            var row = PRESET_KEYS[i]
+            if (row.preset !== (pass === 0 ? name : "all")) continue
+            if (matches(row, key, text, modifiers) && applies(row, context, frontend)) return row
+        }
+    }
+    return null
+}
+function lookupFor(name, key, text, modifiers, context, frontend) {
+    context = context || "listing"
+    frontend = frontend || "gui"
+    var row = presetMatch(name, key, text, modifiers, context, frontend)
+    if (row) return row.action
+    if (context !== "listing" && context !== "rail") return ""
+    for (var i = 0; i < SHARED_KEYS.length; i++) {
+        if (matches(SHARED_KEYS[i], key, text, modifiers)) return SHARED_KEYS[i].action
+    }
+    if ((frontend === "tui" || frontend === "gui") && modifiers === 0 && text >= String(DIGITS.from) && text <= String(DIGITS.to))
+        return DIGITS.prefix + text
+    return ""
+}
+function lookup(key, text, modifiers, context, frontend) {
+    return lookupFor(preset, key, text, modifiers, context, frontend)
+}
+function actionGroup(action) {
+    var arms = { copyArm: "copy", cutArm: "cut", pasteArm: "paste", cursorFirstArm: "cursorFirst", trashArm: "trash" }
+    return arms[action] || action
+}
+function bindingRows(name, frontend, group) {
+    var rows = [], candidates = PRESET_KEYS.concat(SHARED_KEYS)
+    for (var i = 0; i < candidates.length; i++) {
+        var row = candidates[i]
+        if ((row.preset !== "all" && row.preset !== name) || (group !== undefined && actionGroup(row.action) !== group)) continue
+        if (!applies(row, "listing", frontend || "gui") || !row.action) continue
+        if (lookupFor(name, row.keycode, row.text, row.mask, "listing", frontend || "gui") !== row.action) continue
+        var duplicate = rows.some(function (kept) { return kept.keys === row.keys && kept.action === row.action })
+        if (!duplicate) rows.push(row)
+    }
+    return rows
+}
+// One action per first ask, never the whole table: the status strip asks for one key while the first window builds.
+function hintFor(action) {
+    if (!Object.prototype.hasOwnProperty.call(HINTS, action)) HINTS[action] = hintsFor(preset, action)[action] || ""
+    return HINTS[action]
+}
+// How wide a cap may get before a second spelling stops earning its place. The sheet draws two
+// columns of a 300 unit card, so a cap past this elides and the wording beside it has nowhere to go.
+var SHEET_CAP_BUDGET = 16
+
+// Actions that answer each other show a second spelling on both members or on neither (width alone gave "]" beside "[ / ctrl-pageup").
+var SHEET_MIRRORS = [["cursorDown", "cursorUp"], ["cursorFirst", "cursorLast"], ["pageDown", "pageUp"],
+    ["historyBack", "historyForward"], ["tabNext", "tabPrevious"], ["tabMoveLeft", "tabMoveRight"],
+    ["zoomIn", "zoomOut"], ["textSizeUp", "textSizeDown"], ["extendDown", "extendUp"]]
+
+// An action id is not wording. A row the base sheet does not name printed its own identifier, so the
+// pane advertised "pageDown" and "textSizeReset" beside sentences like "hidden files".
+function spelledOut(action) {
+    return String(action).replace(/([a-z0-9])([A-Z])/g, "$1 $2").toLowerCase()
+}
+
+// Which spelling speaks for an action: the preset's own before an inherited one, and a plain key
+// before a chord. setPreset ranks the menu hint the same way, so the sheet and the menus agree.
+function capRank(row, preset) {
+    return (row.preset === preset ? 0 : 2) + (row.mods === "text" ? 0 : 1)
+}
+
+function sheetFor(name, frontend) {
+    var result = [], groups = {}
+    var rows = bindingRows(name, frontend || "gui").concat(SHEET_EXTRA).filter(function (row) { return row.sheet !== false })
+    for (var i = 0; i < rows.length; i++) {
+        var row = rows[i], action = actionGroup(row.action)
+        var group = groups[action]
+        if (!group) {
+            var label = row.label || spelledOut(action)
+            for (var j = 0; j < BASE_SHEET.length; j++)
+                if (actionGroup(BASE_SHEET[j].action) === action) label = BASE_SHEET[j].label
+            group = { action: action, label: label, keys: "", context: row.context || "listing", spellings: [] }
+            result.push(group)
+            groups[action] = group
+        }
+        group.spellings.push(row)
+    }
+    // One cap names one key. Joining every spelling an action answers to built caps of 40 characters
+    // on the default preset and 78 on mac, wider than the whole card, so the pane drew them across
+    // the column beside it. The best spelling always shows, a second only while both still fit.
+    for (var g = 0; g < result.length; g++) {
+        var spellings = result[g].spellings.slice()
+        spellings.sort(function (left, right) { return capRank(left, name) - capRank(right, name) })
+        var keys = spellings.length ? spellings[0].keys : ""
+        result[g].alone = keys
+        for (var k = 1; k < spellings.length; k++) {
+            var both = keys + " / " + spellings[k].keys
+            if (spellings[k].keys === keys || both.length > SHEET_CAP_BUDGET) continue
+            keys = both
+            break
+        }
+        result[g].keys = keys
+    }
+    // A pair shows a second spelling only when both members have one that fits.
+    for (var m = 0; m < SHEET_MIRRORS.length; m++) {
+        var first = groups[SHEET_MIRRORS[m][0]], second = groups[SHEET_MIRRORS[m][1]]
+        if (!first || !second) continue
+        if ((first.keys !== first.alone) === (second.keys !== second.alone)) continue
+        first.keys = first.alone
+        second.keys = second.alone
+    }
+    for (var d = 0; d < result.length; d++) {
+        delete result[d].spellings
+        delete result[d].alone
+    }
+    return result
+}
+function hintsFor(name, group) {
+    var hints = {}, ranks = {}, rows = bindingRows(name, "gui", group)
+    for (var i = 0; i < rows.length; i++) {
+        var row = rows[i]
+        if (row.mods !== "text" && row.mods !== "none" && row.mods !== "shift") continue
+        var action = actionGroup(row.action), rank = (row.preset === name ? 0 : 2) + (row.mods === "text" ? 0 : row.mods === "none" ? 1 : 4)
+        if (ranks[action] !== undefined && ranks[action] <= rank) continue
+        // A menu hint is the key the operator presses: Menus.html and the OpenWith board
+        // both draw Move to Trash with d; a shift chord fills an action no plain key names. The full dd chord stays on the sheet below.
+        hints[action] = row.mods === "text" ? row.key : row.keys
+        ranks[action] = rank
+    }
+    return hints
+}
+function setPreset(name) {
+    preset = PRESETS.indexOf(name) >= 0 ? name : "default"
+    HINTS = {}
+}
+var HINTS = {}
+setPreset("default")
+''')
+    return '\n'.join(lines).rstrip()
+
+
+try:
+    target = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / 'ui/js/Keymap.js'
+    source = Path(sys.argv[2]) if len(sys.argv) > 2 else ROOT / 'keys.toml'
+    target.write_text(generate(tomllib.loads(source.read_text())) + '\n')
+except (OSError, ValueError, KeyError) as error:
+    print(f'flea-keymap-gen: {error}', file=sys.stderr)
+    sys.exit(1)

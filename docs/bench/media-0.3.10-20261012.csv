@@ -1,0 +1,25 @@
+id,run,mapped_ms,settled_ms,pss_kb,cpu_s,child_pss_kb,thumbs_n,pss_anon_kb,uss_kb,drm_kb,thumbs_by_dir,cpu_tree_s,thumbs_by_format,ranked,preview_ms,cpu_reaped_s,cpu_sys_s,dirty_wb_kb,pgpgout_pre_kb,pgpgout_launch_kb,write_clean,rerun
+flea,1,521,1734,95769,0.86,5115,43,58508,77804,279544,fail=0;large=43,4.86,heic=0;jpg=0;mkv=7;mp4=29;png=0;txt=0;webm=7;webp=0;unknown=0,yes,-,1.03,4.86,32,0,700,1,0
+flea-anchor,1,508,1897,99102,0.90,4051,43,61944,81084,281724,fail=0;large=43,6.04,heic=0;jpg=0;mkv=7;mp4=29;png=0;txt=0;webm=7;webp=0;unknown=0,yes,-,1.07,6.04,0,0,696,1,0
+strata,1,599,3661,89649,1.14,0,unmeasurable,52088,79972,122384,fail=0;large=43,7.32,unmeasurable,unranked: its watches saw 0 renders for 86 opened fixture files so neither is a count,-,1.35,7.32,8,0,4076,1,0
+flea,2,530,1771,95407,0.85,5295,43,58064,77456,279544,fail=0;large=43,4.82,heic=0;jpg=0;mkv=7;mp4=29;png=0;txt=0;webm=7;webp=0;unknown=0,yes,-,1.01,4.82,16,0,700,1,0
+flea-anchor,2,502,1884,97628,0.91,4169,43,60704,79640,281596,fail=0;large=43,6.07,heic=0;jpg=0;mkv=7;mp4=29;png=0;txt=0;webm=7;webp=0;unknown=0,yes,-,1.07,6.07,0,0,696,1,0
+strata,2,603,3210,90115,1.15,0,unmeasurable,52552,80416,122384,fail=0;large=43,7.21,unmeasurable,unranked: its watches saw 0 renders for 86 opened fixture files so neither is a count,-,1.35,7.21,32,0,4076,1,0
+flea,3,530,1770,96054,0.84,5133,43,58832,78120,279544,fail=0;large=43,4.78,heic=0;jpg=0;mkv=7;mp4=29;png=0;txt=0;webm=7;webp=0;unknown=0,yes,-,1.01,4.78,32,0,696,1,0
+flea-anchor,3,501,1827,98143,0.90,4127,43,60956,80140,281596,fail=0;large=43,6.03,heic=0;jpg=0;mkv=7;mp4=29;png=0;txt=0;webm=7;webp=0;unknown=0,yes,-,1.06,6.03,0,0,696,1,0
+strata,3,588,3447,89425,1.16,0,unmeasurable,52120,79928,122384,fail=0;large=43,7.37,unmeasurable,unranked: its watches saw 0 renders for 86 opened fixture files so neither is a count,-,1.36,7.37,0,0,4372,1,0
+nautilus,1,909,19290,188303,9.98,0,641,78644,175900,186196,fail=0;large=641,120.50,heic=13;jpg=0;mkv=100;mp4=400;png=14;txt=0;webm=100;webp=14;unknown=0,yes,-,14.35,120.50,32,0,1104,1,0
+thunar,1,513,1002,36019,0.88,0,unmeasurable,18768,23208,0,fail=0;large=0,0.95,unmeasurable,unranked: nothing reached the thumbnail cache so its work was not measured,-,0.88,0.95,32,0,0,1,0
+pcmanfm,1,420,-1,40465,36.70,0,689,17440,27648,0,fail=0;large=0;normal=689,152.79,heic=0;jpg=0;mkv=100;mp4=400;png=89;txt=0;webm=100;webp=0;unknown=0,yes,-,98.19,152.79,0,0,26500,1,0
+nemo,1,863,3345,56044,2.48,0,60,30240,43280,0,fail=0;large=60,9.38,heic=0;jpg=45;mkv=0;mp4=0;png=0;txt=0;webm=0;webp=15;unknown=0,yes,-,5.79,9.38,0,0,276,1,0
+dolphin,1,814,13759,105273,7.86,0,642,50280,88008,0,fail=0;large=642,68.07,heic=0;jpg=210;mkv=72;mp4=288;png=0;txt=0;webm=72;webp=0;unknown=0,yes,-,64.54,68.07,32,0,85376,1,0
+nautilus,2,890,19123,180648,9.84,0,641,76360,168288,188248,fail=0;large=641,121.33,heic=13;jpg=0;mkv=100;mp4=400;png=14;txt=0;webm=100;webp=14;unknown=0,yes,-,14.10,121.33,32,0,920,1,0
+thunar,2,515,998,35984,0.90,0,unmeasurable,18736,23200,0,fail=0;large=0,0.97,unmeasurable,unranked: nothing reached the thumbnail cache so its work was not measured,-,0.90,0.97,32,0,0,1,0
+pcmanfm,2,411,-1,40558,37.06,0,691,17760,27848,0,fail=0;large=0;normal=691,154.41,heic=0;jpg=0;mkv=100;mp4=400;png=91;txt=0;webm=100;webp=0;unknown=0,yes,-,98.78,154.41,32,0,26372,1,0
+nemo,2,862,3401,56332,2.54,0,60,30372,43544,0,fail=0;large=60,9.53,heic=0;jpg=45;mkv=0;mp4=0;png=0;txt=0;webm=0;webp=15;unknown=0,yes,-,5.86,9.53,72,0,272,1,0
+dolphin,2,747,13573,98263,4.90,0,500,20188,74912,0,fail=0;large=500,65.52,heic=0;jpg=50;mkv=75;mp4=300;png=0;txt=0;webm=75;webp=0;unknown=0,yes,-,64.02,65.52,32,0,66712,1,0
+nautilus,3,897,19705,180464,10.05,0,641,76336,168120,188248,fail=0;large=641,120.73,heic=13;jpg=0;mkv=100;mp4=400;png=14;txt=0;webm=100;webp=14;unknown=0,yes,-,14.37,120.73,32,0,1204,1,0
+thunar,3,499,961,36000,0.87,0,unmeasurable,18680,23208,0,fail=0;large=0,0.94,unmeasurable,unranked: nothing reached the thumbnail cache so its work was not measured,-,0.87,0.94,0,0,0,1,0
+pcmanfm,3,422,-1,40973,36.85,0,690,17884,28172,0,fail=0;large=0;normal=690,154.08,heic=0;jpg=0;mkv=100;mp4=400;png=90;txt=0;webm=100;webp=0;unknown=0,yes,-,98.53,154.08,0,0,24132,1,0
+nemo,3,850,3623,55261,2.37,0,60,29448,42500,0,fail=0;large=60,9.13,heic=0;jpg=45;mkv=0;mp4=0;png=0;txt=0;webm=0;webp=15;unknown=0,yes,-,5.58,9.13,84,0,276,1,0
+dolphin,3,747,13824,107024,7.81,0,642,20196,93356,0,fail=0;large=642,68.61,heic=0;jpg=210;mkv=72;mp4=288;png=0;txt=0;webm=72;webp=0;unknown=0,yes,-,65.14,68.61,0,0,86536,1,0

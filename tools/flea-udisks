@@ -1,0 +1,432 @@
+#!/usr/bin/python3
+
+# The privileged half of the image flasher: one process per flash, one descriptor over its socket; FLEA_UDISKS overrides its path as the test seam.
+
+import importlib.machinery
+import importlib.util
+import json
+import os
+import socket
+import subprocess
+import sys
+
+import gi
+
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio, GLib
+
+BUS = "org.freedesktop.UDisks2"
+BLOCK_IFACE = "org.freedesktop.UDisks2.Block"
+DRIVE_IFACE = "org.freedesktop.UDisks2.Drive"
+FILESYSTEM_IFACE = "org.freedesktop.UDisks2.Filesystem"
+ENCRYPTED_IFACE = "org.freedesktop.UDisks2.Encrypted"
+
+# The one-byte answers Flea reads off the socket: ok carries a descriptor, the rest carry none.
+STATUS_OK = b"O"
+STATUS_DENIED = b"D"
+STATUS_BUSY = b"B"
+STATUS_CHANGED = b"C"
+STATUS_ERROR = b"E"
+
+OPEN_ACTION = "org.freedesktop.udisks2.open-device"
+# The OpenDevice flags, from the named os constants so no octal is misread for another flag.
+OPEN_FLAGS = os.O_EXCL | os.O_DIRECT | os.O_CLOEXEC
+# Buses a removable drive hangs off; the same set eligibility reads out of the sysfs device path.
+REMOVABLE_BUSES = ("usb", "sdio", "ieee1394")
+# The bench seam's file, beside the helper in the source tree; packaging never installs it.
+SEAM_FILE = "flea-udisks-seam"
+
+
+def load_seam():
+    # Looked up beside the helper's real path, so an installed helper in root's /usr/lib/flea has no seam at all.
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), SEAM_FILE)
+    if not os.path.isfile(path):
+        return None
+    loader = importlib.machinery.SourceFileLoader("flea_udisks_seam", path)
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader("flea_udisks_seam", loader))
+    loader.exec_module(module)
+    return module
+
+
+SEAM = load_seam()
+
+
+def say(message):
+    print("flea-udisks: %s" % message, file=sys.stderr, flush=True)
+
+
+def fail_sock(sock, status, message):
+    say(message)
+    try:
+        sock.sendmsg([status], [])
+    except OSError as error:
+        say("could not answer Flea (%s)" % error)
+
+
+def manager():
+    # The daemon's whole tree, one proxy per interface; cached properties are read off each.
+    return Gio.DBusObjectManagerClient.new_for_bus_sync(
+        Gio.BusType.SYSTEM, Gio.DBusObjectManagerClientFlags.NONE,
+        BUS, "/org/freedesktop/UDisks2", None, None, None)
+
+
+def cached(proxy, name):
+    if proxy is None:
+        return None
+    value = proxy.get_cached_property(name)
+    return value.unpack() if value is not None else None
+
+
+# A D-Bus ay as text, bytes or a list of ints and nothing else, the rule tools/flea-portal reads its ay options by.
+def bytestring(value):
+    if isinstance(value, bytes):
+        raw = value
+    elif isinstance(value, list):
+        try:
+            raw = bytes(value)
+        except (TypeError, ValueError):
+            return ""
+    else:
+        return ""
+    return raw.split(b"\0", 1)[0].decode("utf-8", "replace")
+
+
+def encode(value):
+    # Compact separators, the one shape the backend reads from every answer.
+    return json.dumps(value, separators=(",", ":"))
+
+
+# One block device as plain data: the gi proxy stays at the edge, every decision below reads this.
+def block_info(obj):
+    proxy = obj.get_interface(BLOCK_IFACE)
+    if proxy is None:
+        return None
+    crypt = obj.get_interface(ENCRYPTED_IFACE)
+    fs = obj.get_interface(FILESYSTEM_IFACE)
+    return {"Device": bytestring(cached(proxy, "Device")),
+            "Size": cached(proxy, "Size") or 0,
+            "Drive": cached(proxy, "Drive") or "/",
+            "HintSystem": cached(proxy, "HintSystem"),
+            "Encrypted": crypt is not None,
+            "Backing": cached(proxy, "CryptoBackingDevice") or "/",
+            "Cleartext": (cached(crypt, "CleartextDevice") or "/") if crypt is not None else "/",
+            "MountPoints": [bytestring(mount) for mount in cached(fs, "MountPoints") or []] if fs is not None else []}
+
+
+def drive_info(proxy):
+    if proxy is None:
+        return None
+    return {"HintSystem": cached(proxy, "HintSystem"),
+            "Removable": cached(proxy, "Removable"),
+            "MediaRemovable": cached(proxy, "MediaRemovable"),
+            "ConnectionBus": cached(proxy, "ConnectionBus"),
+            "Serial": cached(proxy, "Serial")}
+
+
+def blocks():
+    # Every block device on the daemon, path beside its plain data.
+    out = []
+    for obj in manager().get_objects():
+        info = block_info(obj)
+        if info is not None:
+            out.append((obj.get_object_path(), info))
+    return out
+
+
+def drive_for(drive_path):
+    try:
+        proxy = Gio.DBusProxy.new_for_bus_sync(
+            Gio.BusType.SYSTEM, Gio.DBusProxyFlags.NONE, None,
+            BUS, drive_path, DRIVE_IFACE, None)
+    except GLib.Error:
+        return None
+    return drive_info(proxy)
+
+
+def on_drive(dev, device):
+    # Sample: sda owns /dev/sda and /dev/sda1, nvme0n1 owns /dev/nvme0n1p1, and neither owns /dev/sdaa or /dev/nvme0n10.
+    if not device.startswith("/dev/"):
+        return False
+    name = device[len("/dev/"):]
+    if name == dev:
+        return True
+    tail = name[len(dev):] if name.startswith(dev) else ""
+    if not tail:
+        return False
+    if dev[-1:].isdigit():
+        return tail[0] == "p" and tail[1:].isdigit()
+    return tail.isdigit()
+
+
+def whole_disk(listed, dev):
+    # The one block whose Device is exactly /dev/<dev>, never a partition that happens to be listed first.
+    for path, block in listed:
+        if block["Device"] == "/dev/" + dev:
+            return path, block
+    return None
+
+
+def iface_at(path, iface):
+    try:
+        return Gio.DBusProxy.new_for_bus_sync(
+            Gio.BusType.SYSTEM, Gio.DBusProxyFlags.NONE, None, BUS, path, iface, None)
+    except GLib.Error:
+        return None
+
+
+def treat_as_system(dev, drive, root, sys_root="/sys"):
+    # The daemon calls a loop's drive "/" a system disk; only the bench seam overrules it, for a loop inside the root.
+    return is_system_drive(drive) and not (SEAM is not None and SEAM.loop_allowed(dev, root, sys_root))
+
+
+def split_options(args):
+    # --loop-root <root> may lead the arguments; only the bench build of Flea passes it, and only a helper beside its seam takes it.
+    if len(args) >= 2 and args[0] == "--loop-root":
+        return args[1], args[2:]
+    return "", args
+
+
+def is_system_drive(drive):
+    if drive is None:
+        return True
+    if drive.get("HintSystem", True):
+        return True
+    if drive.get("Removable", False) or drive.get("MediaRemovable", False):
+        return False
+    bus = str(drive.get("ConnectionBus", ""))
+    return bus not in REMOVABLE_BUSES
+
+
+def error_name(error):
+    # The machine half of a D-Bus failure, GDBus.Error:<name>: <prose>; the prose is the daemon's language and is never read.
+    text = str(getattr(error, "message", error))
+    marker = "GDBus.Error:"
+    if marker not in text:
+        return ""
+    return text.split(marker, 1)[1].split(":")[0]
+
+
+def busy_name(name):
+    return "Busy" in name or "Mounted" in name
+
+
+def denied_name(name):
+    return "NotAuthorized" in name or "Dismissed" in name or "AuthFailed" in name
+
+
+def check_open_authorized():
+    # Asked first so a dismissed prompt leaves the drive untouched; the grant it keeps is what OpenDevice finds.
+    try:
+        done = subprocess.run(
+            ["pkcheck", "--action-id", OPEN_ACTION,
+             "--process", str(os.getpid()), "--allow-user-interaction"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as error:
+        say("pkcheck did not run (%s), so the open carries the prompt" % error)
+        return True
+    return done.returncode == 0
+
+
+def needs_unmount(block):
+    return bool(block["MountPoints"])
+
+
+def needs_lock(block):
+    # Only an unlocked volume has a cleartext device to lock; a locked or plain block has none.
+    return block["Encrypted"] and block["Cleartext"] != "/"
+
+
+def drive_blocks(listed, dev):
+    # The drive's own blocks, then each cleartext block an unlocked volume of the drive opened, which carries its filesystem.
+    own = [(path, block) for path, block in listed if on_drive(dev, block["Device"])]
+    paths = {path for path, _ in own}
+    return own + [(path, block) for path, block in listed if block.get("Backing", "/") in paths]
+
+
+def call_each(listed, dev, picks, iface, method, what):
+    # One no-argument call on every block of the drive that picks says yes to; busy and error are its words.
+    for path, block in drive_blocks(listed, dev):
+        if not picks(block):
+            continue
+        proxy = iface_at(path, iface)
+        if proxy is None:
+            continue
+        try:
+            proxy.call_sync(method, GLib.Variant("(a{sv})", ({},)),
+                            Gio.DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, -1, None)
+        except GLib.Error as error:
+            name = error_name(error)
+            # A volume that went unmounted since the list was read, during the password prompt, is the goal met and not a busy drive.
+            if name.endswith(".Error.NotMounted"):
+                continue
+            say("%s refused with %s" % (what, name or "an unnamed error"))
+            return "busy" if busy_name(name) else "error"
+    return ""
+
+
+def unmount_all(listed, dev):
+    # Every mounted filesystem on the drive and on its unlocked volumes, never forced; a foreign mount keeps its password.
+    return call_each(listed, dev, needs_unmount, FILESYSTEM_IFACE, "Unmount", "Unmount")
+
+
+def lock_all(listed, dev):
+    return call_each(listed, dev, needs_lock, ENCRYPTED_IFACE, "Lock", "Lock")
+
+
+def cmd_drives(devs, root):
+    try:
+        listed = blocks()
+    except GLib.Error:
+        # The daemon is unreachable; the backend keeps every drive on an unreadable answer.
+        print(encode({"drives": []}))
+        return 0
+    kept = []
+    for dev in devs:
+        found = whole_disk(listed, dev)
+        if found is None:
+            continue
+        kept.append({"dev": dev, "system": treat_as_system(dev, drive_for(found[1]["Drive"]), root)})
+    print(encode({"drives": kept}))
+    return 0
+
+
+def cmd_open(dev, serial, size, root):
+    try:
+        sock = socket.fromfd(sys.stdin.fileno(), socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    except OSError as error:
+        say("no socket to answer on (%s)" % error)
+        return 1
+    try:
+        listed = blocks()
+    except GLib.Error:
+        fail_sock(sock, STATUS_ERROR, "udisks answered nothing")
+        return 1
+    found = whole_disk(listed, dev)
+    if found is None:
+        fail_sock(sock, STATUS_CHANGED, "/dev/%s is no longer there" % dev)
+        return 0
+    block_path, block = found
+    drive = drive_for(block["Drive"])
+    if treat_as_system(dev, drive, root):
+        fail_sock(sock, STATUS_CHANGED, "/dev/%s is a system disk" % dev)
+        return 0
+    if serial and str((drive or {}).get("Serial", "")) != serial:
+        fail_sock(sock, STATUS_CHANGED, "/dev/%s changed since it was chosen" % dev)
+        return 0
+    if size and int(block.get("Size", 0)) != size:
+        fail_sock(sock, STATUS_CHANGED, "/dev/%s changed since it was chosen" % dev)
+        return 0
+    if not check_open_authorized():
+        fail_sock(sock, STATUS_DENIED, "the password prompt was closed")
+        return 0
+    refused = unmount_all(listed, dev)
+    if refused == "busy":
+        fail_sock(sock, STATUS_BUSY, "a volume on /dev/%s would not unmount" % dev)
+        return 0
+    if refused:
+        fail_sock(sock, STATUS_ERROR, "a volume on /dev/%s could not be unmounted" % dev)
+        return 0
+    refused = lock_all(listed, dev)
+    if refused == "busy":
+        fail_sock(sock, STATUS_BUSY, "a volume on /dev/%s would not lock" % dev)
+        return 0
+    if refused:
+        fail_sock(sock, STATUS_ERROR, "a volume on /dev/%s could not be locked" % dev)
+        return 0
+    try:
+        proxy = Gio.DBusProxy.new_for_bus_sync(
+            Gio.BusType.SYSTEM, Gio.DBusProxyFlags.NONE, None, BUS, block_path, BLOCK_IFACE, None)
+    except GLib.Error:
+        fail_sock(sock, STATUS_ERROR, "udisks answered nothing")
+        return 1
+    # call_with_unix_fd_list_sync answers (result, out_fd_list); the (h) handle indexes the list.
+    try:
+        result, out_list = proxy.call_with_unix_fd_list_sync(
+            "OpenDevice", GLib.Variant("(sa{sv})", ("rw", {"flags": GLib.Variant("i", OPEN_FLAGS)})),  # udisks reads flags as "i"; any other type leaves flags 0
+            GLib.VariantType("(h)"), Gio.DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, -1, None, None)
+        fd = out_list.get(result.unpack()[0])
+    except GLib.Error as error:
+        name = error_name(error)
+        say("OpenDevice refused with %s" % (name or "an unnamed error"))
+        if denied_name(name):
+            fail_sock(sock, STATUS_DENIED, "the password prompt was closed")
+        else:
+            fail_sock(sock, STATUS_ERROR, "udisks refused to open /dev/%s" % dev)
+        return 0
+    except (TypeError, IndexError) as error:
+        fail_sock(sock, STATUS_ERROR, "udisks opened nothing for /dev/%s (%s)" % (dev, error))
+        return 0
+    try:
+        socket.send_fds(sock, [STATUS_OK], [fd])
+    except OSError as error:
+        fail_sock(sock, STATUS_ERROR, "the descriptor did not cross (%s)" % error)
+        return 1
+    return 0
+
+
+def cmd_eject(dev, root):
+    try:
+        listed = blocks()
+    except GLib.Error:
+        print(encode({"ok": False, "err": "error"}))
+        return 0
+    found = whole_disk(listed, dev)
+    if found is None:
+        print(encode({"ok": False, "err": "gone"}))
+        return 0
+    block = found[1]
+    drive = drive_for(block["Drive"])
+    if treat_as_system(dev, drive, root):
+        print(encode({"ok": False, "err": "error"}))
+        return 0
+    refused = unmount_all(listed, dev) or lock_all(listed, dev)
+    if refused:
+        print(encode({"ok": False, "err": refused}))
+        return 0
+    proxy = iface_at(block["Drive"], DRIVE_IFACE)
+    if proxy is None:
+        print(encode({"ok": False, "err": "error"}))
+        return 0
+    try:
+        proxy.call_sync("PowerOff", GLib.Variant("(a{sv})", ({},)),
+                        Gio.DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, -1, None)
+    except GLib.Error as error:
+        name = error_name(error)
+        say("PowerOff refused with %s" % (name or "an unnamed error"))
+        print(encode({"ok": False, "err": "busy" if busy_name(name) else "error"}))
+        return 0
+    print(encode({"ok": True}))
+    return 0
+
+
+def main(argv):
+    if len(argv) < 2:
+        say("takes drives, open or eject")
+        return 2
+    root, args = split_options(argv[2:])
+    if root and SEAM is None:
+        say("--loop-root needs the bench seam, which this helper does not carry")
+        return 2
+    if argv[1] == "drives":
+        return cmd_drives(args, root)
+    if argv[1] == "open":
+        if len(args) != 3:
+            say("open takes a device, a serial and a size")
+            return 2
+        try:
+            size = int(args[2])
+        except ValueError:
+            say("open takes a device, a serial and a size")
+            return 2
+        return cmd_open(args[0], args[1], size, root)
+    if argv[1] == "eject":
+        if len(args) != 1:
+            say("eject takes a device")
+            return 2
+        return cmd_eject(args[0], root)
+    say("takes drives, open or eject")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

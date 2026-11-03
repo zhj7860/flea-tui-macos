@@ -1,0 +1,46 @@
+id,run,mapped_ms,settled_ms,pss_kb,cpu_s,child_pss_kb,thumbs_n,pss_anon_kb,uss_kb,drm_kb,thumbs_by_dir,cpu_tree_s,thumbs_by_format,ranked,preview_ms,cpu_reaped_s
+flea,1,492,1845,84341,0.99,3340,43,56492,63572,277624,fail=0;large=43,6.56,jpg=0;mp4=35;png=0;txt=0;webm=8;webp=0;unknown=0,yes,-,1.16
+nautilus,1,877,19075,184225,11.62,0,641,81596,176144,194468,fail=0;large=641,117.55,jpg=0;mp4=400;png=71;txt=0;webm=100;webp=70;unknown=0,yes,-,16.10
+thunar,1,572,12780,38803,7.10,59521,221,22728,26376,0,fail=0;large=0;normal=221,20.46,jpg=0;mp4=177;png=0;txt=0;webm=44;webp=0;unknown=0,yes,-,20.25
+pcmanfm,1,426,114870,42612,79.07,0,700,19420,31400,0,fail=0;large=0;normal=700,181.72,jpg=0;mp4=400;png=200;txt=0;webm=100;webp=0;unknown=0,yes,-,133.08
+nemo,1,817,1978,47083,1.46,0,unmeasurable,27836,35660,0,fail=0;large=0,1.64,unmeasurable,unranked: nothing reached the thumbnail cache so its work was not measured,-,1.46
+dolphin,1,676,14423,95316,8.09,0,670,50448,71636,0,fail=0;large=670,69.98,jpg=224;mp4=357;png=0;txt=0;webm=89;webp=0;unknown=0,yes,-,66.59
+strata,1,572,2932,75838,1.01,0,42,42600,69984,122384,fail=0;large=42,7.20,jpg=0;mp4=34;png=0;txt=0;webm=8;webp=0;unknown=0,yes,-,1.22
+yazi,1,294,1557,50842,0.29,0,n/a,34336,50616,0,fail=0;large=0,1.24,n/a,n/a: tui in kitty,133,0.75
+mc,1,297,923,5321,0.03,0,n/a,3376,5032,0,fail=0;large=0,0.87,n/a,n/a: tui in kitty,-1,0.03
+broot,1,299,531,4218,0.01,0,n/a,708,4180,0,fail=0;large=0,0.45,n/a,n/a: tui in kitty,-1,0.01
+nnn,1,297,654,2553,0.03,0,n/a,1964,2440,0,fail=0;large=0,0.63,n/a,n/a: tui in kitty,134,0.03
+lf,1,296,626,16267,0.13,0,n/a,13316,13928,0,fail=0;large=0,0.63,n/a,n/a: tui in kitty,133,0.13
+ranger,1,298,928,28377,0.29,0,n/a,25600,26452,0,fail=0;large=0,0.76,n/a,n/a: tui in kitty,134,0.30
+xplr,1,295,658,13656,0.19,0,n/a,8572,13604,0,fail=0;large=0,0.70,n/a,n/a: tui in kitty,-1,0.19
+superfile,1,298,1250,157468,0.46,0,n/a,142616,157360,0,fail=0;large=0,1.49,n/a,n/a: tui in kitty,-1,0.96
+flea,2,410,1813,85408,0.85,3338,43,57672,64680,277496,fail=0;large=43,6.40,jpg=0;mp4=35;png=0;txt=0;webm=8;webp=0;unknown=0,yes,-,0.98
+nautilus,2,867,18884,184010,11.17,0,641,81448,175888,194468,fail=0;large=641,117.24,jpg=0;mp4=400;png=71;txt=0;webm=100;webp=70;unknown=0,yes,-,15.29
+thunar,2,538,12991,38703,7.32,65200,221,22760,26264,0,fail=0;large=0;normal=221,20.95,jpg=0;mp4=177;png=0;txt=0;webm=44;webp=0;unknown=0,yes,-,20.73
+pcmanfm,2,444,115504,42309,78.37,0,700,19160,31108,0,fail=0;large=0;normal=700,180.86,jpg=0;mp4=400;png=200;txt=0;webm=100;webp=0;unknown=0,yes,-,132.39
+nemo,2,805,2047,47154,1.39,0,unmeasurable,28156,35756,0,fail=0;large=0,1.55,unmeasurable,unranked: nothing reached the thumbnail cache so its work was not measured,-,1.39
+dolphin,2,710,13487,91235,5.13,0,500,40428,63436,0,fail=0;large=500,66.14,jpg=50;mp4=360;png=0;txt=0;webm=90;webp=0;unknown=0,yes,-,64.58
+strata,2,557,2862,75799,1.02,0,42,42584,69760,122384,fail=0;large=42,7.11,jpg=0;mp4=34;png=0;txt=0;webm=8;webp=0;unknown=0,yes,-,1.24
+yazi,2,293,1556,51282,0.29,0,n/a,34688,51068,0,fail=0;large=0,1.25,n/a,n/a: tui in kitty,134,0.74
+mc,2,298,933,5368,0.03,0,n/a,3372,5064,0,fail=0;large=0,0.85,n/a,n/a: tui in kitty,-1,0.03
+broot,2,303,529,4001,0.01,0,n/a,708,3960,0,fail=0;large=0,0.47,n/a,n/a: tui in kitty,-1,0.01
+nnn,2,303,570,2557,0.03,0,n/a,1960,2428,0,fail=0;large=0,0.64,n/a,n/a: tui in kitty,134,0.03
+lf,2,295,681,16183,0.14,0,n/a,13272,13880,0,fail=0;large=0,0.62,n/a,n/a: tui in kitty,135,0.14
+ranger,2,297,939,28351,0.29,0,n/a,25596,26400,0,fail=0;large=0,0.79,n/a,n/a: tui in kitty,135,0.30
+xplr,2,299,656,13671,0.18,0,n/a,8600,13620,0,fail=0;large=0,0.67,n/a,n/a: tui in kitty,-1,0.18
+superfile,2,323,1296,155293,0.42,0,n/a,140612,155180,0,fail=0;large=0,1.44,n/a,n/a: tui in kitty,133,0.88
+flea,3,407,1686,85359,0.83,3397,43,57556,64580,277496,fail=0;large=43,6.37,jpg=0;mp4=35;png=0;txt=0;webm=8;webp=0;unknown=0,yes,-,0.95
+nautilus,3,871,19161,183837,11.59,0,641,81188,175760,194468,fail=0;large=641,118.22,jpg=0;mp4=400;png=71;txt=0;webm=100;webp=70;unknown=0,yes,-,16.07
+thunar,3,529,12905,38763,7.28,61638,221,22708,26396,0,fail=0;large=0;normal=221,20.79,jpg=0;mp4=177;png=0;txt=0;webm=44;webp=0;unknown=0,yes,-,20.58
+pcmanfm,3,442,115063,42701,79.36,0,700,19472,31456,0,fail=0;large=0;normal=700,182.24,jpg=0;mp4=400;png=200;txt=0;webm=100;webp=0;unknown=0,yes,-,133.56
+nemo,3,826,1694,47850,1.43,0,unmeasurable,28620,36436,0,fail=0;large=0,1.60,unmeasurable,unranked: nothing reached the thumbnail cache so its work was not measured,-,1.43
+dolphin,3,679,13492,97778,5.18,0,500,19420,77152,0,fail=0;large=500,66.40,jpg=50;mp4=360;png=0;txt=0;webm=90;webp=0;unknown=0,yes,-,64.85
+strata,3,555,2881,75906,1.00,0,42,42656,69892,122384,fail=0;large=42,7.14,jpg=0;mp4=34;png=0;txt=0;webm=8;webp=0;unknown=0,yes,-,1.22
+yazi,3,282,1544,55943,0.29,0,n/a,39184,55720,0,fail=0;large=0,1.24,n/a,n/a: tui in kitty,136,0.76
+mc,3,298,955,5401,0.04,0,n/a,3372,5112,0,fail=0;large=0,0.85,n/a,n/a: tui in kitty,-1,0.04
+broot,3,299,529,4305,0.01,0,n/a,712,4264,0,fail=0;large=0,0.45,n/a,n/a: tui in kitty,-1,0.01
+nnn,3,306,524,2555,0.02,0,n/a,1964,2436,0,fail=0;large=0,0.58,n/a,n/a: tui in kitty,135,0.02
+lf,3,278,560,16289,0.13,0,n/a,13244,14136,0,fail=0;large=0,0.61,n/a,n/a: tui in kitty,134,0.13
+ranger,3,282,921,28357,0.28,0,n/a,25596,26408,0,fail=0;large=0,0.72,n/a,n/a: tui in kitty,164,0.29
+xplr,3,277,617,13404,0.17,0,n/a,8492,13348,0,fail=0;large=0,0.64,n/a,n/a: tui in kitty,-1,0.17
+superfile,3,322,1252,153217,0.41,0,n/a,138592,153108,0,fail=0;large=0,1.40,n/a,n/a: tui in kitty,135,0.86

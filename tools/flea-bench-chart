@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+"""Writes the benchmark charts in docs/images/ from the release-candidate bench CSVs.
+
+    tools/flea-bench-chart                 rewrites the six files in docs/images/
+    tools/flea-bench-chart /tmp/out        writes somewhere else, for a diff
+
+Two charts, each in two cuts. The wide SVG is for the README, where GitHub renders it in both
+themes, so it paints its own opaque ground and carries no script, no SMIL and no CSS animation for
+the markdown sanitiser to strip. The narrow one is cropped for social and is authored at a 600 px
+logical width, so the artboard's own type sizes land at their native size when it is displayed at
+600 px, then rendered to PNG at 2x.
+
+Every value is read out of `tools/flea-bench-report`, which derives it from the CSV and its
+manifest. Nothing here retypes a CSV cell, because four documentation counts on this branch were
+wrong after being corrected by somebody counting declaration lines.
+
+The design is docs/reference/flea-canvas/Bench.dc.html, one of the 17 artboards, and where that
+board's prose and its artwork disagree the artwork is the specification.
+"""
+
+import os
+import re
+import subprocess
+import sys
+
+# The Bench artboard's palette, read off the canvas. A static chart cannot follow the live Omarchy
+# theme, so these are the chart's colours only; in the app every mark takes a palette role.
+GROUND = "#16161e"
+PANEL = "#1f2335"
+BORDER = "#262b40"
+TEXT = "#c0caf5"
+MUTED = "#565f89"
+ACCENT = "#9ece6a"
+RIVAL = "#7982a9"
+RED = "#f7768e"
+FONT = "JetBrains Mono,JetBrainsMono Nerd Font,ui-monospace,SFMono-Regular,Menlo,Consolas,monospace"
+
+# JetBrains Mono's advance width as a fraction of the font size, used to fit text to a box.
+ADV = 0.6
+
+# Ordinals and counts as flea-bench-report spells them, so a card subtitle can quote its ranking.
+ORD = {"first": "1st", "second": "2nd", "third": "3rd", "fourth": "4th",
+       "fifth": "5th", "sixth": "6th", "seventh": "7th"}
+CNT = {"four": "4", "five": "5", "six": "6", "seven": "7"}
+
+# Sample input, one placement line as flea-bench-report writes it:
+# - **Memory, PSS:** 106.7 MiB, first of seven, ahead of `pcmanfm` at 111.3 MiB, 1.04x
+PLACE = re.compile(r"^([\d.,]+ ?\S+?),? (\w+) of (\w+), (?:ahead of|behind) `(\w+)` at ([\d.,]+ [A-Za-z]+)")
+
+
+def esc(s):
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def report(csv):
+    out = subprocess.run(["tools/flea-bench-report", csv], capture_output=True, text=True)
+    if out.returncode != 0 or "## GUI group" not in out.stdout:
+        sys.exit("flea-bench-chart: flea-bench-report gave nothing usable for %s" % csv)
+    return out.stdout
+
+
+def num(s):
+    return float(s.replace(",", "").split()[0])
+
+
+def parse_gui(md):
+    """Pull the ranked GUI table and the unranked table out of a bench report."""
+    # Sample input: | `flea` | 1bd18d9 | 752 ms | 1,166 ms | not measured | 106.7 MiB | 0.96 s | 3 |
+    rows, unranked, section = [], [], None
+    cols, table = None, None
+    for line in md.splitlines():
+        if line.startswith("## GUI group"):
+            section = "gui"
+            continue
+        if section == "gui" and line.startswith("## "):
+            break
+        if section != "gui" or not line.startswith("|"):
+            continue
+        c = [x.strip().strip("`") for x in line.strip("|").split("|")]
+        if c and all(x != "" and set(x) == {"-"} for x in c):
+            continue
+        low = [x.lower() for x in c]
+        if "entrant" in low:
+            idx = {h: i for i, h in enumerate(low)}
+            if "why it is not ranked" in idx:
+                table, cols = "unranked", idx
+                for need in ("entrant", "settled listing", "work done", "why it is not ranked"):
+                    if need not in idx:
+                        sys.exit("flea-bench-chart: the GUI unranked table has no '%s' column" % need)
+            else:
+                table, cols = "ranked", idx
+                for need in ("entrant", "first window", "settled listing", "work done", "memory, PSS", "CPU, process tree", "runs"):
+                    if need.lower() not in idx:
+                        sys.exit("flea-bench-chart: the GUI ranked table has no '%s' column" % need)
+            continue
+        if cols is None or table is None:
+            continue
+        if len(c) < len(cols):
+            continue
+        # Sample input: | `strata` | v0.19.0 | never settled | not measured | no thumbnail count in this run |
+        if table == "ranked":
+            rows.append(dict(name=c[cols["entrant"]], first=c[cols["first window"]], settled=c[cols["settled listing"]], work=c[cols["work done"]], mem=c[cols["memory, pss"]], cpu=c[cols["cpu, process tree"]], runs=c[cols["runs"]]))
+        else:
+            unranked.append(dict(name=c[cols["entrant"]], settled=c[cols["settled listing"]], work=c[cols["work done"]], why=c[cols["why it is not ranked"]]))
+    if not rows:
+        sys.exit("flea-bench-chart: the GUI group parsed to no rows, which is never right")
+    return rows, unranked
+
+
+def placement(md, key):
+    """The report's own ranking for one column, as a card subtitle needs it."""
+    for line in md.splitlines():
+        if line.startswith("- **" + key):
+            m = PLACE.match(line.split("**", 2)[2].strip().lstrip(":").strip())
+            if not m:
+                sys.exit("flea-bench-chart: could not read the result line for %s" % key)
+            val, ordw, cntw, rival, rvalue = m.groups()
+            return dict(value=val, ord=ORD[ordw], count=CNT[cntw], rival=rival, rvalue=rvalue)
+    sys.exit("flea-bench-chart: no result line for %s" % key)
+
+
+def grab(md, pattern):
+    m = re.search(pattern, md)
+    if not m:
+        sys.exit("flea-bench-chart: the report has no %s" % pattern)
+    return m.groups()
+
+
+def cols(px, size):
+    return int(px / (size * ADV))
+
+
+def wrap(s, px, size):
+    n = cols(px, size)
+    out, line = [], ""
+    for word in s.split():
+        if line and len(line) + 1 + len(word) > n:
+            out.append(line)
+            line = word
+        else:
+            line = (line + " " + word).strip()
+    if line:
+        out.append(line)
+    return out
+
+
+def pick(options, px, size):
+    """First variant that fits the box; the last is the fallback, so a crop never clips."""
+    for o in options:
+        if len(o) * size * ADV <= px:
+            return o
+    return options[-1]
+
+
+class Svg:
+    def __init__(self, w):
+        self.w = w
+        self.parts = []
+
+    def text(self, x, y, s, size, fill, anchor="start", weight="400", ls=None):
+        a = ' text-anchor="%s"' % anchor if anchor != "start" else ""
+        l = ' letter-spacing="%s"' % ls if ls else ""
+        wt = ' font-weight="%s"' % weight if weight != "400" else ""
+        self.parts.append(
+            '<text x="%s" y="%s" font-size="%s" fill="%s"%s%s%s'
+            ' font-variant-numeric="tabular-nums">%s</text>'
+            % (x, y, size, fill, a, wt, l, esc(s)))
+
+    def rect(self, x, y, w, h, fill, stroke=None):
+        s = ' stroke="%s" stroke-width="1"' % stroke if stroke else ""
+        # Square ends: the cut language says rows and bars never round, and it wins on its own board.
+        self.parts.append('<rect x="%s" y="%s" width="%s" height="%s" fill="%s"%s/>'
+                          % (x, y, w, h, fill, s))
+
+    def out(self, h):
+        return ('<svg xmlns="http://www.w3.org/2000/svg" width="%s" height="%s" '
+                'viewBox="0 0 %s %s" font-family="%s">'
+                '<defs><pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" '
+                'patternTransform="rotate(45)">'
+                '<rect width="3" height="6" fill="%s"/></pattern></defs>'
+                '<rect width="%s" height="%s" fill="%s"/>'
+                % (self.w, h, self.w, h, FONT, RIVAL, self.w, h, GROUND)
+                + "".join(self.parts) + "</svg>")
+
+
+def chart(spec):
+    """One benchmark card: eyebrow, provenance, stat cards, bar panel, footer."""
+    W = spec["width"]
+    pad = spec["pad"]
+    s = Svg(W)
+    CW = W - 2 * pad                # content width
+    PL = pad + 1 + 18               # panel content left edge
+    PCW = CW - 2 - 36               # panel content width
+    lab = spec["lab"]
+    workw = spec["workw"]
+    gap = 12
+    track = PCW - lab - gap - gap - workw
+    valw = int(spec["valch"] * 11 * ADV) + 2
+    barmax = track - 8 - valw
+
+    y = pad
+    s.text(pad, y + 11, spec["eyebrow"].upper(), 11, MUTED, weight="500", ls=1.54)
+    y += 16
+    for line in wrap(spec["prov"], CW, 11):
+        y += 16
+        s.text(pad, y, line, 11, MUTED)
+    y += 20
+
+    # Stat cards: big number, label, sub, exactly the artboard's three-line cell.
+    n = len(spec["cards"])
+    cg = 12
+    cw = (CW - cg * (n - 1)) / n
+    inner = cw - 28
+    ch = 84
+    for i, (big, label, subs) in enumerate(spec["cards"]):
+        cx = pad + i * (cw + cg)
+        s.rect(cx + 0.5, y + 0.5, cw - 1, ch - 1, PANEL, BORDER)
+        s.text(cx + 14, y + 34, big, 24, TEXT)
+        s.text(cx + 14, y + 55, pick(label, inner, 12), 12, TEXT)
+        s.text(cx + 14, y + 73, pick(subs, inner, 11), 11, MUTED)
+    y += ch + 20
+
+    ptop = y
+    rows = spec["rows"]
+    unranked = spec["unranked"]
+    note = wrap(pick(spec["unrankednote"], PCW, 11), PCW, 11) if unranked else []
+    ph = 32 + 22 + 26 * len(rows)
+    if unranked:
+        ph += 19 + 16 * len(note) + 2 + 26 * len(unranked)
+    s.rect(pad + 0.5, ptop + 0.5, CW - 1, ph - 1, PANEL, BORDER)
+
+    hy = ptop + 17
+    s.text(PL + lab + gap, hy + 11, spec["timehdr"], 11, MUTED)
+    s.text(PL + lab + gap + track + gap, hy + 11, spec["workhdr"], 11, MUTED)
+    ry = hy + 22
+
+    def row(name, ms, valtext, worktext, hero, dashed=False, workred=False):
+        base = ry + 17
+        s.text(PL + lab, base, name, 12, TEXT if hero else MUTED, anchor="end")
+        bx = PL + lab + gap
+        if dashed:
+            bw = spec["dashw"]
+            s.rect(bx, ry + 7.5, bw, 11, "url(#hatch)")
+        else:
+            bw = max(3, round(ms / spec["axis"] * barmax))
+            s.rect(bx, ry + 7.5, bw, 11, ACCENT if hero else RIVAL)
+        s.text(bx + bw + 8, base, valtext, 11, MUTED)
+        s.text(PL + lab + gap + track + gap, base, worktext, 11,
+               RED if workred else (ACCENT if hero else MUTED))
+
+    for r in rows:
+        row(r["name"], num(r["settled"]), r["settled"], r["workcell"], r["name"] == "flea")
+        ry += 26
+
+    if unranked:
+        ry += 9
+        s.rect(pad + 1, ry, CW - 2, 1, BORDER)
+        ry += 8
+        for line in note:
+            s.text(PL, ry + 11, line, 11, RED)
+            ry += 16
+        ry += 2
+        for u in unranked:
+            row(u["name"], 0, u["settled"], u["workcell"], False, dashed=True, workred=True)
+            ry += 26
+
+    y = ptop + ph + 18
+    for line in wrap(spec["footer"], CW, 13):
+        y += 18
+        s.text(pad, y, line, 13, MUTED)
+    return s.out(round(y + pad - 5))
+
+
+def shortwork(w):
+    return w.replace(" thumbnails", " thumbs").replace(" thumbnail", " thumb")
+
+
+def card_from(md, key, label):
+    # Cards carry the measured value and its condition, never a place or a rival.
+    p = placement(md, key)
+    return (p["value"], [label],
+            ["median of 3 runs",
+             "median"])
+
+
+def build(csv, out_gh, out_social):
+    md = report(csv)
+    rows, unranked = parse_gui(md)
+    visible, = grab(md, r"fixture: (\d+) visible entries")
+    thumbable, = grab(md, r"thumbnailable: (\d+)")
+    date, = grab(md, r"run date: (\S+),")
+    # Sample input, one entrant version line: - `strata` (gui) source v0.6.1 committed 2026-09-01
+    versions = ", ".join(
+        rest if rest.startswith(name) else "%s %s" % (name, rest.split()[0])
+        for name, rest in [
+            (n, r.replace("source ", "", 1).split(",")[0].strip())
+            for n, r in re.findall(r"^- `(\w+)` \(gui\) (.+)$", md, re.M)]
+        if name != "flea")
+    media = int(thumbable) > 0
+    rows.sort(key=lambda r: num(r["settled"]))
+    fixture = "{:,}".format(int(visible))
+
+    # The board's rule is that no timing stands alone. On a fixture with nothing to thumbnail the
+    # number that stops the settle bar being misread is the first-window time, so that is the column.
+    for r in rows:
+        r["workcell"] = shortwork(r["work"]) if media else r["first"]
+    for u in unranked:
+        u["workcell"] = shortwork(u["work"])
+
+    flea = [r for r in rows if r["name"] == "flea"][0]
+    eyebrow = "Field bench, GUI group, %s files" % fixture
+
+    if media:
+        dolphin = [r for r in rows if r["name"] == "dolphin"][0]
+        ratio = num(dolphin["settled"]) / num(flea["settled"])
+        work = num(dolphin["work"]) / num(flea["work"])
+        fw, dw = flea["work"].split()[0], dolphin["work"].split()[0]
+        cards = [(fw, ["thumbnails Flea drew"], ["the viewport, by design"]),
+                 (dw, ["dolphin drew"],
+                  ["%.1fx the work, about %.1fx the time" % (work, ratio),
+                   "%.1fx work, %.1fx time" % (work, ratio)]),
+                 ("{:,}".format(int(thumbable)), ["thumbnailable"],
+                  ["%s entries less %d txt controls" % (fixture, int(visible) - int(thumbable)),
+                   "%s less %d txt" % (fixture, int(visible) - int(thumbable))])]
+        prov = ("%s entries, %s of them thumbnailable. Cold cache, one box, median of 3 runs per "
+                "entrant, %s. %s." % (fixture, "{:,}".format(int(thumbable)), date, versions))
+        sprov = ("%s entries, %s thumbnailable. Cold cache, median of 3 runs."
+                 % (fixture, "{:,}".format(int(thumbable))))
+        timehdr, workhdr = "time to settled", "work done"
+        footer = ("Every timing carries the work beside it. Flea settled in %s drawing %s "
+                  "thumbnails; dolphin settled in %s drawing %s thumbnails. Thumbnails "
+                  "are asked for only when the list stops moving and only for the rows on screen, "
+                  "so read each timing with the work column beside it."
+                  % (flea["settled"], fw, dolphin["settled"], dw))
+        sfooter = ("Flea settled in %s drawing %s thumbnails; dolphin settled in %s drawing %s "
+                   "thumbnails." % (flea["settled"], fw, dolphin["settled"], dw))
+        cardset = cards
+    else:
+        cards = [card_from(md, "Time to a settled listing", "settled listing"),
+                 card_from(md, "CPU, process tree", "CPU, process tree"),
+                 card_from(md, "Memory, PSS", "memory, PSS"),
+                 card_from(md, "Time to first window", "first window")]
+        pcm = [r for r in rows if r["name"] == "pcmanfm"][0]
+        prov = ("%s entries, none of them thumbnailable, so work is equal by construction and the "
+                "times compare straight across. Cold cache, one box, median of 3 runs per entrant, "
+                "%s. %s." % (fixture, date, versions))
+        sprov = "%s entries, none thumbnailable. Cold cache, median of 3 runs." % fixture
+        timehdr, workhdr = "time to a settled listing", "first window"
+        footer = ("First window and settled listing are not the same column. pcmanfm puts a "
+                  "frame on screen in %s and finishes the listing in about %.1f seconds; Flea puts "
+                  "a frame on screen in %s and finishes in about %.1f seconds."
+                  % (pcm["first"], num(pcm["settled"]) / 1000, flea["first"], num(flea["settled"]) / 1000))
+        sfooter = ("pcmanfm puts a frame on screen in %s and finishes in about %.1f s; Flea puts a "
+                   "frame on screen in %s and finishes in about %.1f s."
+                   % (pcm["first"], num(pcm["settled"]) / 1000, flea["first"], num(flea["settled"]) / 1000))
+        cardset = cards[:3]
+
+    base = dict(rows=rows, unranked=unranked, timehdr=timehdr, workhdr=workhdr,
+                axis=max(num(r["settled"]) for r in rows),
+                unrankednote=["Not ranked. Work nobody measured cannot be compared on time, and "
+                              "an entrant that never settled has no time.",
+                              "Not ranked: work not measured, or never settled."])
+    open(out_gh, "w", encoding="utf-8").write(chart(dict(
+        base, width=860, pad=24, lab=74, workw=96, valch=9, dashw=120,
+        eyebrow=eyebrow, prov=prov, cards=cards, footer=footer)))
+    open(out_social, "w", encoding="utf-8").write(chart(dict(
+        base, width=600, pad=18, lab=64, workw=88, valch=9, dashw=84,
+        eyebrow=eyebrow, prov=sprov, cards=cardset, footer=sfooter)))
+
+
+# The social PNG is rendered at 2x so the 600 px logical art is crisp at its 1200 px posting size.
+SOCIAL_PNG_WIDTH = 1200
+
+
+def to_png(svg, png):
+    r = subprocess.run(["rsvg-convert", "-w", str(SOCIAL_PNG_WIDTH), svg, "-o", png],
+                       capture_output=True, text=True)
+    # rsvg-convert has been known to print and exit 0, so the artefact is checked, not the code.
+    if r.returncode != 0 or not os.path.isfile(png) or os.path.getsize(png) == 0:
+        sys.exit("flea-bench-chart: rsvg-convert wrote no PNG for %s: %s" % (svg, r.stderr.strip()))
+
+
+def main():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    os.chdir(root)
+    outdir = sys.argv[1] if len(sys.argv) > 1 else os.path.join(root, "docs/images")
+    # The repo ships the release-candidate CSVs, so a clone regenerates exactly the committed charts.
+    bench = os.environ.get("FLEA_BENCH_DIR", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "docs", "bench"))
+    if not os.path.isdir(outdir):
+        sys.exit("flea-bench-chart: %s is not a directory" % outdir)
+
+    written = 0
+    for csv, stem in [("scale-rc-2026.csv", "bench-scale"), ("media-rc-2044.csv", "bench-media")]:
+        path = os.path.join(bench, csv)
+        if not os.path.isfile(path):
+            sys.exit("flea-bench-chart: %s is missing, set FLEA_BENCH_DIR" % path)
+        gh = os.path.join(outdir, stem + ".svg")
+        social = os.path.join(outdir, stem + "-social.svg")
+        build(path, gh, social)
+        to_png(social, os.path.join(outdir, stem + "-social.png"))
+        written += 3
+    print("flea-bench-chart: %d files written to %s" % (written, outdir))
+
+
+main()

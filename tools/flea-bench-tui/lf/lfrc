@@ -1,0 +1,5 @@
+# lf ships no image preview at all: its own lfrc.example at /usr/share/doc/lf/lfrc.example has no
+# preview lines in it. AUTHORED HERE, so lf's row carries that caveat. The shape is lf's documented
+# previewer hook, with kitty's own icat kitten as the image path.
+set previewer $XDG_CONFIG_HOME/lf/previewer.sh
+set cleaner $XDG_CONFIG_HOME/lf/cleaner.sh

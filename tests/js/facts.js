@@ -1,0 +1,415 @@
+.import "../../ui/js/Facts.js" as Facts
+.import "../../ui/js/Kinds.js" as Kinds
+
+// Every expectation here is read off the canvas's Preview column board, label by label and in its
+// own order, so a drift in either one fails rather than passing quietly.
+function run(check) {
+    // A fixed instant, 2026-08-31 12:00:00 UTC less a day, so "Modified" never reads the clock.
+    var day = 86400
+    var mtime = 1788177600 - day
+
+    function row(icon, size, mode) {
+        return { n: "x", d: false, s: size, m: mtime, p: mode === undefined ? 33188 : mode, i: icon, k: 0 }
+    }
+    function labels(list) {
+        var out = []
+        for (var i = 0; i < list.length; i++) out.push(list[i].label)
+        return out.join("|")
+    }
+    function valueOf(list, label) {
+        for (var i = 0; i < list.length; i++) if (list[i].label === label) return list[i].value
+        return "(no such row)"
+    }
+
+    check("an icon name classifies the state without the column re-deriving one",
+          Kinds.kindState("image-x-generic") + "|" + Kinds.kindState("video-x-generic")
+          + "|" + Kinds.kindState("audio-x-generic") + "|" + Kinds.kindState("text-x-script")
+          + "|" + Kinds.kindState("text-x-generic") + "|" + Kinds.kindState("package-x-generic")
+          + "|" + Kinds.kindState("application-x-executable"),
+          "image|video|audio|code|text|archive|unsupported")
+
+    // A .doc and a .pdf share one icon, and only one of them is something this column can draw.
+    // Routing the rest of that family to text made the backend count the newlines in a binary.
+    function named(name, icon) {
+        var r = row(icon, 10)
+        r.n = name
+        return r
+    }
+    check("the office family is unsupported, because none of it is text",
+          Kinds.kindState("x-office-document") + "|" + Kinds.kindState("x-office-spreadsheet")
+          + "|" + Kinds.kindState("x-office-presentation"),
+          "unsupported|unsupported|unsupported")
+    check("a word processor document is not routed to the text frame",
+          Facts.state(named("report.odt", "x-office-document"), 1, false, ""), "unsupported")
+    check("but a pdf sharing that icon is still told apart by its extension",
+          Facts.state(named("manual.pdf", "x-office-document"), 1, false, ""), "pdf")
+    check("CSV and TSV reach text despite their spreadsheet icon",
+          ["table.csv", "table.TSV"].map(function (name) {
+              return Facts.state(named(name, "x-office-spreadsheet"), 1, false, "")
+                  + ":" + Kinds.quickLookKind("x-office-spreadsheet", name)
+          }).join("|"), "text:text|text:text")
+    check("binary spreadsheets and names containing csv remain unsupported",
+          ["table.xlsx", "table.ods", "table.csv.bak"].map(function (name) {
+              return Facts.state(named(name, "x-office-spreadsheet"), 1, false, "")
+                  + ":" + Kinds.quickLookKind("x-office-spreadsheet", name)
+          }).join("|"), "unsupported:unsupported|unsupported:unsupported|unsupported:unsupported")
+    // The canvas's own Text tile is field-bench-notes.md, and .md carries the office icon too.
+    check("and markdown reaches the text frame, which is what the canvas draws",
+          Facts.state(named("field-bench-notes.md", "x-office-document"), 1, false, ""), "text")
+    check("every markdown suffix, not just .md",
+          Facts.state(named("a.markdown", "x-office-document"), 1, false, "") + "|"
+          + Facts.state(named("b.mkd", "x-office-document"), 1, false, ""), "text|text")
+    check("and a name merely containing md is not markdown",
+          Facts.state(named("amd.doc", "x-office-document"), 1, false, ""), "unsupported")
+
+    // Archives040: the widened formats draw the file or terminal mark, so the extension routes them.
+    check("a package draws the archive tile by its extension, not its file mark",
+          Facts.state(named("driver.deb", "application-x-generic"), 1, false, ""), "archive")
+    check("and so do the disk image and the appimage",
+          Facts.state(named("debian-13.iso", "application-x-generic"), 1, false, "") + "|"
+          + Facts.state(named("run.AppImage", "application-x-executable"), 1, false, ""), "archive|archive")
+    check("Quick Look routes the widened formats to the archive frame too",
+          Kinds.quickLookKind("application-x-generic", "driver.deb") + "|"
+          + Kinds.quickLookKind("application-x-generic", "debian-13.iso"), "archive|archive")
+
+    // A symlink's own mode wins over whatever its name says it is.
+    check("a symlink is a symlink whatever its name looks like",
+          Facts.state(row("image-x-generic", 10, 41471), 0, false, ""), "symlink")
+    check("a multi-selection outranks the row under the cursor",
+          Facts.state(row("image-x-generic", 10), 4, false, ""), "multi")
+    check("an error outranks a kind",
+          Facts.state(row("image-x-generic", 10), 1, false, "Permission denied"), "error")
+    check("and a preview still arriving is loading",
+          Facts.state(row("video-x-generic", 10), 1, true, ""), "loading")
+    // The backend's icon for a source file is inconsistent, so code is told apart by extension.
+    check("a source file is code whatever icon the backend gave it",
+          ["icons.rs", "app.py", "main.go", "run.sh", "conf.toml"].map(function (n) {
+              return Facts.state({ n: n, d: false, s: 1, m: 1, p: 33188, i: "text-x-generic", k: 0 }, 1, false, "", "Rust source code")
+          }).join("|"),
+          "code|code|code|code|code")
+    check("and prose is not",
+          Facts.state({ n: "notes.md", d: false, s: 1, m: 1, p: 33188, i: "text-x-generic", k: 0 }, 1, false, "", "Markdown"),
+          "text")
+    // An image named .css is an image; only a row the icon already called text can be promoted.
+    check("an extension alone never promotes a row the icon did not call text",
+          Facts.state({ n: "sprite.css", d: false, s: 1, m: 1, p: 33188, i: "image-x-generic", k: 0 }, 1, false, "", "PNG image"),
+          "image")
+    check("and the extension table matches only a real suffix",
+          Kinds.isCode("a.rs") + "|" + Kinds.isCode("rs") + "|" + Kinds.isCode("a.rsx") + "|" + Kinds.isCode("README"),
+          "true|false|false|false")
+
+    // The backend says "I could not identify this" by making the Kind the icon name itself, which is
+    // the canvas's own core.dump tile and is not text however far the icon ladder fell.
+    check("a type nothing recognised is unsupported, not text",
+          Facts.state(row("text-x-generic", 212000000), 1, false, "", "Data"), "unsupported")
+    check("while a real text type stays text",
+          Facts.state(row("text-x-generic", 18000), 1, false, "", "Plain text document"), "text")
+    check("and a caller that names no kind at all still classifies by icon",
+          Facts.state(row("text-x-generic", 18000), 1, false, ""), "text")
+    check("no row at all is the unsupported state rather than a crash",
+          Facts.state(null, 0, false, ""), "unsupported")
+    check("a directory is not a preview subject",
+          Kinds.isPreviewable({ d: true }) + "|" + Kinds.isPreviewable({ d: false }) + "|" + Kinds.isPreviewable(null),
+          "false|true|false")
+
+    // Preview board rule 1: eight ordinary settled kinds open with Kind, Size, Modified, five add one
+    // kind fact and stop at four rows, and video, audio and code carry two.
+    check("image states Kind, Size, Modified, Pixels",
+          labels(Facts.facts("image", row("image-x-generic", 2100000), { w: 2560, h: 1440 }, "PNG image")),
+          "Kind|Size|Modified|Pixels")
+    check("and its pixels read as the canvas writes them",
+          valueOf(Facts.facts("image", row("image-x-generic", 2100000), { w: 2560, h: 1440 }, "PNG image"), "Pixels"),
+          "2560 × 1440")
+    // Animated GIF specimen: Frames follows Pixels in the same cells, and a still picture states none.
+    check("an animated gif adds Frames after Pixels",
+          labels(Facts.facts("image", row("image-x-generic", 1200000), { w: 480, h: 270, frames: 24 }, "GIF image")),
+          "Kind|Size|Modified|Pixels|Frames")
+    check("and its frames read as a bare count",
+          valueOf(Facts.facts("image", row("image-x-generic", 1200000), { w: 480, h: 270, frames: 24 }, "GIF image"), "Frames"),
+          "24")
+    check("a one-frame gif and a png draw no Frames row",
+          labels(Facts.facts("image", row("image-x-generic", 1200000), { w: 480, h: 270, frames: 1 }, "GIF image")) + "|"
+              + labels(Facts.facts("image", row("image-x-generic", 2100000), { w: 2560, h: 1440 }, "PNG image")),
+          "Kind|Size|Modified|Pixels|Kind|Size|Modified|Pixels")
+    check("video states Kind, Size, Modified, Duration, Pixels",
+          labels(Facts.facts("video", row("video-x-generic", 48000000), { w: 1920, h: 1080 }, "MP4 video", { duration: "1:12" })),
+          "Kind|Size|Modified|Duration|Pixels")
+    check("audio states Kind, Size, Modified, Duration, Rate",
+          labels(Facts.facts("audio", row("audio-x-generic", 31000000), null, "FLAC audio", { duration: "4:05", rate: "44.1 kHz" })),
+          "Kind|Size|Modified|Duration|Rate")
+    check("pdf states Kind, Size, Modified, Pages",
+          labels(Facts.facts("pdf", row("application-pdf", 2300000), null, "PDF document", { pages: "51" })),
+          "Kind|Size|Modified|Pages")
+    check("text states Kind, Size, Modified, Lines",
+          labels(Facts.facts("text", row("text-x-generic", 18000), { lines: 214 }, "Markdown")),
+          "Kind|Size|Modified|Lines")
+    // Mode stays: columns view draws no permission column, so dropping it here removes it entirely.
+    check("code states Kind, Size, Modified, Lines, Mode",
+          labels(Facts.facts("code", row("text-x-script", 4200), { lines: 132 }, "Rust source")),
+          "Kind|Size|Modified|Lines|Mode")
+    check("archive states Kind, Size, Modified, Entries",
+          labels(Facts.facts("archive", row("package-x-generic", 1200000000), null, "Zstandard tar", { entries: "214", unpacked: "3.4 GB" })),
+          "Kind|Size|Modified|Entries")
+    // Size above already says what the archive weighs packed, so its one row carries both counts.
+    check("and the archive's one fact is the count and the unpacked total together",
+          valueOf(Facts.facts("archive", row("package-x-generic", 1200000000), null, "Zstandard tar", { entries: "214", unpacked: "3.4 GB" }), "Entries"),
+          "214, 3.4 GB out")
+    check("an archive nothing has measured unpacked still states its count",
+          valueOf(Facts.facts("archive", row("package-x-generic", 1200000000), null, "Zstandard tar", { entries: "214" }), "Entries"),
+          "214")
+    check("symlink states Kind, Target, Points at, Mode",
+          labels(Facts.facts("symlink", row("folder", 18, 41471), { target: "/usr/share/omarchy", targetDir: true }, "Folder")),
+          "Kind|Target|Points at|Mode")
+    check("and says what it points at rather than repeating the path",
+          valueOf(Facts.facts("symlink", row("folder", 18, 41471), { target: "/usr/share/omarchy", targetDir: true }, "Folder"), "Points at"),
+          "Folder")
+    check("a symlink to a file says so too",
+          valueOf(Facts.facts("symlink", row("file", 18, 41471), { target: "a.txt", targetDir: false }, "x"), "Points at"),
+          "File")
+    check("error states Kind, Size, Mode, Owner",
+          labels(Facts.facts("error", row("application-x-generic", 419, 33152), null, "Unknown", { owner: "root" })),
+          "Kind|Size|Mode|Owner")
+    check("loading states Kind, Size, State",
+          labels(Facts.facts("loading", row("video-x-generic", 48000000), null, "MP4 video")),
+          "Kind|Size|State")
+    check("unsupported states Kind, Size, Modified, Mode",
+          labels(Facts.facts("unsupported", row("application-x-generic", 212000000), null, "Data")),
+          "Kind|Size|Modified|Mode")
+
+    // Duration and rate come off the meta answer rather than being assembled by a caller.
+    check("a video reads its duration off the meta answer",
+          valueOf(Facts.facts("video", row("video-x-generic", 48000000), { w: 1920, h: 1080, durationMs: 72000 }, "MP4 video"), "Duration"),
+          "1:12")
+    check("an audio row reads its rate the way the canvas writes it",
+          valueOf(Facts.facts("audio", row("audio-x-generic", 31000000), { durationMs: 245000, sampleRate: 44100 }, "FLAC audio"), "Rate"),
+          "44.1 kHz")
+    check("a whole number of kilohertz drops the decimal",
+          Facts.mediaExtra({ sampleRate: 48000 }).rate, "48 kHz")
+    check("a media row with nothing probed yet shows empty cells rather than zeroes",
+          Facts.mediaExtra({ durationMs: 0, sampleRate: 0 }).duration + "|" + Facts.mediaExtra({ durationMs: 0, sampleRate: 0 }).rate,
+          "|")
+    check("and no meta at all is not a crash",
+          JSON.stringify(Facts.mediaExtra(null)), "{}")
+
+    // Entries and the unpacked total come off the archive's own index, read without extracting it.
+    check("an archive states its entries and what they weigh unpacked",
+          valueOf(Facts.facts("archive", row("package-x-generic", 1200000000), { entries: 214, unpacked: 3400000000 }, "Zstandard tar"), "Entries"),
+          "214, 3.4 GB out")
+    check("and an archive nothing has listed yet shows empty cells rather than zeroes",
+          JSON.stringify(Facts.archiveExtra({ entries: 0, unpacked: 0 })), "{}")
+
+    // The count is exact however long the listing is: the backend streams it and caps only the names
+    // it sends, and the difference is the tile's own "+ N more" line.
+    var big = { entries: 214, unpacked: 3400000000,
+                names: [{ n: "daemon", d: true }, { n: "ui", d: true }, { n: "Cargo.toml", d: false }] }
+    check("a long archive states an exact count and an exact unpacked total, never a cap",
+          valueOf(Facts.facts("archive", row("package-x-generic", 1200000000), big, "Zstandard tar"), "Entries"),
+          "214, 3.4 GB out")
+    check("and a four-figure archive groups its entries",
+          valueOf(Facts.facts("archive", row("package-x-generic", 1200000000),
+                              { entries: 1204, unpacked: 3400000000 }, "Zstandard tar"), "Entries"),
+          "1,204, 3.4 GB out")
+    check("the tile lists the names the wire carried",
+          Facts.archiveEntries(big).map(function (e) { return e.n }).join("|"),
+          "daemon|ui|Cargo.toml")
+    check("and states how many it could not list",
+          String(Facts.archiveMore(big)), "211")
+    check("an archive whose names all fit says no more at all",
+          String(Facts.archiveMore({ entries: 3, unpacked: 10, names: [{ n: "a" }, { n: "b" }, { n: "c" }] })), "0")
+    check("and one nothing has listed yet lists nothing rather than throwing",
+          Facts.archiveEntries(null).length + "|" + Facts.archiveMore(null), "0|0")
+    // The frame bounds the list a second time, so a tall wire answer cannot run past the tile and
+    // hide the very number the tile exists to state.
+    check("a frame with room for two names lists two",
+          Facts.archiveEntries(big, 2).map(function (e) { return e.n }).join("|"), "daemon|ui")
+    check("and counts every entry it did not name, wire and frame alike",
+          String(Facts.archiveMore(big, 2)), "212")
+    check("a frame with no room at all lists none and counts them all",
+          Facts.archiveEntries(big, 0).length + "|" + Facts.archiveMore(big, 0), "0|214")
+
+    // A line count the backend had to stop early is a floor, marked the way a partial size is.
+    check("a complete line count is a plain number",
+          Facts.lineCount({ lines: 214, partial: false }), "214")
+    check("and a four-figure one groups",
+          Facts.lineCount({ lines: 1204, partial: false }), "1,204")
+    check("and a truncated one is marked as a floor",
+          Facts.lineCount({ lines: 9000, partial: true }), "> 9,000")
+    check("no meta yet is an empty cell rather than a zero",
+          Facts.lineCount(null), "")
+    // src/backend/metareq.rs answers lines 0 for a file it could not open, the same 0 an empty file
+    // answers, so without lfailed the table printed "Lines: 0" as if it had measured one.
+    check("a file the backend could not open states no count rather than zero",
+          Facts.lineCount({ lines: 0, partial: false, linesFailed: true }), "")
+    check("and a file that really is empty still states its zero",
+          Facts.lineCount({ lines: 0, partial: false, linesFailed: false }), "0")
+    // HANDOFF rule 19: a label with no value is not drawn, so the row goes rather than the value.
+    check("an unreadable text file draws no Lines row at all",
+          labels(Facts.facts("text", row("text-x-generic", 18000),
+                             { lines: 0, partial: false, linesFailed: true }, "Markdown")), "Kind|Size|Modified")
+    check("and a raw image whose dimensions are unreadable draws no Pixels row",
+          labels(Facts.facts("image", row("image-x-generic", 2100000), null, "Raw image")), "Kind|Size|Modified")
+    check("an archive nothing has listed draws no Entries row either",
+          labels(Facts.facts("archive", row("package-x-generic", 1200000), null, "Zip archive")), "Kind|Size|Modified")
+    check("a video nothing has probed yet drops Duration and keeps the rest",
+          labels(Facts.facts("video", row("video-x-generic", 48000000), { w: 1920, h: 1080 }, "MP4 video")),
+          "Kind|Size|Modified|Pixels")
+    check("pixels with nothing behind them are empty rather than 0 × 0",
+          Facts.pixels(null) + "|" + Facts.pixels({ w: 0, h: 0 }), "|")
+
+    // The multi-select summary, which is a summary and never a collage.
+    var many = [row("image-x-generic", 1000), row("image-x-generic", 2000),
+                row("video-x-generic", 4000), row("text-x-generic", 8000)]
+    check("multi-select states Kinds, Combined, Newest, Oldest",
+          labels(Facts.multiFacts(many)), "Kinds|Combined|Newest|Oldest")
+    check("and counts the kinds the way the canvas phrases them",
+          valueOf(Facts.multiFacts(many), "Kinds"), "2 images, 1 video, 1 text")
+    check("and a four-figure kind groups",
+          Facts.kindSummary([{ word: "image", count: 1204 }], ""), "1,204 images")
+    check("the combined size is every selected row added up",
+          valueOf(Facts.multiFacts(many), "Combined"), "15.0 kB")
+    check("an empty selection states only the row it can fill, rather than throwing",
+          labels(Facts.multiFacts([])), "Combined")
+    check("a hole in the selection is skipped rather than counted",
+          valueOf(Facts.multiFacts([null, row("image-x-generic", 1000)]), "Kinds"), "1 image")
+
+    // A selection wider than the held window cannot be summed without a metadata sweep, which this
+    // codebase refuses, so every number it does produce is a floor and has to look like one.
+    check("a selection wider than the held window states floors, not an undercount",
+          valueOf(Facts.multiFacts(many, 9), "Combined") + "|"
+          + valueOf(Facts.multiFacts(many, 9), "Kinds"),
+          "> 15.0 kB|> 2 images, > 1 video, > 1 text")
+    check("and a selection entirely inside the window states plain totals",
+          valueOf(Facts.multiFacts(many, 4), "Combined") + "|"
+          + valueOf(Facts.multiFacts(many, 4), "Kinds"),
+          "15.0 kB|2 images, 1 video, 1 text")
+    check("a hole inside the window is a floor too, because a row it could not read is a row it did not count",
+          valueOf(Facts.multiFacts([null, row("image-x-generic", 1000)], 2), "Combined"), "> 1.0 kB")
+
+    // The Quick Look classifies from the same icon and name the column does, so the two can never
+    // disagree about what a row is; the overlay refused every image for as long as it kept its own list.
+    check("the Quick Look draws an image, an archive and a symlink to an image by the icon the backend sent",
+          Kinds.quickLookKind("image-x-generic", "photo.png") + "|" + Kinds.quickLookKind("package-x-generic", "backup.tar.zst")
+          + "|" + Kinds.quickLookKind("image-x-generic", "link-to-photo.png"),
+          "image|archive|image")
+    check("the Quick Look keeps its media, pdf, markdown and text answers",
+          Kinds.quickLookKind("audio-x-generic", "tone.wav") + "|" + Kinds.quickLookKind("video-x-generic", "clip.mp4")
+          + "|" + Kinds.quickLookKind("x-office-document", "manual.pdf") + "|" + Kinds.quickLookKind("x-office-document", "notes.md")
+          + "|" + Kinds.quickLookKind("text-x-generic", "notes.txt"),
+          "audio|video|pdf|text|text")
+    check("code renders as text in the Quick Look, and an office file or an executable is declined",
+          Kinds.quickLookKind("text-x-script", "script.sh") + "|" + Kinds.quickLookKind("x-office-document", "report.doc")
+          + "|" + Kinds.quickLookKind("application-x-executable", "a.out"),
+          "text|unsupported|unsupported")
+    // /usr/share/mime/generic-icons on this box maps text/* to five different text- names, so the
+    // family classifies, and a list of the names seen so far is exactly what missed every image.
+    check("an icon classifies by its family, not by a list of the names seen so far",
+          Kinds.kindState("text-x-generic-template") + "|" + Kinds.kindState("image-x-generic"),
+          "text|image")
+    check("a 3D model a thumbnailer serves is an image, with none serving it takes the generic file pane, and only its suffix names a model",
+          [["part.STL", true], ["part.STL", false], ["part.STL"], ["photo.png", false]].map(function (a) { return Kinds.quickLookKind("image-x-generic", a[0], a[1]) }).join("|")
+          + "|" + ["part.STL", "a.3mf", "scene.glb", "photo.png", "stl", "a.stlx"].map(Kinds.isModel).join("|"), "image|unsupported|unsupported|image|true|true|true|false|false|false")
+
+    // The Quick Look's one line under an archive's name, from the same meta the column's table reads.
+    check("an archive's Quick Look line states the count and the unpacked size, and nothing before the index lands",
+          Facts.archiveLine({ entries: 214, unpacked: 3400000000, names: [] }) + "|"
+          + Facts.archiveLine({ entries: 1, unpacked: 0, names: [] }) + "|" + Facts.archiveLine(null) + "|"
+          + Facts.archiveLine({ entries: 0, unpacked: 0, archiveFailed: false, names: [] }) + "|"
+          + Facts.archiveLine({ entries: 0, unpacked: 0, archiveFailed: true, names: [] }),
+          "214 entries \u00b7 3.4 GB unpacked|1 entry||0 entries|")
+    check("and the Quick Look line groups a four-figure count",
+          Facts.archiveLine({ entries: 1204, unpacked: 0, names: [] }), "1,204 entries")
+
+    // TallPreviews: the frame's shape follows the row's kind alone, and the facts fold into one line whose Kind elides alone.
+    var every = [Facts.TEXT, Facts.CODE, Facts.ARCHIVE, Facts.IMAGE, Facts.VIDEO, Facts.AUDIO, Facts.PDF,
+                 Facts.SYMLINK, Facts.MULTI, Facts.LOADING, Facts.ERROR, Facts.UNSUPPORTED]
+    check("text, code, an archive list and a PDF are tall and every other kind keeps the 16 by 10 frame",
+          every.map(function (st) { return Facts.tall(st) }).join("|"),
+          "true|true|true|false|false|false|true|false|false|false|false|false")
+    function line(st, size, meta, kind, extra) {
+        var l = Facts.compactLine(st, row("text-x-generic", size), meta, kind, extra)
+        return l.kind + "|" + l.tail
+    }
+    check("code states its Kind, size and lines, the Kind apart from the tail that never elides",
+          line(Facts.CODE, 4100, { lines: 132 }, "Rust source code"), "Rust source code| \u00b7 4.1 kB \u00b7 132 lines")
+    check("a Markdown document reads the same shape",
+          line(Facts.TEXT, 6200, { lines: 48 }, "Markdown document"), "Markdown document| \u00b7 6.2 kB \u00b7 48 lines")
+    check("one line is a singular and none is a plural",
+          line(Facts.TEXT, 3, { lines: 1 }, "Plain text") + "#" + line(Facts.TEXT, 0, { lines: 0 }, "Plain text"),
+          "Plain text| \u00b7 3 B \u00b7 1 line#Plain text| \u00b7 0 B \u00b7 0 lines")
+    check("a count the backend stopped early keeps its floor and a four-figure count its group",
+          line(Facts.CODE, 4100, { lines: 5000, partial: true }, "Rust source code") + "#" + line(Facts.TEXT, 4100, { lines: 1204 }, "Plain text"),
+          "Rust source code| \u00b7 4.1 kB \u00b7 > 5,000 lines#Plain text| \u00b7 4.1 kB \u00b7 1,204 lines")
+    check("a count that is not there yet, or could not be read, leaves the line at Kind and size",
+          line(Facts.CODE, 4100, null, "Rust source code") + "#" + line(Facts.CODE, 4100, { linesFailed: true, lines: 0 }, "Rust source code"),
+          "Rust source code| \u00b7 4.1 kB#Rust source code| \u00b7 4.1 kB")
+    check("an archive states its entries, with a singular, an exact zero and nothing for a failed index",
+          line(Facts.ARCHIVE, 9000, { entries: 214 }, "Zip archive") + "#" + line(Facts.ARCHIVE, 9000, { entries: 1 }, "Zip archive")
+          + "#" + line(Facts.ARCHIVE, 9000, { entries: 0, archiveFailed: false }, "Zip archive")
+          + "#" + line(Facts.ARCHIVE, 9000, { entries: 0, archiveFailed: true }, "Zip archive"),
+          "Zip archive| \u00b7 9.0 kB \u00b7 214 entries#Zip archive| \u00b7 9.0 kB \u00b7 1 entry#Zip archive| \u00b7 9.0 kB \u00b7 0 entries#Zip archive| \u00b7 9.0 kB")
+    check("a PDF states its pages with a singular, a grouped count and nothing until the document is read",
+          line(Facts.PDF, 2400000, null, "PDF document", { pages: "12" }) + "#" + line(Facts.PDF, 31000, null, "PDF document", { pages: "1" })
+          + "#" + line(Facts.PDF, 9000000, null, "PDF document", { pages: "1204" }) + "#" + line(Facts.PDF, 31000, null, "PDF document", { pages: "" })
+          + "#" + line(Facts.PDF, 31000, null, "PDF document"),
+          "PDF document| \u00b7 2.4 MB \u00b7 12 pages#PDF document| \u00b7 31.0 kB \u00b7 1 page#PDF document| \u00b7 9.0 MB \u00b7 1,204 pages#PDF document| \u00b7 31.0 kB#PDF document| \u00b7 31.0 kB")
+    check("a Kind that looks like a placeholder is kept whole, and a missing Kind or row states what it can",
+          line(Facts.CODE, 4100, { lines: 2 }, "100% %2 source") + "#" + line(Facts.CODE, 4100, { lines: 2 }, "")
+          + "#" + JSON.stringify(Facts.compactLine(Facts.CODE, null, { lines: 2 }, "Rust source code")),
+          "100% %2 source| \u00b7 4.1 kB \u00b7 2 lines#|4.1 kB \u00b7 2 lines#{\"kind\":\"\",\"tail\":\"\"}")
+    check("the tall frame is the column less its margins, the name, the facts and the two gaps between them",
+          Facts.tallHeight(700, 12, 20, 18, 9) + "|" + Facts.tallHeight(40, 12, 20, 18, 9), "620|0")
+
+    // The photo facts: the backend sends the EXIF values as stored and the column and Properties word them here.
+    var canon = { make: "Canon", model: "Canon EOS R6", lens: "RF35mm F1.8 MACRO IS STM", exp: [1, 250], fnum: [28, 10], iso: 400,
+                  focal: [35, 1], taken: "2026:09:12 18:31:00" }
+    var shot = Facts.photoFacts(canon)
+    check("a photo's facts read as the board writes them",
+          [shot.camera, shot.lens, shot.exposure, shot.focal, shot.taken].join("|"),
+          "Canon EOS R6|RF35mm F1.8 MACRO IS STM|1/250 s \u00b7 f/2.8 \u00b7 ISO 400|35 mm|2026-09-12 18:31")
+    check("a model that already starts with the make's first word stands alone, in any case",
+          Facts.photoFacts({ make: "NIKON CORPORATION", model: "Nikon Z 6" }).camera + "|" + Facts.photoFacts({ make: "OLYMPUS IMAGING CORP.", model: "OLYMPUS E-M1" }).camera,
+          "Nikon Z 6|OLYMPUS E-M1")
+    check("a model that does not start with the make is joined to it",
+          Facts.photoFacts({ make: "SONY", model: "ILCE-7M3" }).camera + "|" + Facts.photoFacts({ make: "FUJIFILM", model: "X-T4" }).camera,
+          "SONY ILCE-7M3|FUJIFILM X-T4")
+    check("a make or a model alone is the camera, and neither is no camera",
+          Facts.photoFacts({ make: "Canon" }).camera + "|" + Facts.photoFacts({ model: "X100V" }).camera + "|" + Facts.photoFacts({}).camera, "Canon|X100V|")
+    check("an exposure under 0.3 s is a fraction and from 0.3 s it is a number of seconds, the way a camera shows it",
+          [[1, 8000], [10, 2500], [1, 4], [3, 10], [1, 3], [1, 2], [6, 10], [8, 10], [1, 1], [2, 1], [3, 2], [30, 1]].map(function (e) { return Facts.photoFacts({ exp: e }).exposure }).join("|"),
+          "1/8000 s|1/250 s|1/4 s|0.3 s|0.3 s|0.5 s|0.6 s|0.8 s|1 s|2 s|1.5 s|30 s")
+    check("the aperture keeps one decimal and drops a trailing zero",
+          [[28, 10], [4, 1], [18, 10], [56, 10], [14, 10]].map(function (f) { return Facts.photoFacts({ fnum: f }).exposure }).join("|"),
+          "f/2.8|f/4|f/1.8|f/5.6|f/1.4")
+    check("an absent part of the exposure is left out and none leaves no exposure",
+          [{ iso: 800 }, { fnum: [28, 10], iso: 100 }, { exp: [1, 60], fnum: [4, 1] }, { exp: [0, 1], fnum: [1, 0], iso: 0 }]
+              .map(function (p) { return Facts.photoFacts(p).exposure }).join("|"),
+          "ISO 800|f/2.8 \u00b7 ISO 100|1/60 s \u00b7 f/4|")
+    check("the focal length rounds to a whole number of millimetres and zero is absent",
+          [[35, 1], [244, 10], [245, 10], [0, 1], [5, 0]].map(function (f) { return Facts.photoFacts({ focal: f }).focal }).join("|"),
+          "35 mm|24 mm|25 mm||")
+    check("a taken stamp is written like Modified and a malformed one is absent",
+          Facts.photoFacts({ taken: "2026:01:02 03:04:05" }).taken + "|" + Facts.photoFacts({ taken: "0000:00:00 00:00:00" }).taken + "|" + Facts.photoFacts({ taken: "yesterday" }).taken,
+          "2026-01-02 03:04||")
+    check("nothing reads Unknown: a missing photo is a set of empty strings",
+          Object.keys(Facts.photoFacts(null)).map(function (k) { return Facts.photoFacts(null)[k] }).join("|") + "|" + Facts.photoFacts(undefined).camera, "||||" + "|")
+
+    // Raw.html: the column follows Kind, Size, Modified, Camera, Lens, Exposure, Focal, Pixels, Taken.
+    var rawMeta = { w: 0, h: 0, photo: Object.assign({ w: 6000, h: 4000 }, canon) }
+    check("a raw image's column rows follow the board's order",
+          labels(Facts.facts("image", row("image-x-generic", 31200000), rawMeta, "Canon CR3 raw image")),
+          "Kind|Size|Modified|Camera|Lens|Exposure|Focal|Pixels|Taken")
+    check("a raw image's rows carry the worded values",
+          valueOf(Facts.facts("image", row("image-x-generic", 31200000), rawMeta, "Canon CR3 raw image"), "Exposure") + "|"
+          + valueOf(Facts.facts("image", row("image-x-generic", 31200000), rawMeta, "Canon CR3 raw image"), "Pixels"),
+          "1/250 s \u00b7 f/2.8 \u00b7 ISO 400|6000 \u00d7 4000")
+    check("a raw image with no EXIF keeps today's rows and nothing reads Unknown",
+          labels(Facts.facts("image", row("image-x-generic", 2100000), { w: 0, h: 0, photo: null }, "Canon CR3 raw image")), "Kind|Size|Modified")
+    check("a raw image with some facts draws only those, in order",
+          labels(Facts.facts("image", row("image-x-generic", 2100000), { photo: { model: "X-T4", make: "FUJIFILM", taken: "2026:01:02 03:04:05" } }, "Fujifilm RAF raw image")),
+          "Kind|Size|Modified|Camera|Taken")
+    check("a plain image without a photo keeps Kind, Size, Modified, Pixels",
+          labels(Facts.facts("image", row("image-x-generic", 2100000), { w: 2560, h: 1440 }, "PNG image")), "Kind|Size|Modified|Pixels")
+    check("a raw image's Pixels row is its sensor size from the photo facts, and a frame header's size wins",
+          Facts.pixels({ w: 0, h: 0, photo: { w: 6000, h: 4000 } }) + "|" + Facts.pixels({ w: 64, h: 48, photo: { w: 6000, h: 4000 } }) + "|"
+          + Facts.pixels({ w: 0, h: 0, photo: { w: 6000 } }) + "|" + Facts.pixels({ photo: null }), "6000 \u00d7 4000|64 \u00d7 48||")
+}

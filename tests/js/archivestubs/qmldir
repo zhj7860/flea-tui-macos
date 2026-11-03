@@ -1,0 +1,15 @@
+singleton Theme 1.0 Theme.qml
+singleton Style 1.0 Style.qml
+singleton ViewState 1.0 ViewState.qml
+singleton Quickshell 1.0 Quickshell.qml
+CardScroll 1.0 CardScroll.qml
+CheckBox 1.0 CheckBox.qml
+DialogButton 1.0 DialogButton.qml
+DialogScrim 1.0 DialogScrim.qml
+DialogField 1.0 DialogField.qml
+DialogTitle 1.0 DialogTitle.qml
+SettingsSegment 1.0 SettingsSegment.qml
+Process 1.0 Process.qml
+SplitParser 1.0 SplitParser.qml
+CardFrame 1.0 CardFrame.qml
+Reveal 1.0 CardFrame.qml

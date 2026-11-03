@@ -1,0 +1,146 @@
+#!/bin/bash
+# Builds the media fixture, see AGENTS.md "Fixtures".
+set -u
+# Hard rule 9's guard owns FIXTURE_ROOT and every absolute, root and containment check below. The
+# marker stays this fixture's own name, so a media build can never delete a matched fixture.
+. "$(dirname "$0")/../tools/flea-sandbox-guard"
+
+
+dir=${DIR:-$FIXTURE_ROOT/flea-media-btrfs}
+count=${COUNT:-2000}
+
+# The marker is what stands between DIR and rm -rf: no marker, no delete.
+marker=.flea-media-fixture
+
+mix_slots=10
+# The mix repeats every twenty files, because two containers share one slot, so a smaller count drops a format.
+mix_period=20
+
+frame_size=1920x1080
+jpeg_quality=88
+heic_quality=80
+clip_seconds=10
+clip_fps=30
+webm_bitrate=2M
+# libvpx speed knob, 8 is the fastest realtime step and the seed is encoded once.
+vp9_cpu_used=8
+# Any fixed value does, it only has to be the same on the next box.
+plasma_seed=7
+
+fail() {
+  echo "flea-media-fixture: $*" >&2
+  exit 1
+}
+
+# Every encode is checked and the tool's own message is quoted, so a half-built fixture cannot exit 0.
+run() {
+  local err
+  if ! err=$("$@" 2>&1 >/dev/null); then
+    fail "$* failed: $err"
+  fi
+}
+
+# A plain copy, never a reflink: shared extents would let a cold read hit one physical copy hundreds of times.
+copy_seed() {
+  cp --reflink=never "$1" "$2" || fail "could not write $2"
+}
+
+# The text files are the long tail, so a viewport meets icon resolution beside the thumbnails.
+write_note() {
+  printf 'the long tail, so icon resolution is exercised too\n' > "$1" || fail "could not write $1"
+}
+
+for tool in ffmpeg magick heif-enc findmnt; do
+  command -v "$tool" >/dev/null || fail "$tool is missing"
+done
+
+case $count in
+  '' | *[!0-9]*) fail "COUNT must be a whole number, got '$count'" ;;
+esac
+if [ "$count" -lt "$mix_period" ]; then
+  fail "COUNT must be at least $mix_period, one for every slot in the mix, got $count"
+fi
+
+sandbox_require "$dir"
+parent=$(dirname "$dir")
+
+# corner: tmpfs pages are the filesystem, so drop_caches cannot evict them, see AGENTS.md "Fixtures".
+fs=$(findmnt -no FSTYPE -T "$parent" 2>/dev/null)
+if [ -z "$fs" ]; then
+  fail "findmnt could not name the filesystem holding $parent"
+fi
+if [ "$fs" = tmpfs ]; then
+  fail "$dir would be on tmpfs, where a cold run measures nothing"
+fi
+
+if [ -e "$dir" ]; then
+  if [ ! -f "$dir/$marker" ]; then
+    fail "$dir exists and carries no $marker, so this script will not delete it"
+  fi
+  rm -rf "$dir" || fail "could not remove the previous fixture at $dir"
+fi
+mkdir -p "$dir" || fail "could not create $dir"
+touch "$dir/$marker" || fail "could not write the marker $dir/$marker"
+
+# One seed per format, then plain copies, so the build runs seven encoders instead of two thousand.
+seed_png=$dir/.seed.png
+seed_jpg=$dir/.seed.jpg
+seed_webp=$dir/.seed.webp
+seed_heic=$dir/.seed.heic
+seed_mp4=$dir/.seed.mp4
+seed_mkv=$dir/.seed.mkv
+seed_webm=$dir/.seed.webm
+
+# -seed makes plasma repeatable, -depth 8 stops it writing 16-bit, and -strip drops the timestamp chunk.
+run magick -seed "$plasma_seed" -size "$frame_size" plasma:fractal -depth 8 -strip "$seed_png"
+run magick "$seed_png" -strip -quality "$jpeg_quality" "$seed_jpg"
+run magick "$seed_png" -strip "$seed_webp"
+run heif-enc -q "$heic_quality" "$seed_png" -o "$seed_heic"
+
+# -fflags is per file, so bitexact goes before the OUTPUT or the Matroska muxer still stamps a date and a segment id.
+run ffmpeg -loglevel error -y -f lavfi \
+  -i "testsrc2=size=$frame_size:rate=$clip_fps" -t "$clip_seconds" \
+  -c:v libx264 -preset veryfast -pix_fmt yuv420p -fflags +bitexact "$seed_mp4"
+run ffmpeg -loglevel error -y -i "$seed_mp4" -c copy -fflags +bitexact "$seed_mkv"
+# No WebM container accepts H.264, so this is the one real encode, and -threads 1 keeps it byte-identical.
+run ffmpeg -loglevel error -y -i "$seed_mp4" \
+  -c:v libvpx-vp9 -deadline realtime -cpu-used "$vp9_cpu_used" -threads 1 \
+  -b:v "$webm_bitrate" -fflags +bitexact "$seed_webm"
+
+# Distrust the encoders' exit codes: a tool that exits 0 on a truncated write would be copied 200 times.
+for seed in "$seed_png" "$seed_jpg" "$seed_webp" "$seed_heic" "$seed_mp4" "$seed_mkv" "$seed_webm"; do
+  [ -s "$seed" ] || fail "$seed is empty or missing after its encoder reported success"
+done
+
+# The mix is deliberate: enough of each type that a viewport of 35 rows meets several.
+n=0
+while [ "$n" -lt "$count" ]; do
+  case $(( n % mix_slots )) in
+    0 | 1 | 2) copy_seed "$seed_jpg" "$dir/photo_$n.jpg" ;;
+    3) copy_seed "$seed_png" "$dir/image_$n.png" ;;
+    4) copy_seed "$seed_webp" "$dir/image_$n.webp" ;;
+    5) copy_seed "$seed_heic" "$dir/image_$n.heic" ;;
+    6 | 7) copy_seed "$seed_mp4" "$dir/clip_$n.mp4" ;;
+    # MKV and WebM share one slot, so the mix stays at ten and both containers still appear.
+    8)
+      if [ $(( n % mix_period )) -lt "$mix_slots" ]; then
+        copy_seed "$seed_mkv" "$dir/clip_$n.mkv"
+      else
+        copy_seed "$seed_webm" "$dir/clip_$n.webm"
+      fi
+      ;;
+    9) write_note "$dir/notes_$n.txt" ;;
+  esac
+  n=$(( n + 1 ))
+done
+
+rm -f "$seed_png" "$seed_jpg" "$seed_webp" "$seed_heic" "$seed_mp4" "$seed_mkv" "$seed_webm"
+
+# ls skips the dotfile marker, so this counts exactly the files the mix was asked for.
+built=$(ls "$dir" | wc -l)
+if [ "$built" -ne "$count" ]; then
+  fail "built $built files in $dir, not $count"
+fi
+
+sync
+echo "flea-media-fixture: $built files in $dir on $(findmnt -no FSTYPE -T "$dir")"

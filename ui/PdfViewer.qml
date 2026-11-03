@@ -1,0 +1,296 @@
+import QtQuick
+import "." as Flea
+import "js/Keymap.js" as Keymap
+import "js/PreviewKeys.js" as PreviewKeys
+
+// The canvas's PdfViewer: the Quick Look's own PDF surface. Hairline chrome above and below, and
+// between them the page, which is the only light thing in the app. The document itself stays in
+// PreviewPdf.qml, so this file is chrome, a zoom and a pan, and nothing else.
+Item {
+    id: root
+
+    property string path: ""
+    property bool active: false
+    // Forwarded to the page below, so Quick Look assigns like the column does.
+    property var backend: null
+    property bool fetchFirst: false
+    // Forwarded to the page below, so Quick Look cleans up only its own copy.
+    property string viewerSlot: ""
+    // Expand fills the window; the overlay that hosts this reads the flag and drops its own inset.
+    property bool expanded: false
+    // Quick Look opens on the document with no control picked, as the Markdown strip does; Tab or Shift+Tab enters the strip.
+    property int pdfControlIndex: -1
+    readonly property var pdfControls: [previous, next, zoomOut, zoomIn, expand, close]
+    Keys.onPressed: function(event) {
+        var action = Keymap.lookup(event.key, event.text, event.modifiers, "pdf")
+        // 2026-09-11 ruling: Space closes every kind, Enter still activates the focused control.
+        if (action === "escape" || action === "focusPreview" || action === "preview") root.closed()
+        else PreviewKeys.pdfAction(action, root)
+        event.accepted = true
+    }
+
+    readonly property int page: pdf.page
+    readonly property int pageCount: pdf.pageCount
+    readonly property bool failed: pdf.failed
+    // The page on screen, -1 before the first render: ui/Preview.qml's swap waits for it.
+    readonly property int shownPage: pdf.shownPage
+    // The document the viewer has opened; a path asked for since is not on screen until this names it.
+    readonly property string opened: pdf.opened
+    readonly property real pageAspect: pdf.pageCount > 0 ? pdf.pageAspect : 0
+    readonly property real pdfScrollY: pageFlick.contentY
+
+    // The canvas draws no scale readout, so the ladder is the whole zoom contract: one step a press,
+    // and a bottom rung that always fits the frame, which is what makes the pan below reachable.
+    readonly property real minZoom: PreviewKeys.PDF_ZOOM_MIN
+    readonly property real maxZoom: PreviewKeys.PDF_ZOOM_MAX
+    readonly property real zoomStep: PreviewKeys.PDF_ZOOM_STEP
+    property real zoom: root.minZoom
+
+    signal closed()
+
+    // A new document is a new subject, so it opens fitted however the last one was left.
+    onPathChanged: { root.zoom = root.minZoom; root.pdfControlIndex = -1 }
+    function turn(delta) { pdf.turn(delta) }
+    function turnPage(delta) { root.turn(delta) }
+    function scrollPage(delta) {
+        pageFlick.contentY = Math.max(0, Math.min(pageFlick.contentHeight - pageFlick.height,
+            pageFlick.contentY + delta * Theme.rowHeight))
+    }
+
+    function zoomBy(steps) {
+        root.zoom = Math.max(root.minZoom, Math.min(root.maxZoom, root.zoom + steps * root.zoomStep))
+    }
+
+    function toggleExpand() { root.expanded = !root.expanded }
+    function expandFrom(page, zoom) {
+        pdf.page = Math.max(0, pdf.pageCount > 0 ? Math.min(pdf.pageCount - 1, page) : page)
+        root.zoom = Math.max(root.minZoom, Math.min(root.maxZoom, zoom))
+        root.expanded = true
+    }
+
+    // A test drives these by coordinate, the same seam ChromeBar.buttonFor already opens.
+    function buttonFor(glyph) {
+        var groups = [tools, pager]
+        for (var g = 0; g < groups.length; g++) {
+            var kids = groups[g].children
+            for (var i = 0; i < kids.length; i++) {
+                if (kids[i].glyph === glyph)
+                    return kids[i]
+            }
+        }
+        return null
+    }
+
+    Rectangle {
+        id: topBar
+        anchors.top: parent.top
+        anchors.left: parent.left
+        anchors.right: parent.right
+        height: Theme.chromeHeight
+        color: Theme.color.surface
+
+        Rectangle {
+            anchors.bottom: parent.bottom
+            anchors.left: parent.left
+            anchors.right: parent.right
+            height: Theme.spacing.hairline
+            color: Theme.color.foreground
+            opacity: 0.12
+        }
+
+        Flea.Glyph {
+            id: kindMark
+            anchors.left: parent.left
+            anchors.leftMargin: Theme.spacing.rowPaddingX
+            y: Math.round((parent.height - Theme.spacing.hairline - height) / 2)
+            // The chrome mark token, centred above the rule as theirs are, so the leading mark matches the buttons at the other end.
+            width: Theme.chromeMarkSize
+            height: Theme.chromeMarkSize
+            name: "file-text"
+            color: Theme.color.foreground
+        }
+
+        // corner: a filename is arbitrary text, so PlainText, the same rule every name on this surface follows.
+        Text {
+            id: nameText
+            anchors.left: kindMark.right
+            anchors.leftMargin: Theme.spacing.gap
+            anchors.verticalCenter: parent.verticalCenter
+            width: Math.min(implicitWidth, Math.max(0, tools.x - x - pager.implicitWidth - 2 * Theme.spacing.gap))
+            text: root.path.substring(root.path.lastIndexOf("/") + 1)
+            color: Theme.color.foreground
+            font.family: Theme.font.family
+            font.pixelSize: Theme.font.caption
+            textFormat: Text.PlainText
+            elide: Text.ElideRight
+        }
+
+        // MediaPdf rule 3: the count and the turn are one control, so they share the header the
+        // filename is already on, and rule 4 leaves a one-page document with the count alone, where
+        // two chevrons dead for the life of the document would be worse than absent.
+        Row {
+            id: pager
+            anchors.left: nameText.right
+            anchors.leftMargin: Theme.spacing.gap
+            anchors.verticalCenter: parent.verticalCenter
+            visible: root.pageCount > 0
+            spacing: Theme.spacing.gap
+
+            Flea.ChromeButton {
+                gesturePolicy: TapHandler.ReleaseWithinBounds
+                ruleRows: Theme.spacing.hairline
+                id: previous
+                glyph: "chevron-left"
+                accessName: "Previous page"
+                visible: root.pageCount > 1
+                width: visible ? implicitWidth : 0
+                keyboardFocused: root.activeFocus && root.pdfControlIndex === 0
+                enabled: root.page > 0
+                onActivated: root.turn(-1)
+            }
+
+            Text {
+                id: counter
+                height: previous.implicitHeight
+                verticalAlignment: Text.AlignVCenter
+                text: (pdf.drawnPage + 1) + " / " + root.pageCount
+                color: Theme.color.foreground
+                font.family: Theme.font.family
+                font.pixelSize: Theme.font.caption
+                textFormat: Text.PlainText
+            }
+
+            Flea.ChromeButton {
+                gesturePolicy: TapHandler.ReleaseWithinBounds
+                ruleRows: Theme.spacing.hairline
+                id: next
+                glyph: "chevron-right"
+                accessName: "Next page"
+                visible: root.pageCount > 1
+                width: visible ? implicitWidth : 0
+                keyboardFocused: root.activeFocus && root.pdfControlIndex === 1
+                enabled: root.page + 1 < root.pageCount
+                onActivated: root.turn(1)
+            }
+        }
+
+        Row {
+            id: tools
+            anchors.right: parent.right
+            anchors.rightMargin: Theme.spacing.rowPaddingX
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Theme.spacing.gap
+
+            Flea.ChromeButton {
+                gesturePolicy: TapHandler.ReleaseWithinBounds
+                ruleRows: Theme.spacing.hairline
+                id: zoomOut
+                glyph: "minus"
+                accessName: "Zoom out"
+                keyboardFocused: root.activeFocus && root.pdfControlIndex === 2
+                enabled: root.pageCount > 0 && root.zoom > root.minZoom
+                onActivated: root.zoomBy(-1)
+            }
+
+            Flea.ChromeButton {
+                gesturePolicy: TapHandler.ReleaseWithinBounds
+                ruleRows: Theme.spacing.hairline
+                id: zoomIn
+                glyph: "plus"
+                accessName: "Zoom in"
+                keyboardFocused: root.activeFocus && root.pdfControlIndex === 3
+                enabled: root.pageCount > 0 && root.zoom < root.maxZoom
+                onActivated: root.zoomBy(1)
+            }
+
+            Flea.ChromeButton {
+                gesturePolicy: TapHandler.ReleaseWithinBounds
+                ruleRows: Theme.spacing.hairline
+                id: expand
+                glyph: "maximize"
+                accessName: "Expand"
+                keyboardFocused: root.activeFocus && root.pdfControlIndex === 4
+                active: root.expanded
+                onActivated: root.toggleExpand()
+            }
+
+            Flea.ChromeButton {
+                gesturePolicy: TapHandler.ReleaseWithinBounds
+                ruleRows: Theme.spacing.hairline
+                id: close
+                glyph: "x"
+                accessName: "Close"
+                keyboardFocused: root.activeFocus && root.pdfControlIndex === 5
+                onActivated: root.closed()
+            }
+        }
+    }
+
+    Flickable {
+        id: pageFlick
+        anchors.top: topBar.bottom
+        anchors.bottom: parent.bottom
+        anchors.left: parent.left
+        anchors.right: parent.right
+        clip: true
+        // At zoom 1 the content is exactly the viewport, so a fitted page cannot be dragged at all.
+        contentWidth: width * root.zoom
+        contentHeight: height * root.zoom
+        boundsBehavior: Flickable.StopAtBounds
+
+        Flea.FastScrollHandler {
+            parent: pageFlick
+            flickable: pageFlick
+        }
+
+        Flea.ViewportScrollBars {
+            parent: pageFlick
+            flickable: pageFlick
+        }
+
+        Rectangle {
+            width: pageFlick.contentWidth
+            height: pageFlick.contentHeight
+            color: Theme.color.background
+
+            Flea.PreviewPdf {
+                id: pdf
+                anchors.fill: parent
+                anchors.margins: 2 * Theme.spacing.rowPaddingX
+                viewport: pageFlick
+                path: root.path
+                active: root.active
+                backend: root.backend
+                fetchFirst: root.fetchFirst
+                viewerSlot: root.viewerSlot
+            }
+        }
+    }
+
+    // The one sentence an unreadable document gets; without it the surface is simply blank.
+    Column {
+        anchors.centerIn: pageFlick
+        width: pageFlick.width - 2 * Theme.spacing.rowPaddingX
+        spacing: Theme.spacing.gap
+        visible: root.failed
+
+        Flea.Glyph {
+            anchors.horizontalCenter: parent.horizontalCenter
+            width: Theme.iconSize
+            height: Theme.iconSize
+            name: "alert"
+            color: Theme.color.error
+        }
+
+        Text {
+            width: parent.width
+            horizontalAlignment: Text.AlignHCenter
+            text: pdf.failSentence
+            color: Theme.color.foreground
+            font.family: Theme.font.family
+            font.pixelSize: Theme.font.caption
+            textFormat: Text.PlainText
+            wrapMode: Text.Wrap
+        }
+    }
+}

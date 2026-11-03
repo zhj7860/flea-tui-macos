@@ -1,0 +1,98 @@
+.import "../../ui/js/Format.js" as Format
+.import "sourcefixture.js" as Source
+
+// Highlight today's dates (Settings, View, ships off): on, today draws foreground and older stamps keep dimmed ink, with no relative words.
+
+function countRe(text, re) {
+    var found = text.match(re)
+    return found ? found.length : 0
+}
+
+// Built from local components, so the suite reads the same boundary in any timezone.
+function at(y, mo, d, h, mi, s) {
+    return new Date(y, mo - 1, d, h || 0, mi || 0, s || 0).getTime()
+}
+
+// The text of the date cell, from its id line to the brace that closes it.
+function dateBlock(row) {
+    var start = row.indexOf("id: modified\n")
+    var end = start < 0 ? -1 : row.indexOf("\n    }\n", start)
+    return start < 0 || end < 0 ? "" : row.slice(start, end)
+}
+
+function run(check) {
+    var noon = at(2026, 9, 23, 12, 0, 0)
+    var start = Format.dayStart(noon)
+    check("today starts at local midnight", start, at(2026, 9, 23, 0, 0, 0))
+    check("the start is the same all day",
+        Format.dayStart(at(2026, 9, 23, 23, 59, 59)), start)
+    check("and the next day starts a day later",
+        Format.dayStart(at(2026, 9, 24, 0, 0, 0)) - start, 24 * 60 * 60 * 1000)
+    // The boundary is the local wall clock and not UTC midnight: every stock timezone in this harness is off UTC.
+    check("local midnight is not UTC midnight",
+        start !== Date.UTC(2026, 8, 23, 0, 0, 0), true)
+    // The one-second boundary each side of it.
+    check("23:59:59 is yesterday",
+        Format.isRecent(at(2026, 9, 22, 23, 59, 59) / 1000, start), false)
+    check("00:00:00 is today",
+        Format.isRecent(at(2026, 9, 23, 0, 0, 0) / 1000, start), true)
+    check("midday is today",
+        Format.isRecent(at(2026, 9, 23, 12, 0, 0) / 1000, start), true)
+    // One boundary and not a band: a future stamp counts as recent too.
+    check("a future mtime counts as recent",
+        Format.isRecent(at(2026, 9, 24, 12, 0, 0) / 1000, start), true)
+    // The switch is Row's own binding; tests/rowcost.qml reads the drawn date color with it off and on.
+    // Rows without a real mtime never lift: ShareBrowser's share rows carry null.
+    check("a null mtime is never recent", Format.isRecent(null, start), false)
+    check("a missing mtime is never recent", Format.isRecent(undefined, start), false)
+    check("the epoch is not recent", Format.isRecent(0, start), false)
+    check("a non-number is never recent", Format.isRecent("noon", start), false)
+
+    // The midnight timer's one-shot: the ms to the next local midnight, re-armed on firing.
+    check("one second to midnight arms one second",
+        Format.msUntilMidnight(at(2026, 9, 23, 23, 59, 59)), 1000)
+    check("midnight arms the full day",
+        Format.msUntilMidnight(at(2026, 9, 23, 0, 0, 0)), 24 * 60 * 60 * 1000)
+    check("midday arms half a day",
+        Format.msUntilMidnight(at(2026, 9, 23, 12, 0, 0)), 12 * 60 * 60 * 1000)
+    check("a minute past midnight the start is the new day",
+        Format.dayStart(at(2026, 9, 24, 0, 1, 0)), at(2026, 9, 24, 0, 0, 0))
+    check("and re-arming there waits out the day",
+        Format.msUntilMidnight(at(2026, 9, 24, 0, 1, 0)), 24 * 60 * 60 * 1000 - 60000)
+
+    // One midnight timer for the whole window and one numeric compare per row, pinned against Row.qml's own date cell.
+    var row = Source.source("ui/Row.qml")
+    var viewState = Source.source("ui/ViewState.qml")
+    check("Row draws the today lift itself", countRe(row, /Format\.isRecent/g), 1)
+    check("Row compares against the window start",
+        row.indexOf("todayStart") >= 0, true)
+    check("Row reads the switch", row.indexOf("highlightToday") >= 0, true)
+    check("Row carries no standalone date import", row.indexOf("RecentDates") < 0, true)
+    // The source spells the switch-first ternary; the drawn colors are pinned in tests/rowcost.qml.
+    var dateColor = dateBlock(row)
+    check("the off path never enters the library",
+        dateColor.indexOf("(root.dateShown && ViewState.highlightToday && Format.isRecent(") >= 0, true)
+    check("no inverted switch survives", dateColor.indexOf("!ViewState.highlightToday") < 0, true)
+    check("no negated recency survives", dateColor.indexOf("!Format.isRecent") < 0, true)
+    check("today lifts to foreground, not the reverse",
+        dateColor.indexOf("? root.dimmed(Theme.color.foreground) : root.cellInk") >= 0, true)
+    check("the reverse lift is gone", dateColor.indexOf("? root.cellInk : root.dimmed(Theme.color.foreground)") < 0, true)
+    check("Row passes no switch into the library", dateColor.indexOf("isRecent(true,") < 0, true)
+    check("Row hands no mtime down", row.indexOf("mtime: root.row") < 0, true)
+    check("Row holds no timer of its own", countRe(row, /Timer\s*\{/g), 0)
+    check("Row builds no Date per row", countRe(row, /new Date/g), 0)
+    check("and reads no clock per row", row.indexOf("Date.now") < 0, true)
+    check("ViewState owns the one midnight timer", countRe(viewState, /Timer\s*\{/g), 1)
+    check("and that timer steps in minute stops, so a suspend still lands the day",
+        viewState.indexOf("Format.MINUTE_MS") >= 0, true)
+    check("ViewState carries no standalone date import", viewState.indexOf("RecentDates") < 0, true)
+    // Scoped to onHighlightTodayChanged's own body, so the same line in onTriggered cannot cover a deletion here.
+    var changedAt = viewState.indexOf("onHighlightTodayChanged")
+    var handlerBody = viewState.substring(changedAt, viewState.indexOf("}", viewState.indexOf("{", changedAt)))
+    check("and the switch restarts it outright",
+        handlerBody.indexOf("root.midnightTimer.running = root.highlightToday") >= 0, true)
+    check("the timer re-arms through the same helper",
+        viewState.indexOf("msUntilMidnight") >= 0, true)
+    check("the switch ships off",
+        viewState.indexOf("highlightToday === true") >= 0, true)
+}

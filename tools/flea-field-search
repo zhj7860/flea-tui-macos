@@ -1,0 +1,1905 @@
+#!/usr/bin/env python3
+"""Search-as-you-type field column: keystroke to the first and last frame in which a results region changes.
+
+  flea-field-search calibrate [--delays 0,50,200] [--runs 10]   prove the method against a client with a known delay
+  flea-field-search report JSONL                                median [min..max] tables and the self-pair spread
+  flea-field-search pickquery DIR [--flat]                      the fixed 6 character query of a column, with what it matches
+  flea-field-search explore ENTRANT DIR QUERY [options]         one run with an evidence picture, to learn an entrant's key
+  flea-field-search selftest                                    run the detector over built-in frame logs, no display
+  flea-field-search preflight                                   name every tool, socket and protocol file a run needs
+  flea-field-search measure JSON                                run a plan: see measure()'s docstring for its JSON
+
+The method in one line: framecap stamps the presented frames, keys are stamped before the write, and the detector reads the first change after a key and the last change before a quiet gap; tests/search-calib.qml proves it.
+Sample input, one recorder line: "F 660389861257350 660389874933379 32 95 126 0 1919 40" (presentation ns, received ns, changed rows, first row, last row, first column, last column, ink rows).
+"""
+import json
+import os
+import re
+import signal
+import socket
+import statistics
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+NS = 1_000_000_000
+LAUNCH_QUIET_NS = int(1.5 * NS)  # still time that counts a fresh window as loaded
+HEADER_WAIT_S = 10  # the longest a recorder may take to print its header before it is ended
+VISIBLE_ROWS = 25  # rows a results region shows at the least, in a short window
+HELD_ROWS = 300  # the filter holds 350 rows of a long folder and shows fewer; 300 stays inside the held window
+MS = 1_000_000
+QUIET_NS = 2 * NS  # silence after a key that counts a settle
+SETTLE_CAP_NS = 15 * NS  # a run still changing past this reads capped, never settled
+BUSY_WINDOW_NS = 50 * MS  # a change this close before the final key may own the first result
+OPEN_QUIET_NS = int(0.8 * NS)  # still time that counts a freshly opened window as loaded
+OPEN_CAP_NS = 4 * NS  # the longest an open waits for that quiet
+LAUNCH_CAP_NS = 30 * NS  # the longest a launch waits for its window to hold still
+MAP_WAIT_S = 60  # the longest a run waits for the entrant's window to map
+CLOSE_QUIET_NS = int(1.0 * NS)  # still time after Esc that counts the tree as closed
+CLOSE_CAP_NS = 6 * NS  # the longest Esc waits for that quiet
+MEM_SETTLE_SLEEP_S = 3.0  # still time after Esc before the after-close snapshot, so reaped pages land
+QUERY_COUNT_MIN = 20  # fewest substring matches a column query may have and still read at depths
+QUERY_COUNT_MAX = 2000  # most substring matches before the query reads as noise
+GAP_P95 = 0.95  # the attach-gap percentile reported beside the max
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+
+# Detector: pure functions over (presentation_ns, changed_rows) pairs, so a recorded log can be re-read.
+
+
+MIN_INK = 8  # rows holding more than one colour that make a frame show a result row (a text line is taller)
+
+
+def changes_of(frames):
+    """The presentation times of the frames that differ from the frame before, in order."""
+    return [f[0] for f in frames if f[1] > 0]
+
+
+def result_changes_of(frames, min_ink=MIN_INK):
+    """The changed frames that show a result row: a blank or flat frame never counts first, and a frame with no ink count counts."""
+    return [f[0] for f in frames if f[1] > 0 and (len(f) < 3 or f[2] < 0 or f[2] >= min_ink)]
+
+
+def first_change_after(changes, t_key):
+    """The first change strictly after t_key, or None."""
+    for t in changes:
+        if t > t_key:
+            return t
+    return None
+
+
+def settle_after(changes, t_key, quiet_ns, end_ns, cap_ns):
+    """The last change before a quiet gap of quiet_ns from t_key; a run still changing past cap_ns reports the cap, flagged capped."""
+    last = None
+    for t in changes:
+        if t <= t_key:
+            continue
+        if t - t_key > cap_ns:
+            return t_key + cap_ns, True
+        if last is not None and t - last >= quiet_ns:
+            return last, False
+        last = t
+    if last is None:
+        return None, False
+    if end_ns - last >= quiet_ns:
+        return last, False
+    return t_key + cap_ns, True
+
+
+def search_columns(frames, key_times, end_ns, quiet_ns=QUIET_NS, cap_ns=SETTLE_CAP_NS):
+    """The per-search numbers: per-key first change and, for the final key, the settle."""
+    changes = changes_of(frames)
+    shown = result_changes_of(frames)
+    per_key = []
+    for i, tk in enumerate(key_times):
+        nxt = key_times[i + 1] if i + 1 < len(key_times) else None
+        t = first_change_after(shown, tk)
+        # A change that lands after the next key belongs to the next key's account; None says nothing came in time.
+        per_key.append(None if t is None or (nxt is not None and t > nxt) else round((t - tk) / MS, 1))
+    final = key_times[-1]
+    first = first_change_after(shown, final)
+    blanks = len([t for t in changes if t > final and (first is None or t < first)])
+    settled, capped = settle_after(changes, final, quiet_ns, end_ns, cap_ns)
+    # Rows still changing at the final key mean the first change may belong to an earlier key's late results.
+    before = [t for t in changes if t <= final]
+    busy = bool(before) and final - before[-1] < BUSY_WINDOW_NS
+    return {
+        "per_key_first_ms": per_key,
+        "first_ms": None if first is None else round((first - final) / MS, 1),
+        "settled_ms": None if settled is None else round((settled - final) / MS, 1),
+        "capped": capped,
+        "busy_at_final_key": busy,
+        "changes_after_final": len([t for t in changes if t > final]),
+        "blank_frames_skipped": blanks,
+    }
+
+
+# Input: linux input_event structs to the ydotool daemon's datagram socket, the bytes ydotool itself writes.
+
+KEYCODES = {
+    "esc": 1, "1": 2, "2": 3, "3": 4, "4": 5, "5": 6, "6": 7, "7": 8, "8": 9, "9": 10, "0": 11, "-": 12, "=": 13,
+    "backspace": 14, "tab": 15, "q": 16, "w": 17, "e": 18, "r": 19, "t": 20, "y": 21, "u": 22, "i": 23, "o": 24,
+    "p": 25, "enter": 28, "ctrl": 29, "a": 30, "s": 31, "d": 32, "f": 33, "g": 34, "h": 35, "j": 36, "k": 37,
+    "l": 38, "shift": 42, "z": 44, "x": 45, "c": 46, "v": 47, "b": 48, "n": 49, "m": 50, ",": 51, ".": 52, "/": 53,
+    "space": 57, "up": 103, "down": 108, "left": 105, "right": 106, "alt": 56,
+}
+SHIFTED = {"_": "-", "+": "="}  # the characters a query may hold that need shift on a US layout
+EV_KEY, EV_SYN = 1, 0
+
+
+def ydotool_socket():
+    """The ydotool socket: $YDOTOOL_SOCKET, else .ydotool_socket under $XDG_RUNTIME_DIR or /run/user/<uid>."""
+    return os.environ.get("YDOTOOL_SOCKET") or os.path.join(
+        os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid(), ".ydotool_socket")
+
+
+class Keys:
+    def __init__(self, path=None):
+        path = path or ydotool_socket()
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        self.sock.connect(path)
+
+    def _event(self, etype, code, value):
+        self.sock.send(struct.pack("16xHHi", etype, code, value))
+
+    def _key(self, code, value):
+        self._event(EV_KEY, code, value)
+        self._event(EV_SYN, 0, 0)
+
+    def chord(self, *names):
+        """Press the names in order, release them in reverse; returns the CLOCK_MONOTONIC ns just before the last key-down."""
+        codes = [KEYCODES[n] for n in names]
+        for c in codes[:-1]:
+            self._key(c, 1)
+        t = time.monotonic_ns()
+        self._key(codes[-1], 1)
+        self._key(codes[-1], 0)
+        for c in reversed(codes[:-1]):
+            self._key(c, 0)
+        return t
+
+    def type_char(self, ch):
+        if ch in SHIFTED:
+            return self.chord("shift", SHIFTED[ch])
+        if ch.isupper():
+            return self.chord("shift", ch.lower())
+        return self.chord(ch)
+
+
+# Session: Hyprland, windows, the recorder.
+
+
+def session_env():
+    """The environment a graphical call needs, rebuilt when this shell came from ssh."""
+    env = dict(os.environ)
+    run = env["XDG_RUNTIME_DIR"] = env.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
+    if not env.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        sigs = sorted(os.listdir(os.path.join(run, "hypr")), key=lambda s: os.stat(os.path.join(run, "hypr", s)).st_mtime)
+        env["HYPRLAND_INSTANCE_SIGNATURE"] = sigs[-1]
+    if not env.get("WAYLAND_DISPLAY"):
+        socks = sorted(n for n in os.listdir(run) if n.startswith("wayland-") and not n.endswith(".lock"))
+        env["WAYLAND_DISPLAY"] = socks[0]
+    return env
+
+
+ENV = None
+
+
+def hypr(*args):
+    return subprocess.run(["hyprctl", *args], env=ENV, capture_output=True, text=True, timeout=10).stdout
+
+
+def clients():
+    return json.loads(hypr("-j", "clients"))
+
+
+def monitor():
+    m = json.loads(hypr("-j", "monitors"))[0]
+    return m
+
+
+def dispatch(expr):
+    out = hypr("dispatch", expr).strip()
+    if out != "ok":
+        raise RuntimeError("hyprctl dispatch %s answered %r, not ok" % (expr, out))
+
+
+def park_cursor():
+    """The pointer goes to the top right corner, outside every window, so it never changes a watched region."""
+    m = monitor()
+    dispatch("hl.dsp.cursor.move({ x = %d, y = 4 })" % (m["x"] + m["width"] - 4))
+
+
+def hide_cursor(keys, settle_s=0.3):
+    """A bare Shift tap, so Hyprland's hide_on_key_press commit never takes the recorder frame of a timed key."""
+    keys.chord("shift")
+    time.sleep(settle_s)
+
+
+def frames_before_result(frames, t_key, t_first):
+    """The recorder frames after the key and before the first result frame, each a commit that was not the result."""
+    return len([f for f in frames if t_key < f[0] < t_first])
+
+
+def focus_window(address):
+    dispatch('hl.dsp.focus({ window = "address:%s" })' % address)
+
+
+def window_by_pid(pids, deadline_s=30):
+    """The first mapped client owned by one of pids; waits up to deadline_s."""
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < deadline_s:
+        for c in clients():
+            if c.get("pid") in pids and c.get("mapped", True):
+                return c
+        time.sleep(0.02)
+    return None
+
+
+# Sample input, a children file: "1234 5678" (space-separated pids).
+def descendants(pid):
+    """pid and everything under it, read from /proc."""
+    out, queue = {pid}, [pid]
+    while queue:
+        p = queue.pop()
+        try:
+            for t in os.listdir("/proc/%d/task" % p):
+                with open("/proc/%d/task/%s/children" % (p, t)) as f:
+                    for k in f.read().split():
+                        if int(k) not in out:
+                            out.add(int(k))
+                            queue.append(int(k))
+        except OSError:
+            pass
+    return out
+
+
+def recorder_argv(binary, region, masks, dump_prefix, dump_rect):
+    """The flea-framecap command line; each mask goes to it as -m, so masked changes never reach the log."""
+    cmd = [binary, "-r", "%d,%d,%d,%d" % region]
+    for m in masks:
+        cmd += ["-m", "%d,%d,%d,%d" % m]
+    if dump_prefix:
+        cmd += ["-d", dump_prefix, "-w", "%d,%d,%d,%d" % dump_rect]
+    return cmd
+
+
+class Recorder:
+    """tools/flea-framecap as a child process whose lines are read as they arrive."""
+
+    def __init__(self, binary, region, masks=(), dump_prefix=None, dump_rect=None):
+        self.dump_rect = dump_rect or region
+        cmd = recorder_argv(binary, region, masks, dump_prefix, self.dump_rect)
+        self.frames = []
+        self.detail = []
+        self.dumps = []
+        self.header = None
+        self.malformed = 0
+        self.unstamped = 0
+        self.lock = threading.Lock()
+        self.proc = subprocess.Popen(cmd, env=ENV, stdout=subprocess.PIPE, text=True, bufsize=1)
+        self.thread = threading.Thread(target=self._read, daemon=True)
+        self.thread.start()
+        t0 = time.monotonic()
+        while self.header is None:
+            if self.proc.poll() is not None or time.monotonic() - t0 > HEADER_WAIT_S:
+                code = self.proc.poll()
+                self.stop()  # a recorder alive without a header is not left running behind the refusal
+                raise RuntimeError("the recorder gave no header (exit %s)" % code)
+            time.sleep(0.01)
+
+    # Sample input, one recorder line: "F <presentation ns> <received ns> <changed> <first> <last> <col> <col> <ink>" (8 values).
+    def _read(self):
+        for line in self.proc.stdout:
+            f = line.split()
+            with self.lock:
+                if f and f[0] == "F":
+                    try:
+                        if len(f) != 9:
+                            raise ValueError("an F line holds 8 values, this one holds %d" % (len(f) - 1))
+                        frame, detail = (int(f[1]), int(f[3]), int(f[8])), tuple(int(v) for v in f[1:])
+                        if frame[0] == 0:  # the recorder's mark for a frame the compositor sent without a presentation time
+                            self.unstamped += 1
+                        else:
+                            self.frames.append(frame)
+                            self.detail.append(detail)
+                    except ValueError:
+                        self.malformed += 1
+                elif f and f[0] == "H":
+                    self.header = f[1:]
+                elif f and f[0] == "D":
+                    self.dumps.append(f[1])
+
+    def _refuse_unstamped(self):
+        if self.unstamped:
+            raise RuntimeError("the recorder saw %d frames with no presentation time" % self.unstamped)
+
+    def snapshot(self):
+        with self.lock:
+            self._refuse_unstamped()
+            return list(self.frames)
+
+    def detail_snapshot(self):
+        with self.lock:
+            self._refuse_unstamped()
+            return list(self.detail)
+
+    def last_change(self):
+        with self.lock:
+            for t, rows, _ in reversed(self.frames):
+                if rows > 0:
+                    return t
+        return None
+
+    def wait_quiet(self, quiet_ns, since_ns, cap_ns):
+        """Block until no change for quiet_ns after since_ns, or cap_ns passed since since_ns. Returns True on quiet."""
+        while True:
+            now = time.monotonic_ns()
+            last = self.last_change()
+            ref = since_ns if last is None or last < since_ns else last
+            if now - ref >= quiet_ns:
+                return True
+            if now - since_ns >= cap_ns:
+                return False
+            time.sleep(0.01)
+
+    def boxes(self, region, masks):
+        """Outlines for the dump: green is the watched region, red the masks, in the dump's own coordinates."""
+        ox, oy = self.dump_rect[0], self.dump_rect[1]
+        out = [((region[0] - ox, region[1] - oy, region[2], region[3]), (0, 255, 0))]
+        out += [((m[0] - ox, m[1] - oy, m[2], m[3]), (255, 0, 0)) for m in masks]
+        return out
+
+    def dump(self, timeout=5):
+        n = len(self.dumps)
+        self.proc.send_signal(signal.SIGUSR1)
+        t0 = time.monotonic()
+        while len(self.dumps) == n and time.monotonic() - t0 < timeout:
+            time.sleep(0.01)
+        return self.dumps[-1] if len(self.dumps) > n else None
+
+    def stop(self):
+        self.proc.terminate()
+        try:
+            self.proc.wait(5)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+        if self.malformed:
+            print("flea-field-search: the recorder dropped %d malformed lines" % self.malformed, file=sys.stderr)
+
+
+def build_recorder(workdir):
+    out = subprocess.run([os.path.join(HERE, "flea-framecap-build"), workdir], capture_output=True, text=True)
+    if out.returncode != 0:
+        raise RuntimeError(out.stderr.strip())
+    return out.stdout.strip()
+
+
+# Pictures: a recorder dump (P6) as a PNG, with the regions drawn on it, for the evidence a number stands on.
+
+
+# Sample input, a dump head: b"P6\n800 600\n255\n" then w*h*3 raw RGB bytes.
+def read_ppm(path):
+    with open(path, "rb") as f:
+        data = f.read()
+    parts = data.split(b"\n", 3)
+    w, h = (int(v) for v in parts[1].split())
+    return w, h, bytearray(parts[3])
+
+
+def draw_box(buf, w, h, rect, rgb, thick=3):
+    """An outline of rect (x, y, rw, rh) in region coordinates onto an RGB buffer."""
+    x, y, rw, rh = rect
+    for t in range(thick):
+        for xx in range(max(0, x), min(w, x + rw)):
+            for yy in (y + t, y + rh - 1 - t):
+                if 0 <= yy < h:
+                    i = (yy * w + xx) * 3
+                    buf[i:i + 3] = bytes(rgb)
+        for yy in range(max(0, y), min(h, y + rh)):
+            for xx in (x + t, x + rw - 1 - t):
+                if 0 <= xx < w:
+                    i = (yy * w + xx) * 3
+                    buf[i:i + 3] = bytes(rgb)
+
+
+def write_png(path, w, h, buf):
+    import zlib
+    raw = bytearray()
+    for y in range(h):
+        raw.append(0)
+        raw += buf[y * w * 3:(y + 1) * w * 3]
+
+    def chunk(tag, body):
+        c = struct.pack(">I", len(body)) + tag + body
+        return c + struct.pack(">I", zlib.crc32(tag + body) & 0xFFFFFFFF)
+
+    with open(path, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(bytes(raw), 1)) + chunk(b"IEND", b""))
+
+
+def ppm_to_png(ppm, png, boxes=()):
+    """boxes: (rect relative to the dump, (r, g, b)) outlines, drawn so a reader sees what was watched."""
+    w, h, buf = read_ppm(ppm)
+    for rect, rgb in boxes:
+        draw_box(buf, w, h, rect, rgb)
+    write_png(png, w, h, buf)
+    os.unlink(ppm)
+
+
+# Entrants: regions in window coordinates, the watched (x, y, w, h) and its masked rectangles, see REPORT-search.md.
+
+FLEA_CLASS = "com.thisisgm.flea"
+TUI_CLASS = "flea-bench-kitty"
+
+
+def margins(top=0, bottom=0, left=0, right=0):
+    return lambda w, h: (left, top, w - left - right, h - top - bottom)
+
+
+def no_masks(w, h):
+    return []
+
+
+# kind, typing, open ([] types straight into the window), close: a chord is a list of key names.
+ENTRANTS = {
+    "flea": dict(kind="recursive fuzzy, ranked", cls=FLEA_CLASS, open=[["f"]], close=[["esc"]],
+                 region=margins(top=56, bottom=34, left=192), masks=no_masks, filter_open=[["/"]], filter_close=[["esc"]],
+                 filter_kind="in-folder filter (/), narrows the rows"),
+    "nautilus": dict(kind="recursive substring (type to search)", cls="org.gnome.Nautilus", open=[], close=[["esc"]],
+                     region=margins(top=61, left=242), masks=no_masks, filter_open=[], filter_close=[["esc"]],
+                     filter_kind="none in-folder: typing opens the recursive search"),
+    "thunar": dict(kind="recursive substring (Ctrl+F search)", cls="thunar", open=[["ctrl", "f"]], close=[["esc"]],
+                   region=margins(top=95, left=172, bottom=32), masks=no_masks, filter_open=[], filter_close=[["esc"]],
+                   filter_kind="type-ahead find (GTK): selects a row, never narrows"),
+    "nemo": dict(kind="recursive filename search (Ctrl+F)", cls="nemo", open=[["ctrl", "f"]], close=[["esc"]],
+                 region=margins(top=165, left=172, bottom=45), masks=no_masks, filter_open=[], filter_close=[["esc"]],
+                 filter_kind="type-ahead find (GTK): selects a row, never narrows"),
+    "dolphin": dict(kind="indexed (Baloo) search bar (Ctrl+F)", cls="org.kde.dolphin", open=[["ctrl", "f"]],
+                    close=[["esc"]], region=margins(top=125, left=150, bottom=32), masks=no_masks,
+                    filter_open=[["ctrl", "i"]], filter_close=[["esc"]],
+                    filter_region=margins(top=40, left=150, bottom=30),
+                    filter_kind="filter bar (Ctrl+I), narrows the rows"),
+    "strata": dict(kind="recursive fuzzy (Ctrl+K)", cls="io.github.lgse.Strata", open=[["ctrl", "k"]],
+                   close=[["esc"]], region=margins(top=100, left=0, bottom=30), masks=no_masks,
+                   filter_open=[["ctrl", "f"]], filter_close=[["esc"]],
+                   filter_kind="pane filter (Ctrl+F), narrows the rows"),
+    "yazi-z": dict(kind="recursive fuzzy (z, fzf)", cls=TUI_CLASS, open=[["z"]], close=[["esc"]],
+                   region=margins(top=25, bottom=50), masks=no_masks, tui=True,
+                   filter_open=[["f"]], filter_close=[["esc"]],
+                   filter_kind="in-folder filter (f), narrows the rows"),
+    "broot": dict(kind="recursive fuzzy tree filter", cls=TUI_CLASS, open=[], close=[["esc"]],
+                  region=margins(top=0, bottom=50), masks=no_masks, tui=True, filter_open=[], filter_close=[["esc"]],
+                  filter_kind="the same tree filter, over the whole tree"),
+    "pcmanfm": dict(kind="none (no search as you type)", cls="pcmanfm", open=[], close=[["esc"]],
+                    region=margins(top=100, left=200), masks=no_masks, filter_open=[], filter_close=[["esc"]],
+                    filter_kind="none"),
+}
+
+
+def flea_state(ctx, arm):
+    """A state directory holding Flea's shipped defaults and the arm's view, made once per (tree, view)."""
+    view = arm.get("view", "list")
+    key = (arm["flea_dir"], view)
+    if key not in ctx["states"]:
+        d = tempfile.mkdtemp(prefix="flea-search-state-")
+        os.makedirs(d + "/no-config", exist_ok=True)
+        patch = json.dumps({"sort": {"key": "name", "reverse": False}, "view": view})
+        subprocess.run([arm["flea_dir"] + "/target/release/flea", "--ui-state", patch],
+                       env=dict(ENV, XDG_STATE_HOME=d, XDG_CONFIG_HOME=d + "/no-config"), capture_output=True, check=True)
+        ctx["states"][key] = d
+    return ctx["states"][key]
+
+
+STRATA_V021 = "/home/flea-sandbox/strata-0210/target/release/strata"  # v0.21.0, the newest stable release
+
+
+def strata_bin():
+    """Strata's binary: STRATA_BIN or the v0.21.0 build. The v0.19.0 checkout under Work/ is refused, never used."""
+    path = os.environ.get("STRATA_BIN", STRATA_V021)
+    if "/Work/strata" in os.path.realpath(path):
+        raise SystemExit("STRATA_BIN names the v0.19.0 checkout (%s); use %s" % (path, STRATA_V021))
+    return path
+
+
+def entrant_argv(arm, fixture, ctx):
+    """(argv, extra environment) for one arm. ctx carries the flea trees, the TUI config and the state directory."""
+    e = arm["entrant"]
+    if e == "flea":
+        tree = arm["flea_dir"]
+        # Each arm compiles into its own tree, as tools/flea-field-bench does, so the shared QML cache directory never grows.
+        env = {"FLEA_BIN": tree + "/target/release/flea", "FLEA_UI": tree + "/ui", "XDG_STATE_HOME": flea_state(ctx, arm),
+               "QML_DISK_CACHE_PATH": tree + "/target/qmlcache"}
+        os.makedirs(env["QML_DISK_CACHE_PATH"], exist_ok=True)
+        return [env["FLEA_BIN"], "--gui", fixture], env
+    if e == "nautilus":
+        return ["nautilus", "--new-window", fixture], {}
+    if e == "dolphin":
+        # Dolphin's session restore is off through tools/xdg-dolphin, leaving ~/.config alone.
+        xdg = os.path.join(HERE, "xdg-dolphin")
+        if not os.path.isfile(os.path.join(xdg, "dolphinrc")):
+            raise SystemExit("the dolphin arm needs %s/dolphinrc, and it is missing" % xdg)
+        return [e, fixture], {"XDG_CONFIG_DIRS": xdg + ":" + os.environ.get("XDG_CONFIG_DIRS", "/etc/xdg")}
+    if e in ("thunar", "nemo", "pcmanfm"):
+        return [e, fixture], {}
+    if e == "strata":
+        return [strata_bin(), fixture], {}
+    tui = ["kitty", "--class", TUI_CLASS, "-o", "cursor_blink_interval=0"]
+    env = {"XDG_CONFIG_HOME": ctx["tui_conf"]}
+    if e == "yazi-z":
+        return tui + ["yazi", fixture], env
+    if e == "broot":
+        return tui + ["broot", fixture], env
+    raise SystemExit("no launch line for entrant " + e)
+
+
+# comm, cmdline token, the same table as tools/flea-field-bench's KILL_TARGETS; a bare qs is never matched.
+KILL_TARGETS = [("qs", "/ui"), ("flea", "--backend"), ("kitty", "--class " + TUI_CLASS), ("nautilus", ""),
+                ("org.gnome.Nauti", ""), ("thunar", ""), ("tumblerd", ""), ("pcmanfm", ""), ("nemo", ""),
+                ("dolphin", ""), ("strata", ""), ("yazi", ""), ("broot", ""), ("fzf", ""), ("localsearch-3", ""),
+                ("localsearch-ext", ""), ("hyprland-dialog", "")]
+
+
+def pids_for(comm, token=""):
+    out = []
+    for p in subprocess.run(["pgrep", "-x", comm], capture_output=True, text=True).stdout.split():
+        try:
+            with open("/proc/%s/cmdline" % p) as f:
+                cmd = f.read().replace("\0", " ")
+        except OSError:
+            continue
+        if not token or token in cmd:
+            out.append(int(p))
+    return out
+
+
+# The ui directories of the Flea trees this run launches; qs is matched by them and never bare.
+UI_TOKENS = []
+
+
+def alive_targets():
+    out = []
+    for c, t in KILL_TARGETS:
+        if c == "qs":
+            out += [(c, p) for tok in UI_TOKENS for p in pids_for(c, tok)]
+        else:
+            out += [(c, p) for p in pids_for(c, t)]
+    return out
+
+
+# Control groups, memory and frame gaps.
+
+
+# Sample input, one /proc/self/cgroup line: "0::/user.slice/user-1000.slice/session-3.scope" (hierarchy, controllers, path).
+def own_cgroup():
+    with open("/proc/self/cgroup") as f:
+        return "/sys/fs/cgroup" + f.read().strip().split(":", 2)[2]
+
+
+SCOPE_UNIT = "flea-field-search"  # substring the delegated scope's cgroup path carries
+
+
+def ensure_scope():
+    """Re-enter this tool under systemd-run --user --scope -p Delegate=yes, as tools/flea-field-bench does."""
+    with open("/proc/self/cgroup") as f:
+        cg = f.read()
+    if SCOPE_UNIT + "-" in cg and ".scope" in cg:
+        return False
+    if os.environ.get("FLEA_SEARCH_REENTERED"):
+        print("flea-field-search: re-entry did not land in a scope of its own, CPU is refused", file=sys.stderr)
+        return True
+    os.environ["FLEA_SEARCH_REENTERED"] = "1"
+    try:
+        os.execvp("systemd-run", ["systemd-run", "--user", "--scope", "--quiet", "-p", "Delegate=yes",
+                                  "--unit=%s-%d" % (SCOPE_UNIT, os.getpid()), "--",
+                                  sys.executable, os.path.abspath(__file__), *sys.argv[1:]])
+    except OSError as e:
+        print("flea-field-search: no delegated scope (%s), CPU is refused" % e, file=sys.stderr)
+        return True
+    return True
+
+
+class Leaf:
+    """A control group of one run, so CPU is read from cpu.stat whatever the entrant forks. Without a delegated scope the leaf stays None and the row refuses CPU; ticks never stand in."""
+
+    def __init__(self, name):
+        self.path = None
+        base = own_cgroup()
+        if os.access(base, os.W_OK) and "flea-field-search" in base:
+            p = os.path.join(base, "run-" + name)
+            os.makedirs(p, exist_ok=True)
+            self.path = p
+
+    def join_in_child(self):
+        path = self.path
+
+        def f():
+            if path:
+                with open(path + "/cgroup.procs", "w") as g:
+                    g.write(str(os.getpid()))
+        return f
+
+    def pids(self):
+        if not self.path:
+            return []
+        try:
+            with open(self.path + "/cgroup.procs") as f:
+                return [int(v) for v in f.read().split()]
+        except OSError:
+            return []
+
+    # Sample input, one cpu.stat line: "usage_usec 123456789" (key, microseconds).
+    def usage_s(self):
+        if not self.path:
+            return None
+        with open(self.path + "/cpu.stat") as f:
+            for line in f:
+                k, v = line.split()
+                if k == "usage_usec":
+                    return int(v) / 1e6
+        return None
+
+    def kill(self):
+        if self.path:
+            try:
+                with open(self.path + "/cgroup.kill", "w") as f:
+                    f.write("1")
+            except OSError:
+                pass
+            for _ in range(100):
+                if not self.pids():
+                    break
+                time.sleep(0.1)
+            try:
+                os.rmdir(self.path)
+            except OSError:
+                pass
+
+
+# Sample input, one smaps_rollup line: "Pss: 1234 kB" (key, value, unit).
+def smaps(pid):
+    """Pss, Pss_Anon and USS in kB from /proc/pid/smaps_rollup, or None."""
+    try:
+        with open("/proc/%d/smaps_rollup" % pid) as f:
+            kv = {}
+            for line in f:
+                k, _, v = line.partition(":")
+                parts = v.split()
+                if parts:
+                    kv[k] = int(parts[0])
+        with open("/proc/%d/comm" % pid) as f:
+            comm = f.read().strip()
+        return {"pid": pid, "comm": comm, "pss_kb": kv.get("Pss", 0), "pss_anon_kb": kv.get("Pss_Anon", 0),
+                "uss_kb": kv.get("Private_Clean", 0) + kv.get("Private_Dirty", 0)}
+    except OSError:
+        return None
+
+
+def mem_snapshot(pids):
+    rows = [r for r in (smaps(p) for p in sorted(pids)) if r]
+    return {"procs": rows, "pss_kb": sum(r["pss_kb"] for r in rows), "pss_anon_kb": sum(r["pss_anon_kb"] for r in rows),
+            "uss_kb": sum(r["uss_kb"] for r in rows)}
+
+
+# Sample input, one WAYLAND_DEBUG=client line: "[15:15:36.027928] {mesa vk display queue}  -> wl_surface#37.attach(wl_buffer#81, 0, 0)" (a time of day, put on the monotonic clock through the offset read now).
+def attach_gaps(lines, t0_ns, t1_ns, rt_minus_mono_ns=None):
+    """Largest and p95 gap, in ms, between buffer attaches of the busiest wl_surface between t0 and t1."""
+    rx = re.compile(r"^\[\s*([0-9:.]+)\]\s+(?:\{[^}]*\}\s+)?->\s+wl_surface[@#](\d+)\.attach\(wl_buffer[@#]\d+")
+    if rt_minus_mono_ns is None:
+        rt_minus_mono_ns = time.time_ns() - time.monotonic_ns()
+    day = 86400 * NS
+    utc_midnight = (t0_ns + rt_minus_mono_ns) // day * day
+    local_off = time.localtime().tm_gmtoff * NS
+    per = {}
+    for line in lines:
+        m = rx.match(line)
+        if not m:
+            continue
+        stamp = m.group(1)
+        if ":" in stamp:
+            h, mi, sec = stamp.split(":")
+            sod = (int(h) * 3600 + int(mi) * 60) * NS + int(round(float(sec) * NS))
+            cands = [utc_midnight + k * day - off + sod for k in (-1, 0, 1) for off in (0, local_off)]
+            t = min(cands, key=lambda c: abs(c - rt_minus_mono_ns - t0_ns)) - rt_minus_mono_ns
+        else:
+            # Sample input, the older libwayland bracket: "[1234567.890]" (CLOCK_REALTIME microseconds modulo 2^32 as milliseconds.microseconds).
+            ms_part, _, us_part = stamp.partition(".")
+            us = int(ms_part) * 1000 + int(us_part or 0)
+            wrap = (1 << 32) * 1000
+            base = t0_ns + rt_minus_mono_ns
+            q0 = base // wrap
+            t = min(((q0 + k) * wrap + us * 1000 for k in (-1, 0, 1)), key=lambda c: abs(c - base)) - rt_minus_mono_ns
+        if t0_ns <= t <= t1_ns:
+            per.setdefault(m.group(2), []).append(t)
+    if not per:
+        return None
+    ts = sorted(max(per.values(), key=len))
+    # The first gap is key to first attach and the last is attach to the end of the window, so both ends are counted.
+    edges = [t0_ns] + ts + [t1_ns]
+    gaps = sorted((b - a) / 1e6 for a, b in zip(edges, edges[1:]))
+    p95 = gaps[min(len(gaps) - 1, int(GAP_P95 * len(gaps)))]
+    return {"attaches": len(ts), "max_gap_ms": round(gaps[-1], 1), "p95_gap_ms": round(p95, 1)}
+
+
+# One arm, one run: launch, wait until quiet, then a fresh search for every length.
+
+
+def clean_all(leaf=None):
+    """End the run's leaf, then everything in KILL_TARGETS, TERM first and KILL after five seconds."""
+    if leaf:
+        leaf.kill()
+    for attempt in range(100):
+        left = alive_targets()
+        if not left:
+            break
+        for _, p in left:
+            try:
+                os.kill(p, signal.SIGTERM if attempt < 50 else signal.SIGKILL)
+            except OSError:
+                pass
+        time.sleep(0.1)
+    time.sleep(0.2)
+
+
+def require_idle():
+    left = alive_targets()
+    if left:
+        raise SystemExit("flea-field-search: %s already running, and this run would end them; refusing to start" % left)
+
+
+def type_keys(keys, text, pace_s):
+    """Type text at pace_s a key on an absolute schedule; the CLOCK_MONOTONIC ns of each key."""
+    times = []
+    start = time.monotonic_ns()
+    for i, ch in enumerate(text):
+        due = start + int(i * pace_s * 1e9)
+        while time.monotonic_ns() < due - 2_000_000:
+            time.sleep(0.001)
+        while time.monotonic_ns() < due:
+            pass
+        times.append(keys.type_char(ch))
+    return times
+
+
+def run_chords(keys, chords):
+    t = None
+    for c in chords:
+        t = keys.chord(*c)
+        time.sleep(0.05)
+    return t
+
+
+def run_arm(arm, fixture, query, ctx, opts):
+    """Everything one launch of one arm measures. Returns one dict per query length (and per mode)."""
+    spec = ENTRANTS[arm["entrant"]]
+    keys = ctx["keys"]
+    mode = opts.get("mode", "search")
+    open_chords = spec["open"] if mode == "search" else spec["filter_open"]
+    close_chords = spec["close"] if mode == "search" else spec["filter_close"]
+    lengths = opts.get("lengths", [1, 3, 6])
+    pace = opts.get("pace_ms", 180) / 1000.0
+    leaf = Leaf("%s-%s" % (arm["id"], opts.get("tag", "r")))
+    argv, extra = entrant_argv(arm, fixture, ctx)
+    env = dict(ENV, **extra)
+    errlog = None
+    if arm.get("wl_debug"):
+        env["WAYLAND_DEBUG"] = "client"
+        errlog = open(os.path.join(ctx["out_dir"], "%s-%s.wl" % (arm["id"], opts.get("tag", "r"))), "w")
+    clean_all()
+    proc = subprocess.Popen(argv, env=env, stdout=subprocess.DEVNULL, stderr=errlog or subprocess.DEVNULL,
+                            start_new_session=True, preexec_fn=leaf.join_in_child())
+    rows = []
+    rec = None
+    try:
+        win = None
+        t0 = time.monotonic()
+        while win is None and time.monotonic() - t0 < MAP_WAIT_S:
+            owned = set(leaf.pids()) | descendants(proc.pid)
+            for c in clients():
+                if c.get("class") == spec["cls"] and (c.get("pid") in owned or not leaf.path):
+                    win = c
+                    break
+            time.sleep(0.02)
+        if win is None:
+            return [{"arm": arm["id"], "error": "no window of class %s mapped in 60 s" % spec["cls"]}]
+        focus_window(win["address"])
+        park_cursor()
+        time.sleep(0.5)
+        win = [c for c in clients() if c["address"] == win["address"]][0]
+        (wx, wy), (ww, wh) = win["at"], win["size"]
+        rx, ry, rw, rh = spec.get("filter_region", spec["region"])(ww, wh) if mode == "filter" else spec["region"](ww, wh)
+        region = (wx + rx, wy + ry, rw, rh)
+        masks = [(wx + a, wy + b, c, d) for (a, b, c, d) in spec["masks"](ww, wh)]
+        dump_dir = os.path.join(ctx["out_dir"], "dump-%s-%s" % (arm["id"], opts.get("tag", "r")))
+        os.makedirs(dump_dir, exist_ok=True)
+        rec = Recorder(ctx["rec_bin"], region, masks, os.path.join(dump_dir, "d"), (wx, wy, ww, wh))
+        # The window is loaded when its results region holds still for LAUNCH_QUIET_NS.
+        settled_launch = rec.wait_quiet(LAUNCH_QUIET_NS, time.monotonic_ns(), LAUNCH_CAP_NS)
+        pids_now = lambda: set(leaf.pids()) | descendants(proc.pid)
+        for length in lengths:
+            text = query[:length]
+            run_chords(keys, open_chords)
+            if open_chords:
+                rec.wait_quiet(OPEN_QUIET_NS, time.monotonic_ns(), OPEN_CAP_NS)
+            cpu0 = leaf.usage_s() if leaf.path else None
+            t_start = time.monotonic_ns()
+            key_times = type_keys(keys, text, pace)
+            final = key_times[-1]
+            quiet_ok = rec.wait_quiet(QUIET_NS, final, SETTLE_CAP_NS)
+            end = time.monotonic_ns()
+            cpu1 = leaf.usage_s() if leaf.path else None
+            frames = rec.snapshot()
+            cols = search_columns(frames, key_times, end)
+            row = {"arm": arm["id"], "entrant": arm["entrant"], "mode": mode, "tag": opts.get("tag", "r"),
+                   "fixture": opts.get("fixture_name", "?"), "length": length, "query": text, "settled_before_search": settled_launch,
+                   "region": region, "masks": masks, "cpu_search_s": None if cpu0 is None or cpu1 is None else round(cpu1 - cpu0, 2),
+                   "cpu_src": "cgroup" if leaf.path else "refused: no delegated scope", "key_times_ns": key_times, "t_start_ns": t_start}
+            row.update(cols)
+            if length == lengths[-1] and opts.get("mem", True):
+                row["mem_settled"] = mem_snapshot(pids_now())
+                if opts.get("evidence"):
+                    dumped = rec.dump()
+                    if dumped:
+                        png = os.path.join(ctx["out_dir"], "%s-%s-%s-L%d.png" % (arm["id"], opts.get("fixture_name", "x"), mode, length))
+                        ppm_to_png(dumped, png, rec.boxes(region, masks))
+                        row["evidence"] = png
+            # Enter baseline: a tag that shows nothing before Enter is timed from the Enter key.
+            if mode == "search" and opts.get("enter_baseline") and length == lengths[-1]:
+                t_enter = keys.chord("enter")
+                rec.wait_quiet(QUIET_NS, t_enter, SETTLE_CAP_NS)
+                if opts.get("mem", True):
+                    row["mem_enter_settled"] = mem_snapshot(pids_now())
+                ec = search_columns(rec.snapshot(), [t_enter], time.monotonic_ns())
+                row["enter_first_ms"], row["enter_settled_ms"], row["enter_capped"] = ec["first_ms"], ec["settled_ms"], ec["capped"]
+                row["enter_window_ns"] = [t_enter, t_enter + int((ec["settled_ms"] or 0) * MS)]
+                if opts.get("evidence"):
+                    dumped = rec.dump()
+                    if dumped:
+                        png = os.path.join(ctx["out_dir"], "%s-%s-enter-L%d.png" % (arm["id"], opts.get("fixture_name", "x"), length))
+                        ppm_to_png(dumped, png, rec.boxes(region, masks))
+                        row["enter_evidence"] = png
+            t_esc = run_chords(keys, close_chords)
+            rec.wait_quiet(CLOSE_QUIET_NS, t_esc, CLOSE_CAP_NS)
+            if length == lengths[-1] and opts.get("mem", True):
+                time.sleep(MEM_SETTLE_SLEEP_S)
+                row["mem_after_close"] = mem_snapshot(pids_now())
+            rows.append(row)
+        if errlog is not None:
+            errlog.flush()
+            for row in rows:
+                with open(errlog.name) as f:
+                    if row.get("enter_window_ns"):
+                        row["enter_frame_gaps"] = attach_gaps(f, *row["enter_window_ns"])
+                    f.seek(0)
+                    row["frame_gaps"] = attach_gaps(f, row["t_start_ns"], row["t_start_ns"] + int((row["settled_ms"] or 0) * MS + (row["key_times_ns"][-1] - row["t_start_ns"])))
+        return rows
+    finally:
+        if rec:
+            rec.stop()
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except OSError:
+            pass
+        clean_all(leaf)
+        if errlog:
+            errlog.close()
+
+
+# measure and report
+
+
+def fixture_facts(path):
+    """Entry count and depth of a fixture, walked once and recorded beside its numbers."""
+    n = deepest = 0
+    for cur, dirs, files in os.walk(path):
+        rel = os.path.relpath(cur, path)
+        depth = 0 if rel == "." else rel.count("/") + 1
+        n += len(dirs) + len(files)
+        deepest = max(deepest, depth + (1 if files else 0))
+    return {"path": path, "entries": n, "max_depth": deepest}
+
+
+def measure(plan_path):
+    """measure PLAN.json: out (.jsonl), runs, query, queries {fixture: query}, mode, lengths, fixtures {name: dir}, arms [{id, entrant, flea_dir, view, typing, enter_baseline, wl_debug, fixtures}]; rounds interleave the arms over every fixture."""
+    with open(plan_path) as f:
+        plan = json.load(f)
+    out_path = plan["out"]
+    if os.path.exists(out_path):
+        raise SystemExit("measure refuses an existing out (%s); move it away first" % out_path)
+    ensure_scope()
+    out_dir = os.path.splitext(out_path)[0] + ".files"
+    ctx = make_ctx(out_dir)
+    arms = plan["arms"]
+    UI_TOKENS[:] = [a["flea_dir"] + "/ui" for a in arms if a.get("flea_dir")]
+    require_idle()
+    for a in arms:
+        if a["entrant"] not in ENTRANTS:
+            raise SystemExit("plan names an entrant the table does not hold: " + a["entrant"])
+    facts = {name: fixture_facts(path) for name, path in plan["fixtures"].items()}
+    monitor_info = monitor()
+    head = {"manifest": {
+        "date": time.strftime("%Y-%m-%d %H:%M:%S"), "host": socket.gethostname(), "plan": plan, "fixtures": facts,
+        "monitor": {k: monitor_info.get(k) for k in ("name", "width", "height", "refreshRate", "scale")},
+        "entrants": {a["id"]: {"entrant": a["entrant"], "kind": ENTRANTS[a["entrant"]]["kind"], "filter_kind": ENTRANTS[a["entrant"]]["filter_kind"], "typing": a.get("typing", "")}
+                     for a in arms},
+        "recorder": ctx["rec_bin"], "pace_ms": plan.get("pace_ms", 180)}}
+    n = len(arms)
+    with open(out_path, "a") as out:
+        out.write(json.dumps(head) + "\n")
+        out.flush()
+        for r in range(plan.get("runs", 5)):
+            order = arms[r % n:] + arms[:r % n]
+            for fixture_name, fixture in plan["fixtures"].items():
+                for arm in order:
+                    if arm.get("fixtures") and fixture_name not in arm["fixtures"]:
+                        continue
+                    opts = {"mode": plan.get("mode", "search"), "lengths": plan.get("lengths", [1, 3, 6]),
+                            "pace_ms": plan.get("pace_ms", 180), "fixture_name": fixture_name,
+                            "evidence": r == 0 and plan.get("evidence", True), "mem": r < 3, "tag": "r%d-%s" % (r, fixture_name),
+                            "enter_baseline": bool(arm.get("enter_baseline"))}
+                    try:
+                        rows = run_arm(arm, fixture, plan.get("queries", {}).get(fixture_name, plan["query"]), ctx, opts)
+                    except Exception as e:  # a failed run is a row, never a silent gap
+                        rows = [{"arm": arm["id"], "error": "%s: %s" % (type(e).__name__, e)}]
+                    for row in rows:
+                        row.update({"round": r, "fixture": fixture_name, "arm": arm["id"]})
+                        out.write(json.dumps(row) + "\n")
+                        out.flush()
+                    print("round %d %s %s: %s" % (r, fixture_name, arm["id"],
+                                                  ", ".join("L%s first %s settled %s" % (x.get("length"), x.get("first_ms"), x.get("settled_ms"))
+                                                            if "length" in x else x.get("error", "?") for x in rows)), flush=True)
+    return 0
+
+
+def rng(vals, digits=0):
+    vals = [v for v in vals if v is not None]
+    if not vals:
+        return "n/a"
+    return "%.*f [%.*f..%.*f]" % (digits, statistics.median(vals), digits, min(vals), digits, max(vals))
+
+
+BAR_RATIO = 0.8  # the ratio check: a subject's median at or under 0.8 of Strata's, its slowest run faster than Strata's fastest
+
+
+def median_of(vals):
+    vals = [v for v in vals if v is not None]
+    return statistics.median(vals) if vals else None
+
+
+def clear_of(mine, theirs):
+    """True when my slowest run is faster than their fastest, so the two ranges do not touch."""
+    return bool(mine) and bool(theirs) and max(mine) < min(theirs)
+
+
+def bar_of(mine, theirs):
+    """Against one reference entrant, normally Strata: (ratio of medians, 'ok' or 'UNDER'), or (None, 'n/a')."""
+    mine, theirs = [v for v in mine if v is not None], [v for v in theirs if v is not None]
+    if not mine or not theirs or statistics.median(theirs) == 0:
+        return None, "n/a"
+    ratio = statistics.median(mine) / statistics.median(theirs)
+    return ratio, "ok" if ratio <= BAR_RATIO and clear_of(mine, theirs) else "UNDER"
+
+
+def status_vs(mine, theirs):
+    """Against the next entrant: clear, OVERLAP (faster median, ranges touch) or NOT-FASTER (a tie is not faster)."""
+    if not mine or not theirs:
+        return "n/a"
+    if statistics.median(mine) < statistics.median(theirs):
+        return "clear" if clear_of(mine, theirs) else "OVERLAP"
+    return "NOT-FASTER"
+
+
+def subjects_of(manifest):
+    """The arm ids the comparison tables treat as subjects: the plan's subjects, else every arm whose id starts with flea-stage."""
+    plan = (manifest or {}).get("plan") or {}
+    named = plan.get("subjects") or ([plan["subject"]] if plan.get("subject") else None)
+    if named:
+        return list(named)
+    return [a for a in ((manifest or {}).get("entrants") or {}) if a.startswith("flea-stage")]
+
+
+def col_vals(g, col):
+    """A group's readings for a column without the caps: a capped settled_ms is never read as a settle."""
+    return [r[col] for r in g if r.get(col) is not None and not (col == "settled_ms" and r.get("capped"))]
+
+
+def col_caps(g, col):
+    return sum(1 for r in g if col == "settled_ms" and r.get("capped"))
+
+
+def rank_key(vals, nc):
+    """A capped group ranks worse than any reading; within a side the median orders."""
+    return (1 if nc else 0, statistics.median(vals) if vals else float("inf"))
+
+
+def verdict_lines(groups, manifest):
+    """Comparison tables: per fixture, mode, length and column, the subject's rank, its status vs the next entrant and its ratio to Strata."""
+    ents = (manifest or {}).get("entrants") or {}
+    subjects = subjects_of(manifest)
+    strata = next((a for a, e in ents.items() if e.get("entrant") == "strata"), None)
+    out = []
+    for fixture in sorted({k[0] for k in groups}):
+        for mode in sorted({k[1] for k in groups if k[0] == fixture}):
+            rows = []
+            notes = []
+            noted = set()
+            for subject in subjects:
+                for length in sorted({k[3] for k in groups if k[0] == fixture and k[1] == mode and k[2] == subject}):
+                    for col in ("first_ms", "settled_ms"):
+                        g = groups.get((fixture, mode, subject, length), [])
+                        mine, mine_nc = col_vals(g, col), col_caps(g, col)
+                        if not mine and not mine_nc:
+                            continue
+                        mine_cell = "capped %d of %d" % (mine_nc, len(g)) if mine_nc else rng(mine)
+                        others, caps, baselines, fully_capped = {}, {}, {}, {}
+                        for (fx, md, arm, ln), og in groups.items():
+                            if (fx, md, ln) != (fixture, mode, length) or arm in subjects:
+                                continue
+                            e = ents.get(arm, {})
+                            vals, nc = col_vals(og, col), col_caps(og, col)
+                            if not vals and not nc:
+                                continue
+                            if e.get("entrant") == "flea":
+                                if vals:
+                                    baselines[arm] = vals
+                                else:
+                                    fully_capped[arm] = (nc, len(og))
+                            elif e.get("typing", "") == "" and (mode != "filter" or "narrows" in e.get("filter_kind", "")):
+                                others[arm], caps[arm] = vals, nc
+                        if not others:
+                            rows.append("| %s | %s | %d | %s | %s | %s | n/a | n/a | n/a | no other entrant | n/a | n/a | n/a |" % (
+                                fixture, mode, length, col, subject, mine_cell))
+                            continue
+                        runner = min(others, key=lambda a: rank_key(others[a], caps[a]))
+                        rank = 1 + sum(1 for a in others if rank_key(others[a], caps[a]) < rank_key(mine, mine_nc))
+                        runner_nc = caps[runner]
+                        strata_nc = caps.get(strata, 0) if strata else 0
+                        if col == "settled_ms" and (mine_nc or strata_nc):
+                            ratio_cell, bar = "capped", "capped"
+                        else:
+                            ratio, bar = bar_of(mine, others.get(strata, [])) if strata else (None, "n/a")
+                            ratio_cell = "n/a" if ratio is None else "%.2f" % ratio
+                        if col == "settled_ms" and (mine_nc or runner_nc):
+                            status = "n/a" if mine_nc else "clear"
+                        else:
+                            status = status_vs(mine, others[runner])
+                        base = ""
+                        if baselines and mine:
+                            b = min(baselines, key=lambda a: statistics.median(baselines[a]))
+                            base = "%s %.2f" % (b, statistics.median(mine) / statistics.median(baselines[b])) if statistics.median(baselines[b]) else b
+                        elif fully_capped and not baselines:
+                            base = "no baseline, every row capped"
+                        for arm, counts in fully_capped.items():
+                            if (fixture, mode, arm, length, col) not in noted:
+                                noted.add((fixture, mode, arm, length, col))
+                                notes.append("- baseline %s L%d %s had every row capped (%d of %d)" % ((arm, length, col) + counts))
+                        runner_cell = "capped %d of %d" % (runner_nc, len(groups[(fixture, mode, runner, length)])) if runner_nc else rng(others[runner])
+                        rows.append("| %s | %s | %d | %s | %s | %s | %s | %s | %d of %d | %s | %s | %s | %s |" % (
+                            fixture, mode, length, col, subject, mine_cell, runner, runner_cell, rank, len(others) + 1,
+                            status, ratio_cell, bar, base or "n/a"))
+            if rows:
+                out.append("### comparison, %s, %s (ms, median [min..max]; ok = ratio at most %.1f and slowest run faster than Strata's fastest)" % (fixture, mode, BAR_RATIO))
+                out.append("")
+                out.append("| fixture | mode | L | column | subject | subject ms | next | next ms | rank | vs next | x Strata | ratio check | x own baseline |")
+                out.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+                out.extend(rows)
+                # A blank line ends the table, so the notes render as a list and not as table rows.
+                if notes:
+                    out.append("")
+                    out.extend(notes)
+                out.append("")
+    return out
+
+
+def report(path):
+    """Markdown tables of median [min..max] per arm, fixture and length, and the self-pair spread of a/b arms."""
+    rows = []
+    manifest = None
+    with open(path) as f:
+        for line in f:
+            d = json.loads(line)
+            if "manifest" in d:
+                manifest = d["manifest"]
+            else:
+                rows.append(d)
+    groups = {}
+    for r in rows:
+        if "length" not in r:
+            continue
+        groups.setdefault((r["fixture"], r.get("mode", "search"), r["arm"], r["length"]), []).append(r)
+    # A type-ahead popup's "settled" is its own close timeout, so that column is withheld.
+    popup = {k for k, v in ((manifest or {}).get("entrants") or {}).items() if v.get("filter_kind", "").startswith("type-ahead")}
+    out = []
+    ents = (manifest or {}).get("entrants") or {}
+    subjects = subjects_of(manifest)
+    strata = next((a for a, e in ents.items() if e.get("entrant") == "strata"), None)
+
+    def strata_ratio(key, col):
+        """Median of this row over Strata's median in the same fixture, mode and length, and the bar for a subject."""
+        if strata is None or key[2] == strata:
+            return "-"
+        if col == "settled_ms" and (col_caps(groups[key], col) or col_caps(groups.get((key[0], key[1], strata, key[3]), []), col)):
+            return "capped"
+        mine = [r.get(col) for r in groups[key]]
+        theirs = [r.get(col) for r in groups.get((key[0], key[1], strata, key[3]), [])]
+        ratio, bar = bar_of(mine, theirs)
+        if ratio is None:
+            return "n/a"
+        return "%.2f %s" % (ratio, bar) if key[2] in subjects else "%.2f" % ratio
+
+    for fixture in sorted({k[0] for k in groups}):
+        for mode in sorted({k[1] for k in groups if k[0] == fixture}):
+            out.append("### %s, %s" % (fixture, mode))
+            out.append("")
+            out.append("| arm | L | runs | first ms | settled ms | x Strata first | x Strata settled | capped | blank frames skipped | cpu s | enter first ms | enter settled ms |")
+            out.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
+            for key in sorted(k for k in groups if k[0] == fixture and k[1] == mode):
+                g = groups[key]
+                withheld = key[1] == "filter" and key[2] in popup
+                nc = sum(1 for r in g if r.get("capped"))
+                ne = sum(1 for r in g if r.get("enter_capped"))
+                if withheld:
+                    settled = "popup timeout"
+                elif nc:
+                    settled = "capped %d of %d" % (nc, len(g))
+                else:
+                    settled = rng([r.get("settled_ms") for r in g])
+                enter_settled = "capped %d of %d" % (ne, len(g)) if ne else rng([r.get("enter_settled_ms") for r in g])
+                out.append("| %s | %d | %d | %s | %s | %s | %s | %d | %d | %s | %s | %s |" % (
+                    key[2], key[3], len(g), rng([r.get("first_ms") for r in g]), settled,
+                    strata_ratio(key, "first_ms"), "n/a" if withheld else strata_ratio(key, "settled_ms"),
+                    nc, sum(r.get("blank_frames_skipped") or 0 for r in g),
+                    rng([r.get("cpu_search_s") for r in g], 2),
+                    rng([r.get("enter_first_ms") for r in g]), enter_settled))
+            out.append("")
+            arms = sorted({k[2] for k in groups if k[0] == fixture and k[1] == mode})
+            pairs = [(a, a[:-2] + "-b") for a in arms if a.endswith("-a") and a[:-2] + "-b" in arms]
+            for a, b in pairs:
+                for length in sorted({k[3] for k in groups if k[2] == a}):
+                    ga, gb = groups.get((fixture, mode, a, length), []), groups.get((fixture, mode, b, length), [])
+                    for col in ("first_ms", "settled_ms"):
+                        va = [r[col] for r in ga if r.get(col) is not None and not (col == "settled_ms" and r.get("capped"))]
+                        vb = [r[col] for r in gb if r.get(col) is not None and not (col == "settled_ms" and r.get("capped"))]
+                        capped_a, capped_b = col_caps(ga, col), col_caps(gb, col)
+                        if va and vb:
+                            line = "self-pair %s vs %s L%d %s: medians %.0f and %.0f, spread %.0f ms" % (
+                                a, b, length, col, statistics.median(va), statistics.median(vb),
+                                abs(statistics.median(va) - statistics.median(vb)))
+                            if capped_a or capped_b:
+                                line += " (capped %d of %d and %d of %d)" % (capped_a, len(ga), capped_b, len(gb))
+                            out.append(line)
+                        elif col == "settled_ms" and (capped_a or capped_b):
+                            out.append("self-pair %s vs %s L%d %s: capped, no spread" % (a, b, length, col))
+            out.append("")
+    out.extend(verdict_lines(groups, manifest))
+    mem_rows = [r for r in rows if "mem_settled" in r]
+    if mem_rows:
+        out.append("### memory of the entrant's process tree, kB, median [min..max], at settled results and 3 s after Esc")
+        out.append("")
+        out.append("| fixture | mode | arm | runs | Pss settled | Pss x Strata | Pss_Anon settled | USS settled | Pss after Esc | USS after Esc | processes |")
+        out.append("|---|---|---|---|---|---|---|---|---|---|---|")
+        by = {}
+        for r in mem_rows:
+            by.setdefault((r["fixture"], r.get("mode", "search"), r["arm"] + (" (typed)" if "mem_enter_settled" in r else ""),
+                           "mem_settled"), []).append(r)
+            if "mem_enter_settled" in r:
+                by.setdefault((r["fixture"], r.get("mode", "search"), r["arm"] + " (Enter)", "mem_enter_settled"), []).append(r)
+        for key in sorted(by):
+            g = by[key]
+            after = [r.get("mem_after_close") or {} for r in g]
+            # A row that also typed Enter is filed under "<id> (typed)", so Strata is looked up under both filings.
+            theirs = [r["mem_settled"]["pss_kb"] for s in ("", " (typed)") for r in by.get((key[0], key[1], strata + s, "mem_settled"), [])] if strata else []
+            ratio, bar = bar_of([r[key[3]]["pss_kb"] for r in g], theirs)
+            versus = "-" if key[2].split(" ")[0] == strata else "n/a" if ratio is None else "%.2f %s" % (ratio, bar) if key[2].split(" ")[0] in subjects else "%.2f" % ratio
+            out.append("| %s | %s | %s | %d | %s | %s | %s | %s | %s | %s | %s |" % (
+                key[0], key[1], key[2], len(g), rng([r[key[3]]["pss_kb"] for r in g]), versus,
+                rng([r[key[3]]["pss_anon_kb"] for r in g]), rng([r[key[3]]["uss_kb"] for r in g]),
+                rng([a.get("pss_kb") for a in after]), rng([a.get("uss_kb") for a in after]),
+                ",".join(sorted({p["comm"] for p in g[0][key[3]]["procs"]}))))
+        out.append("")
+    gap_rows = [r for r in rows if r.get("frame_gaps") or r.get("enter_frame_gaps")]
+    if gap_rows:
+        out.append("### attach gaps of the busiest surface, ms: first keystroke to settled, and Enter to settled")
+        out.append("")
+        out.append("| fixture | mode | arm | L | window | attaches | largest | p95 |")
+        out.append("|---|---|---|---|---|---|---|---|")
+        for r in gap_rows:
+            for label, key in (("typing", "frame_gaps"), ("Enter", "enter_frame_gaps")):
+                g = r.get(key)
+                if g:
+                    out.append("| %s | %s | %s | %d | %s | %d | %s | %s |" % (
+                        r["fixture"], r.get("mode", "search"), r["arm"], r["length"], label, g["attaches"],
+                        g["max_gap_ms"], g["p95_gap_ms"]))
+        out.append("")
+    errors = [r for r in rows if "error" in r]
+    if errors:
+        out.append("errors: " + "; ".join("%s r%s: %s" % (e.get("arm"), e.get("round"), e["error"]) for e in errors))
+    print("\n".join(out))
+    return 0
+
+
+def is_subsequence(q, text):
+    it = iter(text)
+    return all(c in it for c in q)
+
+
+def held_order(root):
+    """Names under root in the order Flea's backend sends them: folders first, then natural names."""
+    def natkey(n):
+        return [int(p) if p.isdigit() else p.lower() for p in re.split(r"(\d+)", n)]
+    ordered = lambda ns: sorted(ns, key=lambda n: (natkey(n), n))
+    paths = os.listdir(root)
+    return ordered([n for n in paths if os.path.isdir(os.path.join(root, n))]) + \
+        ordered([n for n in paths if not os.path.isdir(os.path.join(root, n))])
+
+
+def pickquery(root, flat=False):
+    """The fixed 6 character query of a column: the 6-gram at the most depths (tree) or the substring moving the visible rows at 1, 3 and 6 characters (flat)."""
+    if flat:
+        # Flea's "/" filter keeps backend order (folders first, natural names), so the window is modelled the same way.
+        names = held_order(root)
+        held = names[:HELD_ROWS]
+        def top(q):
+            return [n for n in held if q in n.lower()][:VISIBLE_ROWS]
+        # A substring of a name, so the match moves the rows: a name's own prefix leaves the head of a sorted list as it was.
+        grams = []
+        for n in held[len(held) // 3:] + held[:len(held) // 3]:
+            low = n.lower()
+            for i in range(1, len(low) - 5):
+                g = low[i:i + 6]
+                if g not in grams and re.fullmatch(r"[a-z0-9._-]{6}", g):
+                    grams.append(g)
+        for pick in grams:
+            # The rows on screen after 0, 1, 3 and 6 characters must be four different lists, the last not empty.
+            tops = [top(pick[:k]) for k in (0, 1, 3, 6)]
+            if all(tops[i] != tops[i + 1] for i in range(3)) and len(tops[3]) >= 3:
+                break
+        else:
+            raise SystemExit("no 6 character substring changes the visible rows at 1, 3 and 6 characters in the first %d rows of %s" % (HELD_ROWS, root))
+
+        def within(rows, q):
+            return sum(1 for n in rows if q in n.lower())
+        return {"query": pick, "entries": len(names), "held_rows": len(held),
+                "held_after_1": within(held, pick[:1]), "held_after_3": within(held, pick[:3]),
+                "held_matches": within(held, pick),
+                "substring_matches": within(names, pick),
+                "subsequence_matches": sum(1 for n in names if is_subsequence(pick, n.lower())),
+                "after_1": within(names, pick[:1]), "after_3": within(names, pick[:3])}
+    depth_of, count, rels = {}, {}, []
+    for cur, dirs, files in os.walk(root):
+        rel = os.path.relpath(cur, root)
+        depth = 0 if rel == "." else rel.count("/") + 1
+        for name in dirs + files:
+            p = os.path.join(rel, name) if rel != "." else name
+            rels.append((p[2:] if p.startswith("./") else p).lower())
+            low = name.lower()
+            for m in {low[i:i + 6] for i in range(len(low) - 5)}:
+                if re.fullmatch(r"[a-z0-9]{6}", m):
+                    depth_of.setdefault(m, set()).add(depth)
+                    count[m] = count.get(m, 0) + 1
+    cands = [g for g, d in depth_of.items() if len(d) >= 3 and QUERY_COUNT_MIN <= count[g] <= QUERY_COUNT_MAX]
+    if not cands:
+        raise SystemExit("no 6-gram sits at three depths with 20 to 2000 substring matches under " + root)
+    best = max(cands, key=lambda g: (len(depth_of[g]), count[g], g))
+    return {"query": best, "entries": len(rels), "depths": sorted(depth_of[best]), "substring_matches": count[best],
+            "subsequence_matches": sum(1 for r in rels if is_subsequence(best, r)),
+            "after_1": sum(1 for r in rels if best[:1] in r), "after_3": sum(1 for r in rels if best[:3] in r)}
+
+
+# calibrate
+
+
+def calibrate_row(delay_ms, samples, swaps, floor, floor_share, frame_ms):
+    # One delay row scored under both rules; the pass flag follows the client swap rule.
+    err = [s - floor - delay_ms for s in samples]
+    share = [s - c for s, c in zip(samples, swaps)]
+    cerr = [sh - floor_share for sh in share]
+    return {"delay_ms": delay_ms,
+            "error_vs_programmed_ms": [round(e, 1) for e in err],
+            "error_vs_client_ms": [round(e, 1) for e in cerr],
+            "median_share_ms": round(statistics.median(share), 2),
+            "worst_abs_client_error_ms": round(max(abs(e) for e in cerr), 1),
+            "within_one_frame": all(abs(e) <= frame_ms for e in cerr)}
+
+
+def calibrate_score_row(delay_ms, samples, swaps, floor, floor_share, frame_ms):
+    # Programmed error needs only the floor; the client score needs matching swaps.
+    row = {}
+    if floor is not None:
+        err = [s - floor - delay_ms for s in samples]
+        row["error_vs_programmed_ms"] = [round(e, 1) for e in err]
+        row["worst_abs_programmed_error_ms"] = round(max(abs(e) for e in err), 1)
+    if floor is not None and floor_share is not None and len(swaps) == len(samples):
+        row.update(calibrate_row(delay_ms, samples, swaps, floor, floor_share, frame_ms))
+    return row
+
+
+def calibrate(delays, runs, keep=None):
+    """A client that changes its results a known delay after a key; the method must read that delay back."""
+    work = tempfile.mkdtemp(prefix="flea-calib-")
+    rec_bin = build_recorder(os.path.join(work, "rec"))
+    shell_dir = os.path.join(work, "shell")
+    os.makedirs(shell_dir)
+    with open(os.path.join(REPO, "tests", "search-calib.qml")) as f, open(os.path.join(shell_dir, "shell.qml"), "w") as g:
+        g.write(f.read())
+    keys = Keys()
+    mon = monitor()
+    frame_ms = 1000.0 / mon.get("refreshRate", 60.0)
+    results = []
+    for d in delays:
+        samples = []
+        swaps = []
+        spent = []
+        for run in range(runs):
+            env = dict(ENV, CALIB_DELAY_MS=str(d), QT_FORCE_STDERR_LOGGING="1")
+            logf = open(os.path.join(work, "client-%d-%d.log" % (d, run)), "w")
+            client = subprocess.Popen(["qs", "-p", shell_dir, "-n"], env=env, stdout=logf, stderr=subprocess.STDOUT)
+            try:
+                win = window_by_pid({client.pid} | descendants(client.pid), 20)
+                if win is None:
+                    raise RuntimeError("the calibration window never mapped")
+                focus_window(win["address"])
+                park_cursor()
+                time.sleep(1.0)
+                hide_cursor(keys)
+                win = [c for c in clients() if c["address"] == win["address"]][0]
+                (x, y), (w, h) = win["at"], win["size"]
+                # The masked query line sits inside the watched window, so only the mask keeps it out.
+                region = (x, y, w, h)
+                masks = [(x, y, w, 48)]
+                rec = Recorder(rec_bin, region, masks)
+                try:
+                    time.sleep(0.6)
+                    t_key = keys.chord("a")
+                    ok = rec.wait_quiet(1 * NS, t_key, 6 * NS)
+                    frames = rec.snapshot()
+                    detail = rec.detail_snapshot()
+                finally:
+                    rec.stop()
+                if os.environ.get("CALIB_DEBUG"):
+                    print("DEBUG d=%d key=%d region=%s masks=%s" % (d, t_key, region, masks), file=sys.stderr)
+                    for pres, recv, rows, first, last, c0, c1, ink in detail:
+                        print("DEBUG frame %+.1f ms rows=%d y %d..%d x %d..%d ink=%d recv_lag=%.1f" % (
+                            (pres - t_key) / MS, rows, first, last, c0, c1, ink, (recv - pres) / MS), file=sys.stderr)
+                t_first = first_change_after(result_changes_of(frames), t_key)
+                if t_first is None:
+                    raise RuntimeError("no result frame seen after the key (delay %d, run %d)" % (d, run))
+                samples.append((t_first - t_key) / MS)
+                spent.append(frames_before_result(frames, t_key, t_first))
+                logf.flush()
+                with open(os.path.join(work, "client-%d-%d.log" % (d, run))) as f:
+                    for line in f:
+                        # Sample input, one client line: "CALIB swap key=12.3 swapped=45.6" (detector ms, client ms).
+                        if "CALIB swap" in line:
+                            kv = dict(p.split("=") for p in line.split("CALIB swap")[1].split())
+                            swaps.append(float(kv["swapped"]) - float(kv["key"]))
+            finally:
+                client.terminate()
+                try:
+                    client.wait(5)
+                except subprocess.TimeoutExpired:
+                    client.kill()
+                logf.close()
+                time.sleep(0.5)
+        results.append((d, samples, swaps, spent))
+    floor = statistics.median(results[0][1]) if results and results[0][0] == 0 else None
+    # Median client share on the delay-0 row, the instrument floor under the new rule.
+    floor_share = (statistics.median(s - c for s, c in zip(results[0][1], results[0][2]))
+                   if results and results[0][0] == 0 and len(results[0][2]) == len(results[0][1]) else None)
+    report = {"frame_ms": round(frame_ms, 2), "refresh_hz": mon.get("refreshRate"), "rows": []}
+    for d, samples, swaps, spent in results:
+        row = {
+            "delay_ms": d,
+            "runs": len(samples),
+            "measured_ms": [round(s, 1) for s in samples],
+            "median_ms": round(statistics.median(samples), 1),
+            "min_ms": round(min(samples), 1),
+            "max_ms": round(max(samples), 1),
+            "client_key_to_swap_ms": [round(s, 1) for s in swaps],
+            "frames_before_result": spent,
+        }
+        row.update(calibrate_score_row(d, samples, swaps, floor, floor_share, frame_ms))
+        report["rows"].append(row)
+    report["floor_ms"] = None if floor is None else round(floor, 1)
+    report["floor_share_ms"] = None if floor_share is None else round(floor_share, 1)
+    report["workdir"] = work
+    print(json.dumps(report, indent=1))
+    return report
+
+
+# selftest: the detector on synthetic logs, so it runs with no display.
+
+
+def selftest():
+    fail = []
+
+    def check(name, got, want):
+        if got != want:
+            fail.append("%s: got %r, wanted %r" % (name, got, want))
+
+    ms = MS
+    frames = [(t * ms, rows) for t, rows in [(0, -1), (100, 0), (250, 12), (258, 3), (900, 0), (3000, 0)]]
+    cols = search_columns(frames, [200 * ms], 5000 * ms)
+    check("first", cols["first_ms"], 50.0)
+    check("settled", cols["settled_ms"], 58.0)
+    check("capped", cols["capped"], False)
+    # A change that lands after the next key belongs to the next key.
+    frames = [(t * ms, rows) for t, rows in [(0, -1), (500, 5), (700, 5)]]
+    cols = search_columns(frames, [100 * ms, 400 * ms], 5000 * ms)
+    check("per_key_late", cols["per_key_first_ms"], [None, 100.0])
+    check("per_key_first_final", cols["first_ms"], 100.0)
+    # No change at all.
+    cols = search_columns([(0, -1), (9 * ms, 0)], [100 * ms], 5000 * ms)
+    check("none_first", cols["first_ms"], None)
+    check("none_settled", cols["settled_ms"], None)
+    # Still changing at the cap: reported at the cap and flagged.
+    frames = [(t * ms, 3) for t in range(1000, 40000, 500)]
+    cols = search_columns(frames, [500 * ms], 40000 * ms)
+    check("cap_settled", cols["settled_ms"], 15000.0)
+    check("cap_flag", cols["capped"], True)
+    # A recording that ends before the quiet gap is complete is not a settle.
+    frames = [(1000 * ms, 4), (1500 * ms, 4)]
+    cols = search_columns(frames, [500 * ms], 2000 * ms)
+    check("short_flag", cols["capped"], True)
+    # Rows still changing right before the final key are flagged.
+    frames = [(480 * ms, 8), (700 * ms, 8)]
+    cols = search_columns(frames, [500 * ms], 6000 * ms)
+    check("busy", cols["busy_at_final_key"], True)
+    # Frame times compare strictly: a frame presented at the key's own instant is not a result of it.
+    check("strict", first_change_after([500 * ms], 500 * ms), None)
+    # Frame gaps: attaches 10 ms apart with one 80 ms hole, between a key and the end of the search.
+    wrap_ns = (1 << 32) * 1000
+    off0 = (1_700_000_000 * NS) // wrap_ns * wrap_ns + 123456000 * 1000 - 1000 * MS
+
+    def rt(t_ms):
+        us = (123456000 + (t_ms - 1000) * 1000) % (1 << 32)
+        return "[%7d.%03d]" % (us // 1000, us % 1000)
+
+    lines = ["%s  -> wl_surface@23.attach(wl_buffer@41, 0, 0)" % rt(t) for t in (1000, 1010, 1020, 1100, 1110)]
+    lines += ["%s  -> wl_surface@99.attach(wl_buffer@7, 0, 0)" % rt(1050), "[1005.000]  <- wl_surface@23.enter(wl_output@3)",
+              "%s  -> wl_surface@23.attach(wl_buffer@40, 0, 0)" % rt(999)]
+    g = attach_gaps(lines, 1000 * 1e6, 1120 * 1e6, off0)
+    check("gap_attaches", g["attaches"], 5)
+    check("gap_max", g["max_gap_ms"], 80.0)
+    check("gap_none", attach_gaps(lines, 5000 * 1e6, 6000 * 1e6), None)
+    # The time-of-day form, in UTC and in the local zone, around a run that started at monotonic 7000 ms.
+    off = 1_700_000_000 * NS - 7000 * MS  # realtime minus monotonic
+    for zone in (0, time.localtime().tm_gmtoff * NS):
+        stamps = []
+        for t_ms in (7000, 7010, 7020, 7100, 7110):
+            real = 1_700_000_000 * NS + (t_ms - 7000) * MS + zone
+            sod = real % (86400 * NS)
+            stamps.append("[%02d:%02d:%09.6f] {mesa vk display queue}  -> wl_surface#37.attach(wl_buffer#81, 0, 0)" % (
+                sod // (3600 * NS), sod // (60 * NS) % 60, sod % (60 * NS) / NS))
+        g = attach_gaps(stamps, 7000 * MS, 7120 * MS, off)
+        check("gap_tod_attaches", g and g["attaches"], 5)
+        check("gap_tod_max", g and g["max_gap_ms"], 80.0)
+    # A query may hold any of a-z, 0-9, dot, dash and underscore, and each must reach the input path.
+    check("typeable", all(c in KEYCODES or c in SHIFTED and SHIFTED[c] in KEYCODES for c in "abcdefghijklmnopqrstuvwxyz0123456789.-_"), True)
+    # The entrant table: every chord names keys the input path knows, and every entrant has a launch line.
+    for name, spec in ENTRANTS.items():
+        for chords in (spec["open"], spec["close"], spec["filter_open"], spec["filter_close"]):
+            for chord in chords:
+                for k in chord:
+                    check("key %s in %s" % (k, name), k in KEYCODES, True)
+        check("region %s" % name, len(spec["region"](2536, 1386)), 4)
+        check("filter region %s" % name, len(spec.get("filter_region", spec["region"])(2536, 1386)), 4)
+    # report: a self-pair of a and b arms reads its spread off the medians.
+    import io
+    from contextlib import redirect_stdout
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as tf:
+        for arm, vals in (("x-a", (10, 12, 14)), ("x-b", (20, 22, 24))):
+            for i, v in enumerate(vals):
+                tf.write(json.dumps({"arm": arm, "fixture": "local", "mode": "search", "length": 3, "first_ms": v,
+                                     "settled_ms": v * 2, "capped": False, "cpu_search_s": 0.5, "round": i}) + "\n")
+        tf.write(json.dumps({"arm": "x-a", "fixture": "local", "mode": "search", "length": 3, "first_ms": 12,
+                             "settled_ms": 15000, "capped": True, "cpu_search_s": 0.5, "round": 3}) + "\n")
+        tf.write(json.dumps({"arm": "x-a", "fixture": "local", "mode": "search", "length": 6, "first_ms": 5,
+                             "settled_ms": 9, "capped": False, "round": 0,
+                             "mem_settled": {"pss_kb": 900, "pss_anon_kb": 700, "uss_kb": 800, "procs": [{"comm": "qs"}]},
+                             "mem_after_close": {"pss_kb": 500, "uss_kb": 400},
+                             "frame_gaps": {"attaches": 9, "max_gap_ms": 31.5, "p95_gap_ms": 17.0},
+                             "enter_frame_gaps": {"attaches": 4, "max_gap_ms": 20.0, "p95_gap_ms": 20.0}}) + "\n")
+        tf.write(json.dumps({"manifest": {"entrants": {"t": {"filter_kind": "type-ahead find (GTK): selects a row"}}}}) + "\n")
+        tf.write(json.dumps({"arm": "t", "fixture": "flat", "mode": "filter", "length": 3, "first_ms": 7, "settled_ms": 5000,
+                             "capped": False, "round": 0}) + "\n")
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        report(tf.name)
+    os.unlink(tf.name)
+    check("report_median", "12 [10..14]" in buf.getvalue(), True)
+    check("report_pair", "spread 10 ms" in buf.getvalue(), True)
+    check("report_pair_caps", "spread 20 ms (capped 1 of 4 and 0 of 3)" in buf.getvalue(), True)
+    check("report_mem", "| local | search | x-a | 1 | 900 [900..900] | n/a | 700 [700..700] | 800 [800..800] | 500 [500..500] | 400 [400..400] | qs |" in buf.getvalue(), True)
+    check("report_gaps", "| local | search | x-a | 6 | typing | 9 | 31.5 | 17.0 |" in buf.getvalue(), True)
+    check("report_enter_gaps", "| local | search | x-a | 6 | Enter | 4 | 20.0 | 20.0 |" in buf.getvalue(), True)
+    # A strata arm that also typed Enter files its memory under "<id> (typed)"; the Strata column still finds it.
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as tf:
+        tf.write(json.dumps({"manifest": {"plan": {"subjects": ["flea-stage"]}, "entrants": {
+            "flea-stage": {"entrant": "flea", "typing": ""}, "strata": {"entrant": "strata", "typing": ""}}}}) + "\n")
+        for arm in ("flea-stage", "strata"):
+            tf.write(json.dumps({"arm": arm, "fixture": "local", "mode": "search", "length": 6, "first_ms": 5,
+                                 "settled_ms": 9, "capped": False, "round": 0,
+                                 "mem_settled": {"pss_kb": 900, "pss_anon_kb": 700, "uss_kb": 800, "procs": [{"comm": "qs"}]},
+                                 "mem_enter_settled": {"pss_kb": 910, "pss_anon_kb": 710, "uss_kb": 810, "procs": [{"comm": "qs"}]},
+                                 "mem_after_close": {"pss_kb": 500, "uss_kb": 400}}) + "\n")
+    membuf = io.StringIO()
+    with redirect_stdout(membuf):
+        report(tf.name)
+    os.unlink(tf.name)
+    text = membuf.getvalue()
+    check("report_mem_typed_strata", "| local | search | strata (typed) | 1 | 900 [900..900] | - |" in text, True)
+    check("report_mem_typed_ratio", "| local | search | flea-stage (typed) | 1 | 900 [900..900] | 1.00 UNDER |" in text, True)
+    check("report_mem_enter_ratio", "| local | search | flea-stage (Enter) | 1 | 910 [910..910] | 1.01 UNDER |" in text, True)
+    check("report_popup", "popup timeout" in buf.getvalue(), True)
+    # The comparison: a subject against the next entrant and Strata, one case each of clear, OVERLAP, NOT-FASTER, ok and UNDER.
+    check("bar_ok", bar_of([30, 31, 32], [50, 60, 70]), (31 / 60, "ok"))
+    check("bar_ratio_only", bar_of([48, 49, 50], [55, 60, 70])[1], "UNDER")  # ratio 0.82 is over 0.8
+    check("bar_overlap", bar_of([30, 31, 62], [50, 60, 70])[1], "UNDER")  # ratio ok, slowest run not under Strata's fastest
+    check("status_clear", status_vs([10, 11, 12], [13, 14, 15]), "clear")
+    check("status_overlap", status_vs([10, 11, 14], [13, 14, 15]), "OVERLAP")
+    check("status_tie", status_vs([10, 12, 14], [10, 12, 14]), "NOT-FASTER")
+    check("status_loss", status_vs([20, 21, 22], [13, 14, 15]), "NOT-FASTER")
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as tf:
+        tf.write(json.dumps({"manifest": {"plan": {"subjects": ["flea-stage"]}, "entrants": {
+            "flea-stage": {"entrant": "flea", "typing": ""}, "flea-038-a": {"entrant": "flea", "typing": "highlight only"},
+            "strata": {"entrant": "strata", "typing": ""}, "thunar": {"entrant": "thunar", "typing": ""}}}}) + "\n")
+        for arm, vals in (("flea-stage", (10, 11, 12)), ("strata", (30, 31, 32)), ("thunar", (11, 15, 41)),
+                          ("flea-038-a", (50, 51, 52))):
+            for i, v in enumerate(vals):
+                tf.write(json.dumps({"arm": arm, "fixture": "local", "mode": "search", "length": 1, "first_ms": v,
+                                     "settled_ms": v + 5, "capped": False, "round": i}) + "\n")
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        report(tf.name)
+    os.unlink(tf.name)
+    text = buf.getvalue()
+    check("verdict_overlap", "| local | search | 1 | first_ms | flea-stage | 11 [10..12] | thunar | 15 [11..41] | 1 of 3 | OVERLAP | 0.35 | ok | flea-038-a 0.22 |" in text, True)
+    check("verdict_strata_col", "| flea-stage | 1 | 3 | 11 [10..12] | 16 [15..17] | 0.35 ok | 0.44 ok |" in text, True)
+    # A blank frame after the key is a change but no result: the first result is the first frame with ink rows.
+    frames = [(0, -1, -1), (250 * ms, 12, 2), (270 * ms, 12, 40), (900 * ms, 0, -1)]
+    cols = search_columns(frames, [200 * ms], 5000 * ms)
+    check("ink_first", cols["first_ms"], 70.0)
+    check("ink_blank_skipped", cols["blank_frames_skipped"], 1)
+    check("ink_settled", cols["settled_ms"], 70.0)
+    check("ink_old_log", search_columns([(250 * ms, 12)], [200 * ms], 5000 * ms)["first_ms"], 50.0)
+    # A swap-count mismatch still carries the programmed error.
+    score_fn = globals().get("calibrate_score_row")
+    check("calib_score_present", score_fn is not None, True)
+    if score_fn is not None:
+        prow = score_fn(200, [30.0, 31.0], [3.0], 27.4, 22.6, 8.33)
+        check("calib_mismatch_programmed", "error_vs_programmed_ms" in prow, True)
+        check("calib_mismatch_client", ("error_vs_client_ms" in prow, prow.get("within_one_frame", False)),
+              (False, False))
+        check("calib_mismatch_programmed_worst", prow.get("worst_abs_programmed_error_ms"), 197.4)
+        full = score_fn(200, [30.0, 31.0], [32.0, 33.0], 27.4, 22.6, 8.33)
+        check("calib_full_client_worst", full.get("worst_abs_client_error_ms"), 24.6)
+        check("calib_full_programmed_worst", full.get("worst_abs_programmed_error_ms"), 197.4)
+        check("calib_full_one_key", "worst_abs_error_ms" in full, False)
+        # The socket path and the session env fall back to /run/user/<uid> when XDG_RUNTIME_DIR is unset (ssh) or empty, never to the cwd.
+        sock_fn = globals().get("ydotool_socket")
+        check("socket_helper_present", sock_fn is not None, True)
+        if sock_fn is not None:
+            saved_env = dict(os.environ)
+            try:
+                os.environ.pop("XDG_RUNTIME_DIR", None)
+                os.environ.pop("YDOTOOL_SOCKET", None)
+                check("socket_fallback", sock_fn(), "/run/user/%d/.ydotool_socket" % os.getuid())
+                os.environ["XDG_RUNTIME_DIR"] = ""
+                check("socket_fallback_empty", sock_fn(), "/run/user/%d/.ydotool_socket" % os.getuid())
+                os.environ.update({"HYPRLAND_INSTANCE_SIGNATURE": "x", "WAYLAND_DISPLAY": "y"})
+                check("session_env_empty_runtime_dir", session_env()["XDG_RUNTIME_DIR"], "/run/user/%d" % os.getuid())
+            finally:
+                os.environ.clear()
+                os.environ.update(saved_env)
+    # calibrate on stubs: Shift precedes each run's key, and each run's frames before its result land in its row.
+    import types
+    with tempfile.TemporaryDirectory() as td:
+        open(os.path.join(td, ".flea-test-sandbox"), "w").close()
+        t_key, sent, g = 1000 * ms, [], globals()
+        runs = iter([[(t_key + 1 * ms, 0, -1), (t_key + 31.8 * ms, 652, 300)], [(t_key + 4.6 * ms, 652, 300)]] * 2)
+
+        def popen(argv, env, stdout, stderr):
+            stdout.write("CALIB swap key=0 swapped=3\n")
+            return types.SimpleNamespace(pid=1, terminate=lambda: None, wait=lambda t: 0, kill=lambda: None)
+
+        def recorder(rec_bin, region, masks):
+            frames = next(runs)
+            return types.SimpleNamespace(wait_quiet=lambda *a: True, snapshot=lambda: frames, stop=lambda: None,
+                                         detail=[], detail_snapshot=lambda: [])
+
+        stubs = {"tempfile": types.SimpleNamespace(mkdtemp=lambda prefix: td), "build_recorder": lambda d: "rec",
+                 "Keys": lambda: types.SimpleNamespace(chord=lambda *k: sent.append(k) or t_key),
+                 "monitor": lambda: {"refreshRate": 120.0}, "window_by_pid": lambda pids, s: {"address": "0x1"},
+                 "subprocess": types.SimpleNamespace(Popen=popen, STDOUT=subprocess.STDOUT,
+                                                     TimeoutExpired=subprocess.TimeoutExpired),
+                 "descendants": lambda pid: set(), "focus_window": lambda a: None, "park_cursor": lambda: None,
+                 "time": types.SimpleNamespace(sleep=lambda s: None), "Recorder": recorder,
+                 "clients": lambda: [{"address": "0x1", "at": [0, 0], "size": [100, 100]}], "ENV": {}}
+        saved = {k: g[k] for k in stubs}
+        g.update(stubs)
+        try:
+            with redirect_stdout(io.StringIO()):
+                rep = calibrate([0, 50], 2)
+        finally:
+            g.update(saved)
+        check("calib_run_spent", [r.get("frames_before_result") for r in rep["rows"]], [[1, 0], [1, 0]])
+        check("calib_run_hides", sent, [("shift",), ("a",)] * 4)
+    # A recorder alive but silent is ended before the refusal is raised.
+    ended = []
+    quiet = types.SimpleNamespace(stdout=iter(()), poll=lambda: None,
+                                  terminate=lambda: ended.append("terminate"), wait=lambda t=None: 0, kill=lambda: ended.append("kill"))
+    saved = {k: globals()[k] for k in ("subprocess", "HEADER_WAIT_S", "ENV")}
+    globals().update({"HEADER_WAIT_S": 0.05, "ENV": {},
+                      "subprocess": types.SimpleNamespace(Popen=lambda *a, **k: quiet, PIPE=subprocess.PIPE, TimeoutExpired=subprocess.TimeoutExpired)})
+    try:
+        Recorder("fc", (0, 0, 1, 1))
+        check("silent_recorder_refused", "no refusal", "RuntimeError")
+    except RuntimeError as e:
+        check("silent_recorder_refused", str(e), "the recorder gave no header (exit None)")
+    finally:
+        globals().update(saved)
+    check("silent_recorder_ended", ended, ["terminate"])
+    # Recorder._read takes the real 8-value F line and counts any other shape instead of reading it silently.
+    rec = Recorder.__new__(Recorder)
+    rec.frames, rec.detail, rec.dumps, rec.header, rec.malformed, rec.unstamped = [], [], [], None, 0, 0
+    rec.lock = threading.Lock()
+    rec.proc = types.SimpleNamespace(stdout=[
+        "H 900 700 0 12345\n",
+        "F 660389861257350 660389874933379 32 95 126 0 1919 40\n",
+        "F 660389861257351 660389874933380 -1 -1 -1 -1 -1 -1\n",
+        "F 660389861257350 660389874933379 32 95 126\n",
+        "F 1 2 3 4 5 6 7 8 9 10\n",
+        "F a b c d e f g h\n",
+        "F 0 660389874933379 32 95 126 0 1919 40\n",
+        "D /tmp/d-0.ppm 12346\n"])
+    rec._read()
+    check("read_frames", rec.frames, [(660389861257350, 32, 40), (660389861257351, -1, -1)])
+    check("read_detail", rec.detail[0], (660389861257350, 660389874933379, 32, 95, 126, 0, 1919, 40))
+    check("read_malformed", rec.malformed, 3)
+    # A frame with no presentation time (stamp 0) is counted, kept out of the log, and stops the run at the next snapshot.
+    check("read_unstamped", (rec.unstamped, len(rec.frames), len(rec.detail)), (1, 2, 2))
+    try:
+        rec.snapshot()
+        check("snapshot_unstamped_raises", "returned", "RuntimeError")
+    except RuntimeError as e:
+        check("snapshot_unstamped_raises", str(e), "the recorder saw 1 frames with no presentation time")
+    try:
+        rec.detail_snapshot()
+        check("detail_snapshot_unstamped_raises", "returned", "RuntimeError")
+    except RuntimeError as e:
+        check("detail_snapshot_unstamped_raises", str(e), "the recorder saw 1 frames with no presentation time")
+    check("read_header", rec.header, ["900", "700", "0", "12345"])
+    check("read_dumps", rec.dumps, ["/tmp/d-0.ppm"])
+    # Every mask reaches flea-framecap as -m, which leaves changes inside it out of the log.
+    check("mask_argv", recorder_argv("fc", (0, 0, 100, 100), [(0, 0, 100, 10), (5, 5, 1, 1)], None, None),
+          ["fc", "-r", "0,0,100,100", "-m", "0,0,100,10", "-m", "5,5,1,1"])
+    # What the calibration mask changes: without the echo at the key, first_ms reads the delay; with it, near zero.
+    masked = search_columns([(0, -1, -1), (270 * ms, 12, 40)], [200 * ms], 5000 * ms)
+    unmasked = search_columns([(0, -1, -1), (205 * ms, 12, 40), (270 * ms, 12, 40)], [200 * ms], 5000 * ms)
+    check("mask_first_masked", masked["first_ms"], 70.0)
+    check("mask_first_unmasked", unmasked["first_ms"], 5.0)
+    # Old libwayland brackets are CLOCK_REALTIME microseconds modulo 2^32 as ms.us, so they convert through the realtime offset.
+    off = (1_700_000_000 * NS) // wrap_ns * wrap_ns + 404635000 * 1000 - 7000 * MS
+    rt_lines = []
+    for t_ms in (7000, 7010, 7020, 7100, 7110):
+        us = (404635000 + (t_ms - 7000) * 1000) % (1 << 32)
+        rt_lines.append("[%7d.%03d]  -> wl_surface@23.attach(wl_buffer@41, 0, 0)" % (us // 1000, us % 1000))
+    g = attach_gaps(rt_lines, 7000 * MS, 7120 * MS, off)
+    check("gap_rt_attaches", g and g["attaches"], 5)
+    check("gap_rt_max", g and g["max_gap_ms"], 80.0)
+    # The held window keeps backend order: folders first, then natural names.
+    import shutil
+    hd = tempfile.mkdtemp()
+    os.mkdir(os.path.join(hd, "zebra-dir"))
+    for n in ("file_10.txt", "Apple.txt", "file_2.txt"):
+        open(os.path.join(hd, n), "w").close()
+    check("held_order", held_order(hd), ["zebra-dir", "Apple.txt", "file_2.txt", "file_10.txt"])
+    shutil.rmtree(hd)
+    # explore flea without --flea refuses by name instead of hitting a TypeError.
+    try:
+        explore(["flea", "/tmp", "query"])
+        check("explore_flea_needs_tree", "no refusal", "SystemExit")
+    except SystemExit as e:
+        check("explore_flea_needs_tree", "--flea" in str(e), True)
+    # The dolphin arm points at the dolphinrc travelling with the tool.
+    _argv, extra = entrant_argv({"entrant": "dolphin", "id": "d"}, "/tmp", {})
+    check("dolphin_xdg", extra["XDG_CONFIG_DIRS"].split(":")[0], os.path.join(HERE, "xdg-dolphin"))
+    # measure refuses an existing out instead of appending beside an old manifest.
+    with tempfile.NamedTemporaryFile(delete=False) as of:
+        pass
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as pf:
+        json.dump({"out": of.name}, pf)
+    try:
+        measure(pf.name)
+        check("measure_refuses_existing", "no refusal", "SystemExit")
+    except SystemExit as e:
+        check("measure_refuses_existing", "existing" in str(e), True)
+    os.unlink(of.name)
+    os.unlink(pf.name)
+    # A capped settled_ms is never a number built from caps: the cell names the count and the rank sinks.
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as tf:
+        tf.write(json.dumps({"manifest": {"plan": {"subjects": ["s-a"]}, "entrants": {
+            "s-a": {"entrant": "thunar", "typing": ""}, "strata": {"entrant": "strata", "typing": ""}}}}) + "\n")
+        for i, v in enumerate((10, 11, 12)):
+            tf.write(json.dumps({"arm": "s-a", "fixture": "local", "mode": "search", "length": 3, "first_ms": v,
+                                 "settled_ms": v + 5, "capped": False, "round": i}) + "\n")
+        tf.write(json.dumps({"arm": "s-a", "fixture": "local", "mode": "search", "length": 3, "first_ms": 11,
+                             "settled_ms": 15000, "capped": True, "round": 3}) + "\n")
+        for i, v in enumerate((30, 31, 32)):
+            tf.write(json.dumps({"arm": "strata", "fixture": "local", "mode": "search", "length": 3, "first_ms": v,
+                                 "settled_ms": v + 5, "capped": False, "round": i}) + "\n")
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        report(tf.name)
+    os.unlink(tf.name)
+    text = buf.getvalue()
+    check("cap_cell", "| s-a | 3 | 4 | 11 [10..12] | capped 1 of 4 |" in text, True)
+    check("cap_unbuilt", "15000" in text, False)
+    check("cap_verdict", "| local | search | 3 | settled_ms | s-a | capped 1 of 4 | strata | 36 [35..37] | 2 of 2 | n/a | capped | capped | n/a |" in text, True)
+    # A baseline arm with every settled row capped stays out of the minimum and is named with its cap count.
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as tf:
+        tf.write(json.dumps({"manifest": {"plan": {"subjects": ["s-b"]}, "entrants": {
+            "s-b": {"entrant": "thunar", "typing": ""}, "flea-old": {"entrant": "flea", "typing": "highlight only"},
+            "strata": {"entrant": "strata", "typing": ""}}}}) + "\n")
+        for i, v in enumerate((10, 11, 12)):
+            tf.write(json.dumps({"arm": "s-b", "fixture": "local", "mode": "search", "length": 3, "first_ms": v,
+                                 "settled_ms": v + 5, "capped": False, "round": i}) + "\n")
+        for i, v in enumerate((50, 51, 52)):
+            tf.write(json.dumps({"arm": "flea-old", "fixture": "local", "mode": "search", "length": 3, "first_ms": v,
+                                 "settled_ms": v + 5, "capped": True, "round": i}) + "\n")
+        for i, v in enumerate((30, 31, 32)):
+            tf.write(json.dumps({"arm": "strata", "fixture": "local", "mode": "search", "length": 3, "first_ms": v,
+                                 "settled_ms": v + 5, "capped": False, "round": i}) + "\n")
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        report(tf.name)
+    os.unlink(tf.name)
+    text = buf.getvalue()
+    check("cap_base_note", "baseline flea-old L3 settled_ms had every row capped (3 of 3)" in text, True)
+    check("cap_base_words", "no baseline, every row capped" in text, True)
+    check("cap_base_list", "|\n\n- baseline flea-old L3" in text, True)
+    # A capped subject beside one usable baseline blames neither baseline's caps.
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as tf:
+        tf.write(json.dumps({"manifest": {"plan": {"subjects": ["s-b"]}, "entrants": {
+            "s-b": {"entrant": "thunar", "typing": ""}, "flea-a": {"entrant": "flea", "typing": "highlight only"},
+            "flea-b": {"entrant": "flea", "typing": "highlight only"}, "strata": {"entrant": "strata", "typing": ""}}}}) + "\n")
+        for arm, base, capped in (("s-b", 10, True), ("flea-a", 50, False), ("flea-b", 60, True), ("strata", 30, False)):
+            for i in range(3):
+                tf.write(json.dumps({"arm": arm, "fixture": "local", "mode": "search", "length": 3, "first_ms": base + i,
+                                     "settled_ms": base + i + 5, "capped": capped, "round": i}) + "\n")
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        report(tf.name)
+    os.unlink(tf.name)
+    text = buf.getvalue()
+    check("cap_subject_own", ("no baseline, every row capped" in text, "baseline flea-b L3 settled_ms" in text), (False, True))
+    if fail:
+        print("\n".join("FAIL " + f for f in fail))
+        return 1
+    print("SELFTEST ok")
+    return 0
+
+
+def make_ctx(out_dir):
+    os.makedirs(out_dir, exist_ok=True)
+    ctx = {"out_dir": out_dir, "keys": Keys()}
+    ctx["rec_bin"] = build_recorder(os.path.join(out_dir, "rec"))
+    ctx["tui_conf"] = tempfile.mkdtemp(prefix="flea-tuiconf-")
+    subprocess.run(["cp", "-r", os.path.join(HERE, "flea-bench-tui") + "/.", ctx["tui_conf"]], check=True)
+    # broot's first-run shell-function prompt swallows keys, so the harness ships its answered marker.
+    os.makedirs(ctx["tui_conf"] + "/broot/launcher", exist_ok=True)
+    open(ctx["tui_conf"] + "/broot/launcher/installed-v1", "w").close()
+    ctx["states"] = {}
+    return ctx
+
+
+def explore(argv):
+    """explore ENTRANT DIR QUERY [--flea TREE] [--filter] [--enter] [--out DIR] [--json FILE]: one run with evidence, rows as JSON to FILE when given."""
+    ent, fixture, query = argv[0], argv[1], argv[2]
+    flea = argv[argv.index("--flea") + 1] if "--flea" in argv else None
+    if ent == "flea" and not flea:
+        raise SystemExit("explore flea needs --flea TREE naming the tree to launch")
+    out = argv[argv.index("--out") + 1] if "--out" in argv else tempfile.mkdtemp(prefix="flea-explore-")
+    ctx = make_ctx(out)
+    arm = {"id": ent + ("-" + os.path.basename(flea) if flea else ""), "entrant": ent, "flea_dir": flea}
+    if flea:
+        UI_TOKENS.append(flea + "/ui")
+    require_idle()
+    opts = {"evidence": True, "fixture_name": "explore", "mode": "filter" if "--filter" in argv else "search",
+            "enter_baseline": "--enter" in argv, "tag": "x"}
+    rows = run_arm(arm, fixture, query, ctx, opts)
+    for r in rows:
+        r.pop("key_times_ns", None)
+    text = json.dumps(rows, indent=1)
+    if "--json" in argv:
+        with open(argv[argv.index("--json") + 1], "w") as f:
+            f.write(text + "\n")
+    else:
+        print(text)
+    return 0
+
+
+PREFLIGHT_TOOLS = ("qs", "hyprctl", "gcc", "wayland-scanner", "strace", "ffmpeg", "kitty", "nautilus", "thunar", "nemo",
+                   "dolphin", "yazi", "pcmanfm", "broot", "grim", "ydotool")
+PREFLIGHT_XML = ("ext-image-capture-source/ext-image-capture-source-v1", "ext-image-copy-capture/ext-image-copy-capture-v1",
+                 "ext-foreign-toplevel-list/ext-foreign-toplevel-list-v1")
+
+
+def preflight():
+    """One line per need, `ok` or `MISSING`, so a lane can name the gaps before it books a window on them."""
+    import shutil
+    missing = 0
+    for tool in PREFLIGHT_TOOLS:
+        path = shutil.which(tool)
+        print("%-8s %-18s %s" % ("ok" if path else "MISSING", tool, path or ""))
+        missing += 0 if path else 1
+    base = os.environ.get("WAYLAND_PROTOCOLS", "/usr/share/wayland-protocols") + "/staging/"
+    for x in PREFLIGHT_XML:
+        have = os.access(base + x + ".xml", os.R_OK)
+        print("%-8s %-18s %s" % ("ok" if have else "MISSING", "protocol xml", base + x + ".xml"))
+        missing += 0 if have else 1
+    # Strata is the v0.21.0 build, found by path (never by PATH) and by its crate's version.
+    sbin = strata_bin()
+    manifest = os.path.join(os.path.dirname(sbin), "..", "..", "Cargo.toml")
+    version = ""
+    if os.path.exists(manifest):
+        with open(manifest) as f:
+            # Sample input, one Cargo.toml line: 'version = "0.21.3"' (key, quoted value).
+            for line in f:
+                if line.startswith("version"):
+                    version = line.split("=")[1].strip().strip('"')
+                    break
+    good = os.access(sbin, os.X_OK) and version.startswith("0.21.")
+    print("%-8s %-18s %s (crate version %s)" % ("ok" if good else "MISSING", "strata v0.21", sbin, version or "unknown"))
+    missing += 0 if good else 1
+    sock = ydotool_socket()
+    print("%-8s %-18s %s" % ("ok" if os.path.exists(sock) else "MISSING", "ydotool socket", sock))
+    missing += 0 if os.path.exists(sock) else 1
+    return 0 if not missing else 1
+
+
+def main(argv):
+    global ENV
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    cmd = argv[0]
+    if cmd == "pickquery":
+        print(json.dumps(pickquery(argv[1], "--flat" in argv)))
+        return 0
+    if cmd == "preflight":
+        return preflight()
+    if cmd in ("selftest", "report"):
+        return selftest() if cmd == "selftest" else report(argv[1])
+    ENV = session_env()
+    os.environ.update(ENV)
+    if cmd == "measure":
+        return measure(argv[1])
+    if cmd == "explore":
+        return explore(argv[1:])
+    if cmd == "calibrate":
+        delays, runs = [0, 50, 200], 10
+        rest = argv[1:]
+        while rest:
+            if rest[0] == "--delays":
+                delays = [int(v) for v in rest[1].split(",")]
+            elif rest[0] == "--runs":
+                runs = int(rest[1])
+            else:
+                print("unknown option " + rest[0], file=sys.stderr)
+                return 2
+            rest = rest[2:]
+        rep = calibrate(delays, runs)
+        ok = all(r.get("within_one_frame", False) for r in rep["rows"])
+        return 0 if ok else 1
+    print("unknown command " + cmd, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

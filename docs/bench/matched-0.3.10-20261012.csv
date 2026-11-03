@@ -1,0 +1,25 @@
+id,run,mapped_ms,settled_ms,pss_kb,cpu_s,child_pss_kb,thumbs_n,pss_anon_kb,uss_kb,drm_kb,thumbs_by_dir,cpu_tree_s,thumbs_by_format,ranked,preview_ms,cpu_reaped_s,cpu_sys_s,dirty_wb_kb,pgpgout_pre_kb,pgpgout_launch_kb,write_clean,rerun
+flea,1,541,1828,95878,0.90,5206,43,58544,77924,279544,fail=0;large=43,5.04,jpg=0;mp4=35;png=0;txt=0;webm=8;webp=0;unknown=0,yes,-,1.06,5.04,32,0,696,1,0
+flea-anchor,1,513,1900,98682,0.97,4133,43,61556,80708,281724,fail=0;large=43,6.27,jpg=0;mp4=35;png=0;txt=0;webm=8;webp=0;unknown=0,yes,-,1.12,6.27,0,0,696,1,0
+strata,1,671,3264,88389,1.21,0,unmeasurable,50756,79036,122384,fail=0;large=43,7.61,unmeasurable,unranked: its watches saw 0 renders for 86 opened fixture files so neither is a count,-,1.42,7.61,0,0,4372,1,0
+flea,2,529,1818,95848,0.85,5070,43,58576,77932,279544,fail=0;large=43,5.04,jpg=0;mp4=35;png=0;txt=0;webm=8;webp=0;unknown=0,yes,-,1.01,5.04,296,0,700,1,0
+flea-anchor,2,523,1905,97479,0.93,3983,43,60488,79544,281724,fail=0;large=43,6.13,jpg=0;mp4=35;png=0;txt=0;webm=8;webp=0;unknown=0,yes,-,1.09,6.13,0,0,696,1,0
+strata,2,656,3191,88382,1.19,0,unmeasurable,50724,78772,122384,fail=0;large=43,7.50,unmeasurable,unranked: its watches saw 0 renders for 86 opened fixture files so neither is a count,-,1.39,7.50,32,0,4076,1,0
+flea,3,543,1846,95497,0.88,5122,43,58292,77596,279544,fail=0;large=43,4.94,jpg=0;mp4=35;png=0;txt=0;webm=8;webp=0;unknown=0,yes,-,1.04,4.94,208,0,696,1,0
+flea-anchor,3,503,1932,97982,0.95,4152,43,60972,80020,277496,fail=0;large=43,6.27,jpg=0;mp4=35;png=0;txt=0;webm=8;webp=0;unknown=0,yes,-,1.10,6.27,0,0,696,1,0
+strata,3,655,3659,88090,1.23,0,unmeasurable,50704,78452,122384,fail=0;large=43,7.62,unmeasurable,unranked: its watches saw 0 renders for 86 opened fixture files so neither is a count,-,1.43,7.62,0,0,4372,1,0
+nautilus,1,876,18599,180602,9.73,0,641,76396,168164,188248,fail=0;large=641,112.56,jpg=0;mp4=400;png=71;txt=0;webm=100;webp=70;unknown=0,yes,-,13.84,112.56,32,0,14912,1,0
+thunar,1,507,925,34989,0.83,0,unmeasurable,17692,22212,0,fail=0;large=0,0.90,unmeasurable,unranked: nothing reached the thumbnail cache so its work was not measured,-,0.83,0.90,0,0,0,1,0
+pcmanfm,1,406,116022,43165,68.34,0,700,19980,30272,0,fail=0;large=0;normal=700,170.69,jpg=0;mp4=400;png=200;txt=0;webm=100;webp=0;unknown=0,yes,-,123.47,170.69,0,0,22136,1,0
+nemo,1,842,1710,46133,1.47,0,unmeasurable,26848,33368,0,fail=0;large=0,1.65,unmeasurable,unranked: nothing reached the thumbnail cache so its work was not measured,-,1.47,1.65,260,0,408,1,0
+dolphin,1,733,13121,101603,4.94,0,500,19780,66860,0,fail=0;large=500,63.84,jpg=50;mp4=360;png=0;txt=0;webm=90;webp=0;unknown=0,yes,-,62.30,63.84,0,0,64716,1,0
+nautilus,2,892,17934,180661,9.89,0,641,76400,168356,188248,fail=0;large=641,114.32,jpg=0;mp4=400;png=71;txt=0;webm=100;webp=70;unknown=0,yes,-,14.00,114.32,32,0,784,1,0
+thunar,2,517,936,34934,0.82,0,unmeasurable,17664,22152,0,fail=0;large=0,0.89,unmeasurable,unranked: nothing reached the thumbnail cache so its work was not measured,-,0.82,0.89,32,0,136,1,0
+pcmanfm,2,420,114609,43031,69.22,0,700,19916,30136,0,fail=0;large=0;normal=700,171.36,jpg=0;mp4=400;png=200;txt=0;webm=100;webp=0;unknown=0,yes,-,124.41,171.36,80,0,20856,1,0
+nemo,2,842,1746,46755,1.53,0,unmeasurable,27572,34016,0,fail=0;large=0,1.72,unmeasurable,unranked: nothing reached the thumbnail cache so its work was not measured,-,1.53,1.72,344,220,408,1,0
+dolphin,2,746,13185,102888,4.94,0,500,21832,67620,0,fail=0;large=500,64.30,jpg=50;mp4=360;png=0;txt=0;webm=90;webp=0;unknown=0,yes,-,62.78,64.30,0,0,64752,1,0
+nautilus,3,876,18192,180740,10.21,0,641,76384,168432,188248,fail=0;large=641,115.13,jpg=0;mp4=400;png=71;txt=0;webm=100;webp=70;unknown=0,yes,-,14.59,115.13,32,0,796,1,0
+thunar,3,500,933,34989,0.83,0,unmeasurable,17652,22212,0,fail=0;large=0,0.90,unmeasurable,unranked: nothing reached the thumbnail cache so its work was not measured,-,0.83,0.90,32,0,0,1,0
+pcmanfm,3,416,114994,42634,69.26,0,700,19660,29732,0,fail=0;large=0;normal=700,171.88,jpg=0;mp4=400;png=200;txt=0;webm=100;webp=0;unknown=0,yes,-,124.40,171.88,0,0,21652,1,0
+nemo,3,821,1697,45476,1.49,0,unmeasurable,26308,32676,0,fail=0;large=0,1.66,unmeasurable,unranked: nothing reached the thumbnail cache so its work was not measured,-,1.49,1.66,104,0,272,1,0
+dolphin,3,727,13181,101667,4.99,0,500,19800,66976,0,fail=0;large=500,64.40,jpg=50;mp4=360;png=0;txt=0;webm=90;webp=0;unknown=0,yes,-,62.88,64.40,0,0,64768,1,0

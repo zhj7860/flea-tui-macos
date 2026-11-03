@@ -1,0 +1,84 @@
+#!/bin/bash
+# Stages the tarball flea-bin installs from, laid out as docs/release.md "By hand" describes it.
+# Usage: packaging/flea-bin-tarball <binary> <version> <arch> <outdir>
+set -euo pipefail
+
+if [ "$#" -ne 4 ]; then
+  echo "flea-bin-tarball: expected <binary> <version> <arch> <outdir>" >&2
+  exit 2
+fi
+binary=$(realpath -e -- "$1") || { echo "flea-bin-tarball: no file at '$1'" >&2; exit 1; }
+version=$2
+arch=$3
+outdir=$4
+
+here=$(cd "$(dirname "$0")" && pwd)
+repo=$(dirname "$here")
+
+# The same expression the release workflow holds the tag to, so 1x.2.3 and 1.2.3.4 stop here.
+if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "flea-bin-tarball: version '$version' is not X.Y.Z" >&2
+  exit 2
+fi
+
+# e_machine at offset 18 proves the leg packaged its own architecture's binary: 0x3e x86_64, 0xb7 aarch64.
+case "$arch" in
+  x86_64) want_machine="3e 00" ;;
+  aarch64) want_machine="b7 00" ;;
+  *) echo "flea-bin-tarball: arch '$arch' is not x86_64 or aarch64" >&2; exit 2 ;;
+esac
+[ -x "$binary" ] || { echo "flea-bin-tarball: '$binary' is not an executable file" >&2; exit 1; }
+[ "$(head -c 4 "$binary" | tr -d '\0')" = $'\x7fELF' ] || {
+  echo "flea-bin-tarball: '$binary' is not an ELF binary" >&2; exit 1; }
+# Sample input: od -An -tx1 -j18 -N2 prints " 3e 00" for an x86_64 ELF.
+read -r lo hi < <(od -An -tx1 -j18 -N2 "$binary")
+machine="$lo $hi"
+[ "$machine" = "$want_machine" ] || {
+  echo "flea-bin-tarball: '$binary' has e_machine '$machine', which is not $arch" >&2; exit 1; }
+
+# The binary runs here to print its version, so stage a cross-built one inside a container of its own architecture.
+printed=$("$binary" --version) || { echo "flea-bin-tarball: '$binary --version' failed" >&2; exit 1; }
+[ "$printed" = "$version" ] || {
+  echo "flea-bin-tarball: the binary prints '$printed', the tarball says '$version'" >&2; exit 1; }
+
+name="flea-$version-linux-$arch"
+tarball="flea-v$version-linux-$arch.tar.gz"
+stage=$(mktemp -d "${TMPDIR:-/tmp}/flea-bin-tarball.XXXXXX")
+cleanup() { rm -rf -- "$stage"; }
+trap cleanup EXIT
+root="$stage/$name"
+
+# The source PKGBUILD's package() file set, path for path: a path missing here fails the workflow's makepkg proof.
+umask 022
+install -Dm755 "$binary" "$root/flea"
+install -Dm644 "$repo/LICENSE" -t "$root"
+install -Dm755 "$repo/tools/flea-gio-auth" "$repo/tools/flea-udisks" "$repo/tools/flea-portal" "$repo/tools/flea-filemanager1" "$repo/tools/flea-mpris" -t "$root/tools"
+install -Dm644 "$repo/packaging/flea.portal" \
+  "$repo/packaging/org.freedesktop.impl.portal.desktop.flea.service" \
+  "$repo/packaging/com.thisisgm.flea.FileManager1.service" \
+  "$repo/packaging/com.thisisgm.flea.desktop" \
+  "$repo/packaging/com.thisisgm.flea.svg" \
+  "$repo/packaging/flea.hook" -t "$root/packaging"
+install -Dm644 "$repo/ui/qmldir" "$repo"/ui/*.qml "$repo"/ui/*.js -t "$root/ui"
+install -Dm644 "$repo"/ui/js/*.js "$repo"/ui/js/*.mjs -t "$root/ui/js"
+install -Dm644 "$repo"/ui/vendor/*.mjs -t "$root/ui/vendor"
+install -Dm644 "$repo"/ui/vendor/LICENSES/* -t "$root/ui/vendor/LICENSES"
+install -Dm644 "$repo/ui/boot/shell.qml" "$repo/ui/boot/picker.qml" "$repo/ui/boot/fleatab.qml" "$repo/ui/boot/tabtearoff.qml" -t "$root/ui/boot"
+install -Dm644 "$repo/shelf/manifest.json" "$repo/shelf/README.md" "$repo"/shelf/*.qml "$repo"/shelf/*.js -t "$root/shelf"
+
+# Owner, order, modes, mtime and gzip's own header are fixed, so the same tree and binary give the same bytes.
+mtime=${SOURCE_DATE_EPOCH:-}
+if [ -z "$mtime" ] && [ -e "$repo/.git" ]; then
+  # A checkout git refuses to read (safe.directory, a broken clone) fails here under set -e, never falls back.
+  mtime=$(git -C "$repo" log -1 --format=%ct)
+elif [ -z "$mtime" ]; then
+  mtime=$(date +%s)
+  echo "flea-bin-tarball: no SOURCE_DATE_EPOCH and no .git in $repo, so these bytes carry today's date" >&2
+fi
+mkdir -p "$outdir"
+tar --create --file - --directory "$stage" \
+  --owner=0 --group=0 --numeric-owner --sort=name --mtime="@$mtime" "$name" | gzip -n > "$outdir/$tarball"
+(cd "$outdir" && sha256sum "$tarball" > "$tarball.sha256")
+
+echo "$outdir/$tarball"
+echo "$outdir/$tarball.sha256"

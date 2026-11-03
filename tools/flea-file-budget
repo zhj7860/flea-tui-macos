@@ -1,0 +1,266 @@
+#!/bin/bash
+# Over the hard cap fails; over the soft budget only warns, see AGENTS.md "File budget".
+set -u
+
+soft_rust=250; hard_rust=400
+soft_qml=250;  hard_qml=400
+soft_js=200;   hard_js=300
+
+# Recorded debts and scoped release exceptions retain exact per-file ceilings; global limits stay unchanged.
+known_over_cap="shelf/Model.js 701
+tests/csv-preview.qml 520
+shelf/Panel.qml 443
+shelf/ShelfCard.qml 444
+shelf/ShelfService.qml 481
+src/backend/copyfile.rs 739
+src/backend/codereq.rs 408
+src/backend/tags.rs 408
+src/backend/searchsession.rs 350
+src/backend/searchtags.rs 444
+src/backend/searchtags_tests.rs 519
+src/backend/tagsreq_tests.rs 383
+src/backend/copyfile_tests.rs 694
+src/backend/durable.rs 809
+src/backend/dirsize.rs 422
+src/backend/durable_tests.rs 1396
+src/backend/jump_tests.rs 487
+src/backend/renamecompat.rs 721
+src/backend/gvfslist.rs 513
+src/backend/imagesize.rs 559
+src/backend/iomount.rs 634
+src/backend/localsend.rs 432
+src/backend/menu_actions.rs 674
+src/backend/menu_registry.rs 569
+src/backend/meta.rs 550
+src/backend/metareq.rs 541
+src/backend/movebatch.rs 477
+src/backend/movebatch_tests.rs 752
+src/backend/opsdispatch.rs 2273
+src/backend/opsreq.rs 563
+src/backend/opsreq/tests.rs 502
+src/backend/permissions.rs 703
+src/backend/run.rs 1116
+src/backend/officepdf.rs 404
+src/backend/run_session_tests.rs 525
+src/backend/ops.rs 440
+src/backend/thumbs.rs 521
+src/backend/thumbspec.rs 479
+src/backend/dirsizeworker.rs 573
+src/backend/watch.rs 550
+src/backend/thumbreq.rs 464
+src/backend/undo.rs 717
+src/backend/undo_tests.rs 439
+src/backend/undoshare.rs 414
+src/backend/undoshare_tests.rs 563
+src/backend/collide_replace_tests.rs 492
+src/backend/proto.rs 473
+src/backend/sandbox.rs 401
+src/backend/thumbworker.rs 961
+src/backend/trashbrowse.rs 1025
+src/backend/rawpreview_tests.rs 427
+src/backend/trashdelete.rs 987
+src/clip/watch_end_tests.rs 405
+src/gvfsprefetch_tests.rs 398
+src/gui.rs 505
+src/tui/actions.rs 1058
+src/tui/hold_tests.rs 427
+src/tui/input.rs 455
+src/tui/model.rs 1268
+src/tui/mod.rs 419
+src/tui/render.rs 913
+src/uischema.rs 597
+src/uistate.rs 849
+src/uistore.rs 568
+src/vulkan.rs 751
+tests/js/columns.js 687
+tests/js/drag.js 493
+tests/js/dropsflow.js 301
+tests/js/collide.js 319
+tests/js/facts.js 415
+tests/js/devices.js 437
+tests/js/previewswap.js 475
+tests/js/mdstructure.js 655
+tests/js/keymap.js 366
+tests/js/focus.js 843
+tests/js/mounts.js 359
+tests/js/menu.js 673
+tests/js/nav.js 478
+tests/js/rail.js 471
+tests/js/picker.js 382
+tests/picker-grid.qml 465
+tests/picker-hunt.qml 448
+tests/permissions-focus.qml 417
+tests/picker-040.qml 952
+tests/js/network.js 307
+tests/js/ops.js 574
+tests/js/slowclick.js 309
+tests/js/settings.js 398
+tests/js/tap.js 401
+tests/js/uistate.js 489
+tests/js/watch.js 541
+tests/js/xwwatch.js 299
+tests/js/tabs.js 798
+tests/js/search.js 336
+tests/js/previewkeys.js 344
+tests/button-members.qml 524
+tests/chromering.qml 413
+tests/columnrow-geom.qml 426
+tests/dialog-board.qml 663
+tests/columnscost.qml 418
+tests/rowcost.qml 441
+tests/gridmark.qml 419
+tests/columnsfilter.qml 403
+tests/columnsfolder.qml 400
+tests/quicklook-firstframe.qml 457
+tests/markdown-render.qml 894
+tests/rename-cost.qml 482
+tests/markdown-linearity.qml 679
+tests/markdown-preview-state.qml 474
+tests/markdown-tables.qml 401
+tests/quicklook-firstframe.js 214
+tests/preview-settle-live.qml 584
+tests/preview-decode.qml 1012
+tests/js/status.js 349
+tests/rename-grid-bottom.qml 439
+tests/rename-grid-bottom.js 351
+tests/js/runfile.js 313
+tests/ring-bounds.qml 710
+tests/menu-fit.qml 448
+tests/search-live.qml 417
+tests/sidebar-flows.qml 691
+tests/touchpad.qml 882
+tests/xwsettings-tabs.qml 379
+ui/Backend.qml 606
+ui/MenuActionDialog.qml 396
+ui/ChromeBar.qml 352
+ui/ColumnsArea.qml 594
+ui/ColumnPane.qml 461
+ui/ContextMenu.qml 740
+ui/ConvertDialog.qml 456
+ui/GridArea.qml 665
+ui/Ipc.qml 993
+tests/gridprebuild.qml 457
+tests/code-column.qml 416
+tests/preview-pdf-flow.qml 439
+tests/preview-layout-loop.qml 408
+tests/preview-scroll.qml 523
+tests/columnsprebuild.qml 416
+ui/KeymapSheet.qml 551
+ui/List.qml 480
+tests/listprebuild.qml 410
+tests/poolpark.qml 419
+tests/touchpad-edge.qml 438
+tests/railmotion.qml 463
+ui/FastScrollHandler.qml 476
+ui/FigureService.qml 405
+ui/FlashView.qml 397
+ui/NetworkDialog.qml 435
+ui/NetworkForm.qml 426
+ui/NetworkMounts.qml 913
+ui/OpenWithDialog.qml 613
+ui/Pane.qml 1235
+ui/PaneMenuActions.qml 527
+ui/PaneWire.qml 602
+ui/PermissionsDialog.qml 658
+ui/PickerWindow.qml 846
+ui/Preview.qml 1010
+ui/PreviewColumn.qml 559
+ui/DeviceMounts.qml 540
+ui/js/Facts.js 402
+ui/PreviewPdf.qml 482
+ui/PickerChrome.qml 295
+ui/PreviewMarkdown.qml 668
+tests/markdown-code.qml 477
+ui/Row.qml 469
+ui/SettingsPanel.qml 547
+ui/SettingsRow.qml 409
+ui/Sidebar.qml 716
+ui/StatusBar.qml 477
+ui/Theme.qml 480
+ui/TrashView.qml 492
+ui/UnlockDialog.qml 450
+ui/ViewState.qml 565
+ui/WindowBody.qml 817
+ui/js/Anchor.js 379
+ui/js/ColumnsCarry.js 103
+ui/js/Devices.js 440
+ui/js/Filter.js 284
+ui/js/Focus.js 492
+ui/js/Keymap.js 370
+ui/js/Nav.js 328
+ui/js/Markdown.js 135
+ui/js/MdBlocks.js 437
+ui/js/FigureWorker.mjs 619
+ui/js/MdDocument.js 337
+ui/js/MdLeaf.js 309
+ui/js/MdHtml.js 307
+ui/js/Menu.js 513
+ui/js/Drag.js 364
+ui/js/Format.js 305
+ui/js/Ops.js 577
+ui/js/Search.js 396
+ui/js/Mounts.js 320
+ui/js/Picker.js 353
+ui/js/Settings.js 476
+ui/js/Scroll.js 304
+ui/js/Tabs.js 736
+ui/js/UiState.js 438
+ui/TabBar.qml 673
+ui/boot/fleatab.qml 50
+tests/unlock-stdin.qml 483
+src/backend/searchindex.rs 401
+tests/gridjump.qml 516
+tests/gridbare.qml 426
+src/backend/trash.rs 401
+src/backend/trash_tests.rs 423
+tests/permissions-adv.qml 402
+tests/quicklook-code.qml 463"
+
+status=0
+
+# A file listed twice hands the ceiling lookup two numbers and breaks its comparison.
+duplicated=$(printf '%s\n' "$known_over_cap" | awk '{ print $1 }' | sort | uniq -d)
+if [ -n "$duplicated" ]; then
+  echo "DUPLICATE ceiling: $duplicated"
+  status=1
+fi
+
+budget_for() {
+  case "$1" in
+    *.rs)  echo "$soft_rust $hard_rust" ;;
+    *.qml) echo "$soft_qml $hard_qml" ;;
+    *.js|*.mjs)  echo "$soft_js $hard_js" ;;
+    *)     echo "" ;;
+  esac
+}
+
+while IFS= read -r file; do
+  # Pinned vendor bundles are excluded as generated output; the generated Keymap.js keeps its recorded ceiling.
+  case "$file" in
+    ui/vendor/*) continue ;;
+  esac
+  budgets=$(budget_for "$file")
+  [ -z "$budgets" ] && continue
+  soft=${budgets% *}
+  hard=${budgets#* }
+  lines=$(wc -l < "$file")
+  if [ "$lines" -gt "$hard" ]; then
+    # Sample input: ui/Preview.qml 724, an exact per-file ceiling from known_over_cap.
+    recorded=$(printf '%s\n' "$known_over_cap" | awk -v f="$file" '$1 == f { print $2; exit }')
+    if [ -n "$recorded" ]; then
+      if [ "$lines" -gt "$recorded" ]; then
+        echo "GREW      $file: $lines lines, recorded $recorded, cap $hard"
+        status=1
+      else
+        echo "known     $file: $lines lines, recorded $recorded, cap $hard"
+      fi
+      continue
+    fi
+    echo "OVER CAP  $file: $lines lines, cap $hard"
+    status=1
+  elif [ "$lines" -gt "$soft" ]; then
+    echo "over soft $file: $lines lines, budget $soft, split it"
+  fi
+done < <(find src ui shelf tests -type f \( -name '*.rs' -o -name '*.qml' -o -name '*.js' -o -name '*.mjs' \) 2>/dev/null)
+
+exit $status

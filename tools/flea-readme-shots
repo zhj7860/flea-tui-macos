@@ -1,0 +1,898 @@
+#!/bin/bash
+# Builds the fixture the README images are shot against.
+#   tools/flea-readme-shots fixture     build it and list it
+#   tools/flea-readme-shots teardown    delete it
+#
+# The old README images were shot against the media fixture, whose files are synthetic noise, so
+# every thumbnail rendered as coloured static and every clip as colour bars. Nothing here is a
+# photograph either, but each frame is built from a vector skeleton for composition and procedural
+# noise for every edge, surface and grain, which is what reads as a photograph at the 120 px the
+# grid draws. Two earlier attempts that skipped the noise pass read as flat vector art instead.
+# Hard rule 9: every write and delete is inside a sandbox tools/flea-sandbox-guard made.
+set -u
+. "$(dirname "$0")/../tools/flea-sandbox-guard"
+
+root=${DIR:-$FIXTURE_ROOT/flea-readme}
+selects=$root/Selects
+work=$root/.build
+
+# A camera's pixel count, so the Size column carries the megabytes a real photo directory does.
+img_w=3000
+img_h=2000
+# The maps are generated small and scaled up: they are all low frequency, and a 0x150 blur at full
+# size costs seconds per image for a result the eye cannot tell from this one.
+map_w=375
+map_h=250
+jpeg_quality=88
+# 150 dpi A4, the size a contact sheet is actually laid out at.
+page_w=1240
+page_h=1754
+page_header_h=150
+contact_pages=5
+frames_per_sheet=6
+selects_count=18
+clip_seconds=12
+clip_fps=30
+tone_seconds=90
+tone_hz=440
+# The transfer card publishes every 250 ms and has no ipc reader to wait on, so the copy it is
+# photographed during has to still be running: four masters of this size take seconds, not one frame.
+master_count=4
+master_seconds=20
+master_bitrate=20M
+
+fail() {
+  printf 'flea-readme-shots: %s\n' "$*" >&2
+  exit 1
+}
+
+# Every encode is checked and the tool's own message is quoted, so a half-built fixture cannot exit 0.
+run() {
+  local err
+  if ! err=$("$@" 2>&1 >/dev/null); then
+    fail "$* failed: $err"
+  fi
+}
+
+require_tools() {
+  local tool
+  for tool in magick rsvg-convert ffmpeg bsdtar findmnt; do
+    command -v "$tool" >/dev/null || fail "$tool is missing"
+  done
+  ffmpeg -hide_banner -encoders 2>/dev/null | grep -q libx264 \
+    || fail "ffmpeg has no libx264, so the clips cannot be encoded"
+  ffmpeg -hide_banner -encoders 2>/dev/null | grep -q libmp3lame \
+    || fail "ffmpeg has no libmp3lame, so the audio file cannot be encoded"
+}
+
+# ------------------------------------------------------------------ the picture generators
+
+# Mid grey is zero displacement, so a blurred plasma pushes every edge a few pixels either way and
+# no horizon, ridge or reflection stays mathematically perfect.
+warp_map() {
+  run magick -size ${map_w}x${map_h} -seed "$1" plasma:fractal -colorspace Gray \
+    -resize "${img_w}x${img_h}!" -blur 0x18 -auto-level -level 25%,75% "$2"
+}
+
+# Cloud, haze and surface texture are the same thing at different levels; the level IS the strength,
+# because a higher black point leaves less of the plasma above it to screen on.
+noise_layer() {
+  run magick -size $((map_w * 2))x$((map_h * 2)) -seed "$1" plasma:fractal -colorspace Gray \
+    -resize "${img_w}x${img_h}!" -blur 0x4 -auto-level -level "$2" "$3"
+}
+
+# One vignette serves every frame, so the expensive blur is paid once per build.
+build_vignette() {
+  run magick -size 750x500 xc:white -fill black \
+    -draw 'roundrectangle 26,26 724,474 130,130' -blur 0x38 -negate \
+    -resize "${img_w}x${img_h}!" "$work/vignette.png"
+}
+
+# Grain, a film curve and the vignette. A flat render is what gave the game away, so nothing ships
+# without this pass.
+finish() {
+  local src=$1 dst=$2 sat=$3
+  run magick "$src" \
+    -attenuate 0.35 +noise Gaussian \
+    -modulate 100,"$sat",100 \
+    -sigmoidal-contrast 2.5x50% \
+    "$work/vignette.png" -compose multiply -composite \
+    -quality "$jpeg_quality" "$dst"
+}
+
+# Warm light low over water. The stops are arguments so one generator covers dawn, dusk and storm.
+# sun_x is in viewBox units and sun_cx is the same point as a 0..1 fraction, passed rather than
+# computed because bash has no float and this file keeps its arithmetic in the shell.
+svg_shore() {
+  local high=$1 mid=$2 low=$3 glow=$4 sea_hi=$5 sea_lo=$6 sun=$7 sun_x=$8 sun_cx=$9
+  cat <<SVG
+<svg xmlns="http://www.w3.org/2000/svg" width="$img_w" height="$img_h" viewBox="0 0 1600 1066.667">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0.00" stop-color="$high"/><stop offset="0.32" stop-color="$mid"/>
+      <stop offset="0.54" stop-color="$low"/><stop offset="0.66" stop-color="$glow"/>
+    </linearGradient>
+    <linearGradient id="sea" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0.00" stop-color="$sea_hi"/><stop offset="1.00" stop-color="$sea_lo"/>
+    </linearGradient>
+    <radialGradient id="halo" cx="$sun_cx" cy="0.625" r="0.40">
+      <stop offset="0" stop-color="$sun" stop-opacity="0.70"/>
+      <stop offset="1" stop-color="$sun" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="1600" height="706" fill="url(#sky)"/>
+  <rect width="1600" height="1067" fill="url(#halo)"/>
+  <circle cx="$sun_x" cy="666" r="42" fill="$sun"/>
+  <rect y="702" width="1600" height="365" fill="url(#sea)"/>
+  <path d="M0 704 C 90 668, 190 690, 300 676 S 500 700, 620 704 Z" fill="#1b2230"/>
+  <path d="M1160 704 C 1260 672, 1360 692, 1460 668 L1600 656 L1600 704 Z" fill="#1b2230"/>
+</svg>
+SVG
+}
+
+# Layered ridges, each hazed toward the sky so distance reads as distance.
+svg_ridges() {
+  local sky_hi=$1 sky_lo=$2 r1=$3 r2=$4 r3=$5 r4=$6 r5=$7
+  cat <<SVG
+<svg xmlns="http://www.w3.org/2000/svg" width="$img_w" height="$img_h" viewBox="0 0 1600 1066.667">
+  <defs><linearGradient id="s" x1="0" y1="0" x2="0" y2="1">
+    <stop offset="0" stop-color="$sky_hi"/><stop offset="1" stop-color="$sky_lo"/></linearGradient></defs>
+  <rect width="1600" height="1067" fill="url(#s)"/>
+  <path d="M0 596 C 180 512, 300 566, 470 498 S 760 588, 940 516 S 1270 570, 1440 500 L1600 534 L1600 1067 L0 1067 Z" fill="$r1"/>
+  <path d="M0 692 C 210 604, 360 674, 540 592 S 830 692, 1020 606 S 1330 676, 1500 596 L1600 626 L1600 1067 L0 1067 Z" fill="$r2"/>
+  <path d="M0 800 C 240 704, 420 788, 620 692 S 900 800, 1120 706 S 1400 786, 1560 700 L1600 716 L1600 1067 L0 1067 Z" fill="$r3"/>
+  <path d="M0 918 C 280 812, 500 906, 720 800 S 1000 912, 1240 808 S 1480 900, 1600 836 L1600 1067 L0 1067 Z" fill="$r4"/>
+  <path d="M0 1040 C 300 950, 560 1030, 820 940 S 1140 1036, 1400 946 L1600 980 L1600 1067 L0 1067 Z" fill="$r5"/>
+</svg>
+SVG
+}
+
+# The shared path for the two vector-skeleton scenes: texture in, then warp the whole frame as one.
+render_svg_scene() {
+  local dst=$1 seed=$2 sat=$3 cloud_level=$4 svg=$5
+  printf '%s\n' "$svg" > "$work/scene.svg"
+  run rsvg-convert -w "$img_w" -h "$img_h" -o "$work/scene.flat.png" "$work/scene.svg"
+  noise_layer "$((seed + 5))" "$cloud_level" "$work/scene.cloud.png"
+  warp_map "$seed" "$work/scene.warp.png"
+  run magick "$work/scene.flat.png" "$work/scene.cloud.png" -compose screen -composite \
+    "$work/scene.tex.png"
+  run magick "$work/scene.tex.png" "$work/scene.warp.png" \
+    -compose displace -define compose:args=14x14 -composite "$work/scene.raw.png"
+  finish "$work/scene.raw.png" "$dst" "$sat"
+}
+
+# Points of light thrown far out of focus. Nothing in it is straight, so nothing reads as vector.
+render_bokeh() {
+  local dst=$1 seed=$2 back=$3
+  local i x y r a col
+  local cmd cols
+  RANDOM=$seed
+  cols=('#f0a95c' '#e8735a' '#f6d79a' '#7fb2d9' '#c98adf' '#f4b8c4')
+  cmd=(magick -size ${img_w}x${img_h} xc:"$back")
+  for i in $(seq 1 70); do
+    x=$((RANDOM % img_w)); y=$((RANDOM % img_h)); r=$((60 + RANDOM % 250))
+    a=$((25 + RANDOM % 55)); col=${cols[$((RANDOM % 6))]}
+    cmd+=(-fill "$col" -draw "fill-opacity 0.${a} circle $x,$y $((x + r)),$y")
+  done
+  run "${cmd[@]}" -blur 0x48 "$work/scene.raw.png"
+  finish "$work/scene.raw.png" "$dst" 105
+}
+
+# Cloud over a graded sky, the one subject where soft and formless is the truth.
+render_sky() {
+  local dst=$1 seed=$2 low=$3 high=$4 cloud=$5
+  noise_layer "$seed" 38%,90% "$work/scene.mask.png"
+  run magick -size ${img_w}x${img_h} gradient:"$low-$high" "$work/scene.bg.png"
+  run magick "$work/scene.bg.png" \( -size ${img_w}x${img_h} gradient:"$cloud" \) \
+    "$work/scene.mask.png" -compose over -composite "$work/scene.raw.png"
+  finish "$work/scene.raw.png" "$dst" 104
+}
+
+# ------------------------------------------------------------------ the pictures
+
+# Every name is generated, and each names the scene it actually draws, so a reader skimming the grid
+# is never told "bokeh" over a picture of a ridge.
+# Sample row: "pier-at-dusk|shore|157|dusk", read as name|scene|seed|palette.
+selects_table() {
+  cat <<'ROWS'
+blue-hour-rooftops|shore|101|bluehour
+bokeh-market-lights|bokeh|103|warm
+breakwater-mist|ridges|107|cool
+cliff-path-haze|ridges|109|warm
+coastline-at-dawn|shore|113|dawn
+harbour-lights|shore|127|dusk
+headland-storm|shore|131|storm
+high-cloud-study|sky|137|day
+lighthouse-long-exposure|shore|139|night
+morning-fog-valley|ridges|149|pale
+night-market-blur|bokeh|151|cool
+pier-at-dusk|shore|157|dusk
+ridgeline-panorama|ridges|163|blue
+cirrus-at-noon|sky|167|bright
+sea-stack-silhouette|shore|173|storm
+summer-sky|sky|179|day
+lantern-bokeh|bokeh|181|warm
+winter-treeline|ridges|191|pale
+ROWS
+}
+
+render_named() {
+  local name=$1 scene=$2 seed=$3 palette=$4 dst=$5
+  case "$scene:$palette" in
+    shore:dawn)     render_svg_scene "$dst" "$seed" 112 60%,97% "$(svg_shore '#1e2f4c' '#6b5170' '#c26c4a' '#f7d59c' '#94614a' '#141c29' '#fff0cf' 1008 0.630)" ;;
+    shore:dusk)     render_svg_scene "$dst" "$seed" 114 58%,96% "$(svg_shore '#16233d' '#57406a' '#b4543f' '#f2c184' '#7d4f42' '#101825' '#ffe3ae' 620 0.388)" ;;
+    shore:bluehour) render_svg_scene "$dst" "$seed" 106 62%,97% "$(svg_shore '#0d1830' '#28365e' '#4d5f88' '#9fb0cc' '#3a4864' '#0b111c' '#d8e2f2' 1180 0.738)" ;;
+    shore:storm)    render_svg_scene "$dst" "$seed" 96  50%,92% "$(svg_shore '#20242e' '#3c414c' '#666a6f' '#9a9186' '#4a4c53' '#15171d' '#c9bda8' 480 0.300)" ;;
+    shore:night)    render_svg_scene "$dst" "$seed" 102 64%,98% "$(svg_shore '#070c1a' '#131f3c' '#2b3b60' '#6d7ea0' '#1d2740' '#05080f' '#c2cfe8' 880 0.550)" ;;
+    ridges:cool)    render_svg_scene "$dst" "$seed" 108 55%,95% "$(svg_ridges '#5b83a8' '#dfe4e2' '#b9cad8' '#93a9bd' '#67798e' '#3f4c5c' '#242d38')" ;;
+    ridges:warm)    render_svg_scene "$dst" "$seed" 110 57%,95% "$(svg_ridges '#8f9fae' '#e8dfd2' '#cbc3b4' '#a89b89' '#7d6f5e' '#54483a' '#31291f')" ;;
+    ridges:pale)    render_svg_scene "$dst" "$seed" 94  52%,93% "$(svg_ridges '#94a7b6' '#eef1f0' '#d5dee2' '#b4c2c9' '#8d9ca6' '#65737d' '#414c55')" ;;
+    ridges:blue)    render_svg_scene "$dst" "$seed" 112 56%,95% "$(svg_ridges '#3f6f9e' '#c8dae6' '#a2bcd0' '#7c9ab4' '#587a96' '#3a5771' '#22364a')" ;;
+    bokeh:warm)     render_bokeh "$dst" "$seed" '#120c16' ;;
+    bokeh:cool)     render_bokeh "$dst" "$seed" '#0b1018' ;;
+    sky:day)        render_sky "$dst" "$seed" '#1d4f86' '#a9c9dd' '#ffffff-#cfc0b8' ;;
+    sky:bright)     render_sky "$dst" "$seed" '#2f6ea8' '#cfe3ee' '#ffffff-#e2d8cc' ;;
+    *) fail "no generator for scene '$scene' palette '$palette' (picture '$name')" ;;
+  esac
+}
+
+# The table is read on fd 3, because magick inside the loop body would otherwise eat stdin.
+build_selects() {
+  local name scene seed palette made=0
+  mkdir -p "$selects" || fail "could not create $selects"
+  while IFS='|' read -r name scene seed palette <&3; do
+    [ -n "$name" ] || continue
+    render_named "$name" "$scene" "$seed" "$palette" "$selects/$name.jpg"
+    made=$((made + 1))
+    printf '  %s\n' "$name.jpg"
+  done 3< <(selects_table)
+  [ "$made" -eq "$selects_count" ] || fail "expected $selects_count pictures, made $made"
+}
+
+# The clips are built FROM the pictures, so a video thumbnail is a photograph too. The old fixture
+# used ffmpeg's testsrc2, which is why every clip in the shipped images was a chart of colour bars.
+build_clips() {
+  run ffmpeg -loglevel error -y -loop 1 -i "$selects/coastline-at-dawn.jpg" -t "$clip_seconds" \
+    -vf "scale=2400:1600,zoompan=z='min(zoom+0.0006,1.3)':d=$((clip_seconds * clip_fps)):s=1920x1080:fps=$clip_fps" \
+    -c:v libx264 -preset veryfast -pix_fmt yuv420p "$selects/approach-timelapse.mp4"
+  run ffmpeg -loglevel error -y -loop 1 -i "$selects/harbour-lights.jpg" -t "$clip_seconds" \
+    -vf "scale=2400:1600,zoompan=z=1.2:x='iw/2-(iw/zoom/2)+sin(on/90)*220':d=$((clip_seconds * clip_fps)):s=1920x1080:fps=$clip_fps" \
+    -c:v libx264 -preset veryfast -pix_fmt yuv420p "$selects/harbour-pan.mp4"
+}
+
+# A contact sheet of the pictures, which is what a photographer's PDF in this directory would be,
+# and which gives Quick Look a page worth photographing instead of a blank sheet.
+build_contact_sheet() {
+  local page slot names frames pages
+  mapfile -t names < <(selects_table | cut -d'|' -f1)
+  pages=()
+  for page in $(seq 1 "$contact_pages"); do
+    frames=()
+    for slot in $(seq 0 $((frames_per_sheet - 1))); do
+      # Four frames on per page rather than six, so consecutive sheets overlap the way a real one does.
+      frames+=("$selects/${names[$(( ((page - 1) * 4 + slot) % selects_count ))]}.jpg")
+    done
+    run magick montage "${frames[@]}" -thumbnail 330x220 -tile 2x3 -geometry +18+18 \
+      -background white "$work/sheet-$page.png"
+    run magick "$work/sheet-$page.png" -background white -gravity center \
+      -extent "${page_w}x$((page_h - page_header_h))" \
+      -background white -gravity north -splice "0x$page_header_h" \
+      -font Adwaita-Mono -pointsize 34 -fill '#1b1b1b' -annotate +0+56 'SELECTS  contact sheet' \
+      -pointsize 24 -fill '#6b6b6b' -annotate +0+100 "sheet $page of $contact_pages" \
+      "$work/page-$page.png"
+    pages+=("$work/page-$page.png")
+  done
+  run magick "${pages[@]}" -quality 92 "$root/contact-sheet.pdf"
+}
+
+# Raw camera masters: the only files here big enough that a copy of them is still on screen when the
+# transfer card is photographed. High bitrate over a still frame, so they are fast to make and large.
+build_masters() {
+  local names name
+  names=(coastline-at-dawn harbour-lights headland-storm pier-at-dusk)
+  [ "${#names[@]}" -eq "$master_count" ] || fail "the master list is ${#names[@]} long, expected $master_count"
+  for name in "${names[@]}"; do
+    run ffmpeg -loglevel error -y -loop 1 -i "$selects/$name.jpg" -t "$master_seconds" \
+      -vf "scale=1920:1080,fps=$clip_fps" -c:v libx264 -preset ultrafast \
+      -b:v "$master_bitrate" -pix_fmt yuv420p "$root/Raw/$name-master.mp4"
+  done
+}
+
+build_root_files() {
+  mkdir -p "$root/Exports" "$root/Raw" "$root/Scans" || fail "could not create the subfolders"
+  # Scans stays empty on purpose: it is the directory the empty-state image is shot in.
+
+  cp "$selects/coastline-at-dawn.jpg" "$root/Exports/coastline-at-dawn-2400.jpg" || fail "export copy failed"
+  cp "$selects/ridgeline-panorama.jpg" "$root/Exports/ridgeline-panorama-2400.jpg" || fail "export copy failed"
+  cp "$selects/headland-storm.jpg" "$root/cover-grade.jpg" || fail "cover copy failed"
+  build_masters
+  cp "$selects/approach-timelapse.mp4" "$root/timelapse.mp4" || fail "clip copy failed"
+
+  printf '# Field notes\n\nShot the headland on the falling tide; the long lens held up.\nRe-grade the dusk frames warmer before the next export pass.\n' \
+    > "$root/field-notes.md" || fail "could not write field-notes.md"
+  printf 'frame,lens_mm,shutter,aperture,keep\nblue-hour-rooftops,35,1/60,2.8,yes\ncoastline-at-dawn,24,1/250,8,yes\nheadland-storm,85,1/500,4,no\npier-at-dusk,50,1/30,1.8,yes\n' \
+    > "$root/shot-list.csv" || fail "could not write shot-list.csv"
+  printf '{\n  "profile": "coastal-dawn",\n  "white_balance": 5600,\n  "contrast": 12,\n  "clarity": 8\n}\n' \
+    > "$root/lens-profile.json" || fail "could not write lens-profile.json"
+
+  run ffmpeg -loglevel error -y -f lavfi -i "sine=frequency=$tone_hz:duration=$tone_seconds" \
+    -c:a libmp3lame -b:a 192k "$root/studio-tone.mp3"
+  run bsdtar -a -c -f "$root/proofs.tar.zst" -C "$root" Exports
+
+  # Spread the dates so a sort by Date Modified visibly reorders the listing.
+  touch -d '2026-05-14 07:31' "$root/Raw" "$root/shot-list.csv"
+  touch -d '2026-06-02 16:04' "$root/Selects" "$root/lens-profile.json"
+  touch -d '2026-07-19 11:22' "$root/Exports" "$root/proofs.tar.zst"
+  touch -d '2026-08-08 09:47' "$root/studio-tone.mp3" "$root/field-notes.md"
+  touch -d '2026-08-25 18:13' "$root/cover-grade.jpg" "$root/timelapse.mp4"
+  touch -d '2026-08-30 20:55' "$root/contact-sheet.pdf" "$root/Scans"
+}
+
+verify() {
+  local jpgs mp4s masters
+  jpgs=$(find "$selects" -maxdepth 1 -name '*.jpg' | wc -l)
+  mp4s=$(find "$selects" -maxdepth 1 -name '*.mp4' | wc -l)
+  masters=$(find "$root/Raw" -maxdepth 1 -name '*-master.mp4' | wc -l)
+  [ "$jpgs" -eq "$selects_count" ] || fail "Selects holds $jpgs jpegs, expected $selects_count"
+  [ "$mp4s" -eq 2 ] || fail "Selects holds $mp4s clips, expected 2"
+  [ "$masters" -eq "$master_count" ] || fail "Raw holds $masters masters, expected $master_count"
+  [ -s "$root/contact-sheet.pdf" ] || fail "the contact sheet is missing or empty"
+  [ -d "$root/Scans" ] || fail "Scans is missing"
+  # ls -A, never ls: a bare ls is structurally blind to exactly the dotfile temps this build makes.
+  [ -z "$(ls -A "$root/Scans")" ] || fail "Scans must stay empty, it is the empty-state fixture"
+  printf 'FIXTURE %s\n' "$root"
+  ls -A -l "$root"
+  printf '\nSELECTS %s\n' "$selects"
+  ls -A -l "$selects" | head -8
+}
+
+cmd_fixture() {
+  require_tools
+  local parent fs
+  parent=$(dirname "$root")
+  fs=$(findmnt -no FSTYPE -T "$parent" 2>/dev/null)
+  [ -n "$fs" ] || fail "findmnt could not name the filesystem holding $parent"
+  [ "$fs" != tmpfs ] || fail "$root would be on tmpfs, where the thumbnail cache measures nothing"
+
+  sandbox_make "$root"
+  mkdir -p "$work" || fail "could not create $work"
+  build_vignette
+  printf 'building %s pictures at %sx%s\n' "$selects_count" "$img_w" "$img_h"
+  build_selects
+  printf 'building the clips\n'
+  build_clips
+  printf 'building the contact sheet\n'
+  build_contact_sheet
+  printf 'building the root files\n'
+  build_root_files
+  # Through the guard, not a bare rm: the build scratch is inside the sandbox and gets checked too.
+  sandbox_remove "$work"
+  verify
+}
+
+cmd_teardown() {
+  sandbox_remove "$root"
+  printf 'REMOVED %s\n' "$root"
+}
+
+# ------------------------------------------------------------------ the capture run
+#
+# Captures the whole window for every state and crops nothing. The crop is a separate offline step
+# on purpose: the display is contended, and choosing a crop needs a measurement off the frame that
+# nobody has until the frame exists.
+
+repo=$(cd "$(dirname "$0")/.." && pwd) || exit 1
+# The run drives a private copy of ui/, never the repo tree, for two measured reasons. Quickshell
+# watches its config directory, so another lane editing ui/*.qml mid-run hot-reloads the shell and
+# every ipc call answers "still starting" until it comes back; that killed a capture on 2026-09-02.
+# And other lanes launch "qs -p <repo>/ui" too, so a teardown matching that path would kill their
+# window as well as mine. A unique path fixes both.
+ui_src=$repo/ui
+ui=$ui_src
+bin=${FLEA_BIN:-$repo/target/release/flea}
+frames=${FRAMES:-/tmp/flea-readme-frames}
+flea_log=$frames/flea.log
+# The canvas draws FleaWindow.dc.html at 880x620 and the wider boards at 1000, so this is the design
+# size with room for a grid, and it downscales to GitHub's column at about 0.7 rather than 0.35.
+shot_w=${SHOT_W:-1280}
+shot_h=${SHOT_H:-800}
+# The live theme is read off the box, never named in advance: this ran on Tokyo Night while the
+# brief named Vernier, and a lane that hard-fails on a hex nobody is running stops for the wrong
+# reason. Theme.qml:216 parses this same file, so it is the one source both sides can agree on.
+colors_toml=$HOME/.local/state/omarchy/current/theme/colors.toml
+# The Catppuccin-ish surface Theme.qml falls back to. It looks entirely plausible in a PNG, and it
+# is the actual failure being guarded against.
+fallback_surface='#181825'
+# The pointer parks in the screen corner, outside the window, so no frame shows a cursor.
+park_x=2559
+park_y=1439
+settle_s=0.4
+# Fourteen frames about 0.35 s apart span roughly two of the mark's 2800 ms cycles.
+empty_burst=14
+empty_gap_s=0.35
+
+drive() { omarchy-drive "$@"; }
+ipc() { omarchy-drive ipc -p "$ui/boot" flea "$@"; }
+key() { omarchy-drive key --window flea "$@" >/dev/null; }
+# Every chord goes through wtype, never omarchy-drive's hotkey. hotkey uses hl.dsp.send_shortcut,
+# whose keysym lookup fails on this box for digits and letters alike ("send_shortcut: key not
+# found"); its evdev table has them but is only reachable via --global, which the compositor sees
+# first. wtype reaches the application directly, the route tests/ui.sh drives ctrl+d with.
+# Sample input: chord ctrl+shift n  ->  omarchy-drive key --window flea -M ctrl -M shift n -m shift -m ctrl
+chord() {
+  local mods=$1 k=$2 parts pre post i
+  IFS='+' read -ra parts <<< "$mods"
+  pre=(); post=()
+  for i in "${parts[@]}"; do pre+=(-M "$i"); done
+  # Released in reverse order, the way a hand comes off a chord.
+  for (( i=${#parts[@]} - 1; i >= 0; i-- )); do post+=(-m "${parts[i]}"); done
+  key "${pre[@]}" "$k" "${post[@]}"
+}
+settle() { sleep "$settle_s"; }
+dwell() { sleep "$1"; }
+
+require_display_tools() {
+  export PATH="$HOME/.local/bin:$PATH"
+  command -v omarchy-drive >/dev/null || fail "omarchy-drive is not on PATH"
+  eval "$(omarchy-drive env)"
+  # omarchy-drive env omits the Qt platform theme, without which no row icon resolves. The same
+  # three-step recovery tests/ui.sh uses: the ambient value, then the user manager, then a live
+  # client's own environ, which is the only one that answers on an idle box.
+  # pgrep -x matches the process name, never a command line, so it cannot match the shell running it.
+  [ -n "${QT_QPA_PLATFORMTHEME:-}" ] || \
+    export QT_QPA_PLATFORMTHEME="$(systemctl --user show-environment | grep '^QT_QPA_PLATFORMTHEME=' | cut -d= -f2-)"
+  if [ -z "$QT_QPA_PLATFORMTHEME" ]; then
+    local pid
+    pid=$(pgrep -x quickshell | head -1)
+    [ -n "$pid" ] && [ -r "/proc/$pid/environ" ] && \
+      export QT_QPA_PLATFORMTHEME="$(tr '\0' '\n' < "/proc/$pid/environ" | grep '^QT_QPA_PLATFORMTHEME=' | cut -d= -f2-)"
+  fi
+  [ -n "$QT_QPA_PLATFORMTHEME" ] || fail "nothing published QT_QPA_PLATFORMTHEME, so no row would draw an icon"
+  printf 'PLATFORMTHEME %s\n' "$QT_QPA_PLATFORMTHEME"
+  [ -x "$bin" ] || fail "no binary at $bin, build it first"
+  [ -d "$root" ] || fail "no fixture at $root, run '$0 fixture' first"
+}
+
+flea_pids() {
+  local pid
+  for pid in $(pgrep -x qs || true); do
+    [ -r "/proc/$pid/cmdline" ] || continue
+    tr '\0' ' ' 2>/dev/null < "/proc/$pid/cmdline" | grep -Fq "$ui" && printf '%s\n' "$pid"
+  done
+}
+
+# Keystrokes land on whatever holds focus, so a foreign window on the box is a reason to stop and
+# not to work around. The Omarchy bar is a layer surface and never appears here, so an idle box
+# lists nothing at all.
+assert_box_clear() {
+  local others
+  others=$(hyprctl clients -j | jq -r '.[] | select(.class != "com.thisisgm.flea") | .class' | sort -u | tr '\n' ' ')
+  [ -z "$others" ] || fail "another lane holds the display, these windows are open: $others"
+}
+
+# The snapshot is made per run and removed at teardown. mktemp -d, per hard rule 9.
+snapshot_ui() {
+  local d
+  d=$(mktemp -d) || fail "could not make a snapshot directory"
+  cp -a "$ui_src/." "$d/" || fail "could not copy $ui_src into $d"
+  ui=$d
+  printf 'UI snapshot %s\n' "$ui"
+}
+
+launch() {
+  assert_box_clear
+  if omarchy-drive wait window flea --timeout 0 >/dev/null 2>&1; then
+    fail "a Flea window is already open, and only one lane may hold the display"
+  fi
+  mkdir -p "$frames" || fail "could not create $frames"
+  : > "$flea_log"
+  # 3>&- 4>&-, and they matter: flock holds the display lock through an open descriptor, and a
+  # detached child inherits it. An orphaned qs then holds the lock after its own run is dead, which
+  # is what wedged the box for eight lanes on 2026-09-02 (pid 2197778, ppid 1, fd 3 -> the lock).
+  FLEA_UI="$ui" FLEA_BIN="$bin" setsid nohup "$bin" --gui "$root" >"$flea_log" 2>&1 </dev/null 3>&- 4>&- &
+  omarchy-drive wait window flea --timeout 15 >/dev/null || fail "no Flea window appeared in 15 s"
+  omarchy-drive focus flea >/dev/null
+  wait_path "$root"
+}
+
+# Reads one key out of the live colors.toml.
+# Sample input line: accent = "#7aa2f7"
+theme_key() {
+  grep -E "^$1[[:space:]]*=" "$colors_toml" | head -1 | cut -d'"' -f2
+}
+
+# Asserted, never assumed: a shot taken on the fallback palette is worthless and looks fine. The
+# expected values come out of colors.toml, so this passes under whatever theme the box is running.
+assert_theme() {
+  local loaded palette surface accent want_surface want_accent field
+  loaded=$(ipc themeLoaded)
+  [ "$loaded" = true ] || fail "themeLoaded is '$loaded', so this window paints a fallback palette"
+  [ -s "$colors_toml" ] || fail "no live palette at $colors_toml to check the window against"
+  # ui/Ipc.qml's palette reader joins these eight in order: background surface foreground muted accent error symlink executable.
+  # Sample output: "#1a1b26 #13141c #a9b1d6 #414868 #7aa2f7 #f7768e #449dab #9ece6a"
+  palette=$(ipc palette)
+  surface=$(printf '%s\n' "$palette" | cut -d' ' -f2)
+  accent=$(printf '%s\n' "$palette" | cut -d' ' -f5)
+  # ui/Theme.qml:202 picks surface from dark_background before selection, so that is what it must equal.
+  want_surface=$(theme_key dark_background)
+  want_accent=$(theme_key accent)
+  [ -n "$want_surface" ] && [ -n "$want_accent" ] \
+    || fail "could not read dark_background and accent out of $colors_toml"
+  [ "$surface" = "$want_surface" ] \
+    || fail "surface is '$surface' but the live theme says '$want_surface', so this window is not on the box's palette"
+  [ "$accent" = "$want_accent" ] \
+    || fail "accent is '$accent' but the live theme says '$want_accent', so this window is not on the box's palette"
+  # themeLoaded returned true for an empty palette once tonight, so the fallback is checked directly.
+  for field in $palette; do
+    [ "$field" = "$fallback_surface" ] \
+      && fail "the palette carries the fallback $fallback_surface, so colors.toml did not parse"
+  done
+  printf 'THEME %s, loaded, surface %s, accent %s (matches %s)\n' \
+    "$(omarchy theme current 2>/dev/null)" "$surface" "$accent" "$colors_toml"
+}
+
+window_json() { hyprctl clients -j | jq -c '.[] | select(.class == "com.thisisgm.flea")'; }
+window_geometry() { window_json | jq -r '"\(.at[0]) \(.at[1]) \(.size[0]) \(.size[1]) \(.address)"'; }
+
+# hyprctl exits 0 on error, so the geometry read back is the only evidence the resize took.
+size_window() {
+  local wx wy ww wh addr dx dy
+  read -r wx wy ww wh addr < <(window_geometry)
+  [ -n "$addr" ] || fail "no Flea window to size"
+  if [ "$(window_json | jq -r '.floating')" != true ]; then
+    omarchy-drive window float flea >/dev/null
+    settle
+  fi
+  hyprctl dispatch "hl.dsp.window.resize({ x = $shot_w, y = $shot_h, exact = true, window = \"address:$addr\" })" >/dev/null
+  settle
+  read -r wx wy ww wh addr < <(window_geometry)
+  if [ "$ww" -ne "$shot_w" ] || [ "$wh" -ne "$shot_h" ]; then
+    dx=$((shot_w - ww)); dy=$((shot_h - wh))
+    hyprctl dispatch "hl.dsp.window.resize({ x = $dx, y = $dy, window = \"address:$addr\" })" >/dev/null
+    settle
+  fi
+  omarchy-drive window center flea >/dev/null
+  settle
+  read -r wx wy ww wh addr < <(window_geometry)
+  [ "$ww" -eq "$shot_w" ] && [ "$wh" -eq "$shot_h" ] \
+    || fail "the window is ${ww}x${wh}, not ${shot_w}x${shot_h}"
+  printf 'WINDOW %sx%s at %s,%s\n' "$ww" "$wh" "$wx" "$wy"
+}
+
+wait_path() {
+  local want=$1 seen attempt
+  for attempt in $(seq 1 300); do
+    seen=$(ipc path 2>/dev/null || printf unavailable)
+    [ "$seen" = "$want" ] && return 0
+    sleep 0.05
+  done
+  fail "the pane never opened $want, it is at $seen"
+}
+
+# Walks to a row by name from the top, so no shot depends on an index a sort could move.
+seek_row_named() {
+  local want=$1 i
+  key g
+  for i in $(seq 1 60); do
+    case "$(ipc rowAt "$(ipc cursor)")" in
+      "$want|"*) return 0 ;;
+    esac
+    key j
+  done
+  fail "could not put the cursor on $want"
+}
+
+# The view chords go through wtype, not hotkey. omarchy-drive's hotkey uses hl.dsp.send_shortcut,
+# whose keysym lookup has no digits: ctrl+3 dies with "send_shortcut: key not found". Its evdev table
+# does have them but is only reachable via --global, which the compositor sees first. wtype reaches
+# the application directly, the same route tests/ui.sh drives ctrl+d with.
+view() {
+  case "$1" in
+    list) chord ctrl 1 ;;
+    columns) chord ctrl 2 ;;
+    grid) chord ctrl 3 ;;
+  esac
+  settle
+  [ "$(ipc viewMode)" = "$1" ] || fail "the view is $(ipc viewMode), not $1, after its chord"
+}
+
+frame() {
+  omarchy-drive shot "$frames/$1.png" flea >/dev/null || fail "the shot of $1 failed"
+  printf 'FRAME %s\n' "$frames/$1.png"
+}
+
+# The measurements a crop is chosen from, printed rather than guessed at at crop time.
+measure() {
+  printf 'METRIC metrics %s\n' "$(ipc metrics)"
+  printf 'METRIC chromeHeight %s\n' "$(ipc chromeHeight)"
+  printf 'METRIC railCount %s\n' "$(ipc railCount)"
+  printf 'METRIC deviceEntries %s\n' "$(ipc deviceEntries | tr '\n' ';')"
+  printf 'METRIC networkEntries %s\n' "$(ipc networkEntries | tr '\n' ';')"
+  local i
+  for i in $(seq 0 $(( $(ipc railCount) - 1 ))); do
+    printf 'METRIC railRowCentre %s %s\n' "$i" "$(ipc railRowCentre "$i")"
+  done
+}
+
+# Navigates to the fixture from wherever the previous beat left the pane. A single "h" only ever
+# worked from one directory, and after the loading beat the pane sits at /usr, so climbing once
+# lands at / and every following beat fails.
+goto_fixture() {
+  local attempt
+  [ "$(ipc path)" = "$root" ] && return 0
+  for attempt in $(seq 1 8); do
+    [ "$(ipc path)" = / ] && break
+    key h
+    settle
+  done
+  [ "$(ipc path)" = / ] || fail "could not climb to /, the pane is at $(ipc path)"
+  seek_row_named home
+  key -k Return
+  wait_path /home
+  seek_row_named flea-sandbox
+  key -k Return
+  wait_path /home/flea-sandbox
+  seek_row_named flea-readme
+  key -k Return
+  wait_path "$root"
+}
+
+capture_list() {
+  view list
+  key -k Escape
+  key g
+  dwell 2
+  frame list
+}
+
+capture_grid() {
+  seek_row_named Selects
+  key -k Return
+  wait_path "$selects"
+  view grid
+  # The thumbnails are asked for only once the list stops moving, so this waits for the cache.
+  dwell 6
+  frame grid
+}
+
+# The image case is not shot here on purpose. ui/PreviewColumn.qml:90 draws the column preview from
+# the freedesktop thumbnail cache, and nothing fills that cache for these files: after a run that
+# browsed twenty images through list, grid and columns, ~/.cache/thumbnails had zero entries created
+# that day, so the pane draws the kind's glyph. The grid and the row marks look right because they
+# decode the file itself (GridTile.qml:53, Row.qml:93). A twelve second dwell and a re-request did
+# not change it, so it is a defect and not a race, and photographing it would advertise the defect.
+# These two beats use preview types that never touch the cache; the better frame wins.
+capture_columns() {
+  goto_fixture
+  view columns
+  settle
+  seek_row_named Raw
+  key -k Return
+  wait_path "$root/Raw"
+  seek_row_named coastline-at-dawn-master.mp4
+  dwell 8
+  frame columns
+}
+
+capture_columnsdoc() {
+  goto_fixture
+  view columns
+  settle
+  seek_row_named contact-sheet.pdf
+  dwell 8
+  frame columns-doc
+}
+
+capture_quicklook() {
+  key h
+  wait_path "$root"
+  view list
+  seek_row_named contact-sheet.pdf
+  key -k space
+  dwell 4
+  key l
+  dwell 2
+  frame quicklook
+  key -k Escape
+  settle
+}
+
+capture_newfolder() {
+  view list
+  key -k Escape
+  chord ctrl+shift n
+  local seen attempt
+  for attempt in $(seq 1 100); do
+    seen=$(ipc renamingIndex 2>/dev/null || printf -- -1)
+    case "$seen" in [0-9]*) break ;; esac
+    sleep 0.05
+  done
+  case "$seen" in
+    [0-9]*) ;;
+    *) fail "no rename field opened, renamingIndex is $seen" ;;
+  esac
+  dwell 1
+  frame newfolder
+  key -k Escape
+  # z removes the folder the backend already created, so the fixture is left as it was found.
+  key z
+  dwell 1
+}
+
+capture_transfer() {
+  goto_fixture
+  view list
+  seek_row_named Raw
+  key -k Return
+  wait_path "$root/Raw"
+  chord ctrl a
+  key y
+  dwell 1
+  key h
+  wait_path "$root"
+  seek_row_named Exports
+  key -k Return
+  wait_path "$root/Exports"
+  key p
+  # The card publishes every 250 ms and has no ipc reader, so this is a dwell and not a wait.
+  dwell 1
+  frame transfer
+  dwell 6
+  key h
+  wait_path "$root"
+}
+
+# A search that walks /usr is the honest way to hold the crawl on screen; it only ever reads.
+capture_loading() {
+  local attempt
+  goto_fixture
+  for attempt in $(seq 1 6); do
+    key h
+    settle
+    [ "$(ipc path)" = / ] && break
+  done
+  [ "$(ipc path)" = / ] || fail "could not climb to /, the pane is at $(ipc path)"
+  # Searches / and not /usr, and shoots at 0.6 s and not 2 s. /usr answered in 0.3 s on this box, so
+  # the two second dwell photographed the finished result every time: 287,596 scanned, no crawl.
+  key f
+  key -d 90 -- zqxjvw
+  key -k Return
+  dwell 0.6
+  frame loading
+  key -k Escape
+  key -k Escape
+  settle
+}
+
+# A burst, never one shot. FleaMark paints itself in over 1.8 s and repeats on the caption's 2800 ms
+# beat, so a still taken at a random instant catches a blank or half-drawn spiral about a third of
+# the time and reads as a rendering bug. The settled frame is chosen afterwards by ink count.
+# Picks the settled frame out of the burst by ink, because most of the burst is not settled.
+# FleaMark draws for 1800 ms after a 180 ms fade and a 200 ms pause, inside EmptyState's 2800 ms
+# beat, so the mark is whole for only about 620 ms of every cycle: roughly a fifth of any burst.
+# Measured on the 2026-09-02 burst, the fourteen frames scored 0, 20, 172, 324, 556, 671, 756, 836,
+# 896, 920 and four at 928. 928 is the whole spiral; every lower score is a partial draw, and the
+# lowest of them is the bracket shape that got the previous empty.png rejected.
+# The box is the mark's own, above the caption line, so a rotating caption cannot move the score.
+pick_empty() {
+  local f ink best best_ink=-1
+  for f in "$frames"/empty-[0-9][0-9].png; do
+    [ -f "$f" ] || fail "no burst frames to choose from"
+    ink=$(magick "$f" -crop 110x80+670+330 +repage -colorspace Gray -threshold 25% \
+      -format '%[fx:int(w*h*mean)]' info:) || fail "could not measure $f"
+    printf 'INK %s %s\n' "$(basename "$f")" "$ink"
+    if [ "$ink" -gt "$best_ink" ]; then best_ink=$ink; best=$f; fi
+  done
+  cp "$best" "$frames/empty.png" || fail "could not name the settled frame"
+  printf 'PICKED %s at ink %s, now empty.png\n' "$(basename "$best")" "$best_ink"
+}
+
+capture_empty() {
+  local i
+  goto_fixture
+  view list
+  seek_row_named Scans
+  key -k Return
+  wait_path "$root/Scans"
+  [ "$(ipc emptyShown)" = true ] || fail "emptyShown is $(ipc emptyShown), so this is not the empty state"
+  # Spans about two full 2800 ms cycles, so a settled frame is certain rather than likely.
+  for i in $(seq 1 "$empty_burst"); do
+    frame "$(printf 'empty-%02d' "$i")"
+    sleep "$empty_gap_s"
+  done
+}
+
+teardown_window() {
+  local pid waited
+  # flea_pids matches the snapshot path, which no other lane can be running, so this can only ever
+  # signal processes this run started.
+  for pid in $(flea_pids); do kill "$pid"; done
+  for waited in $(seq 1 600); do
+    [ -z "$(flea_pids)" ] && return 0
+    sleep 0.05
+  done
+  printf 'flea-readme-shots: a Flea process was still up after 30 s\n' >&2
+}
+
+cmd_shots() {
+  require_display_tools
+  snapshot_ui
+  launch
+  assert_theme
+  size_window
+  drive move "$park_x" "$park_y" >/dev/null
+  measure
+  # BEATS names which frames to take, so a run interrupted partway can finish the rest without
+  # re-shooting what already landed and without paying for the display twice.
+  local beat
+  for beat in ${BEATS:-list grid columns columnsdoc quicklook newfolder transfer loading empty}; do
+    case "$beat" in
+      list) capture_list ;;
+      grid) capture_grid ;;
+      columns) capture_columns ;;
+      columnsdoc) capture_columnsdoc ;;
+      quicklook) capture_quicklook ;;
+      newfolder) capture_newfolder ;;
+      transfer) capture_transfer ;;
+      loading) capture_loading ;;
+      # The empty state stays gated behind EMPTY=1: its mark was Omarchy's own logo until it was
+      # fixed, and a re-shoot taken before that would have republished the defect at higher resolution.
+      empty) if [ "${EMPTY:-0}" = 1 ]; then capture_empty; pick_empty; else printf 'SKIP empty, set EMPTY=1\n'; fi ;;
+      *) fail "no such beat: '$beat'" ;;
+    esac
+  done
+  teardown_window
+  [ "$ui" != "$ui_src" ] && rm -rf "$ui"
+  printf 'FRAMES %s\n' "$frames"
+  ls -A -l "$frames"
+}
+
+# ------------------------------------------------------------------ the crops
+#
+# One crop per frame, chosen from what that frame has to prove and from the rail geometry the run
+# measures, never from taste. ipc railRowCentre puts the DEVICES rows at y 511 and 540 with their
+# section label between them and the last NETWORK row at y 441, so every crop below either stops
+# above that label or starts right of the rail at x 168 and drops it entirely.
+#
+# A crop is composition. Nothing here blurs, paints over or retouches a pixel: the rail is a real
+# feature and the honest way to keep a hostname out of a public repo is to not point the camera at it.
+#
+# Sample row: "list|list|1280x349+0+0|why this rectangle and no other"
+crops_table() {
+  cat <<'ROWS'
+list|list|1280x349+0+0|the hero keeps the rail and all five columns, so it must stop above the DEVICES label at y535; it stops higher still, at 349, because the NETWORK group carried another lane's mounted zip fixtures at capture time and a section cut mid-label reads as a bug. 349 is the list's own row boundary after lens-profile.json, so eight whole rows and no cut text, and the rail still reads through Projects
+grid|grid|1112x395+168+30|the thumbnails are the whole claim, so the rail goes and all twenty tiles fill the frame at their native size
+columns|columns|1112x770+168+30|the three panes and the facts table are the claim; dropping the rail removes the hostname and lets the board fill the width
+pdf|quicklook|1046x654+117+76|the Quick Look overlay is the claim, cropped inside its own edges. x117 and not x115: the overlay's left edge lands exactly where the DEVICES rail's disk row is cut off, and that row reads '<hostname> . <device>', so the frame's own boundary is the hostname's and two pixels of margin is the difference between cropping it out and shipping it. y76 drops the list row that bleeds above the header
+empty|empty|1112x770+168+30|the settled mark and its caption under the column headers. Dropping the rail at x168 takes the hostname out, and it also cuts the bar's own word for this state, 'empty', which sits at x14: that word is lost to the crop, and the free space on the bar's right is what survives. The large quiet area is not padding, an empty directory is mostly empty, and cropping in would misrepresent how the state reads
+loading|loading|1112x740+168+30|the crawl caught mid-flight, with the search bar's own word for it, 'searching', at the top right. It stops at 740 and takes no status bar, unlike the other x168 crops: this state's bar text, 'Searching, 0 scanned', runs past x168 and the crop would leave a stray 'ed' in the corner, where the empty state's shorter 'empty' falls clear of the cut. A still of a crawl is always a fragment of the spiral, because the animation is a dash offset running around the path rather than a rotation, so the surrounding state is what makes it read as motion and not as a broken mark
+transfer|transfer|1280x64+0+736|the bar is the claim, not a card: a 65 MB copy inside one btrfs filesystem finishes before the shutter, so what this frame honestly holds is the completed operation and its undo, 'Copied 4 items . z undoes', beside the item count. Full width keeps both ends of the bar, which no x168 crop can do, and 736 clears the last DEVICES row that the growing NETWORK group had pushed down to y626, with just enough ground above the bar to show it sitting under the content
+newfolder|newfolder|1112x770+168+30|the rename field and the bar's operation sentence are both the claim and they sit at opposite ends of the window, so this takes the whole content column and drops the rail instead. It starts below the chrome at y30 and not at y0: the path bar's text begins left of x168, so including it renders the path as 'dbox/flea-readme', which reads as a bug rather than a crop
+ROWS
+}
+
+cmd_crop() {
+  local name src geom why out
+  command -v magick >/dev/null || fail "magick is missing"
+  mkdir -p "$repo/docs/images" || fail "could not create docs/images"
+  while IFS='|' read -r name src geom why <&3; do
+    [ -n "$name" ] || continue
+    [ -f "$frames/$src.png" ] || fail "no frame at $frames/$src.png, run '$0 shots' first"
+    out=$repo/docs/images/$name.png
+    # -strip, so the same frames always produce the same bytes: magick writes a creation time into
+    # the PNG otherwise, and re-running the crop then rewrites all seven images with no visible
+    # change, which shows up as a repo full of modified binaries and hides the one that did move.
+    magick "$frames/$src.png" -crop "$geom" +repage -strip "$out" || fail "the crop of $src failed"
+    printf 'CROP %-10s %-18s %s\n' "$name.png" "$geom" "$why"
+  done 3< <(crops_table)
+  printf '\nIMAGES %s\n' "$repo/docs/images"
+  ls -A -l "$repo/docs/images"
+}
+
+case "${1:-}" in
+  fixture) cmd_fixture ;;
+  shots) cmd_shots ;;
+  crop) cmd_crop ;;
+  teardown) cmd_teardown ;;
+  *) printf 'usage: %s {fixture|shots|crop|teardown}\n' "$0" >&2; exit 2 ;;
+esac

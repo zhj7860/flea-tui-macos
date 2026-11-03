@@ -1,0 +1,428 @@
+# Hard rule 9's guard, in one place. Sourced, never run:
+#   . "$(dirname "$0")/../tools/flea-sandbox-guard"
+# Needs realpath from coreutils, which is the tree's only test-side binary dependency. An absent or
+# failing one fails closed: sandbox_canon returns non-zero and every caller either refuses on that or
+# treats it as a refusal, including sandbox_forbidden, which must never read it as "not under".
+# A lane agent test-driving file operations against real paths under $HOME emptied /home/gm on
+# 2026-09-01, and there is no @home snapshot, so every destructive path in this tree comes through
+# here. Each check is code that runs before the delete, not a promise in a report.
+
+# Fixtures live outside $HOME: ~/tmp is one unset variable away from the home directory.
+FIXTURE_ROOT=${FLEA_FIXTURE_ROOT:-/home/flea-sandbox}
+# The marker is what stands between a directory and rm -rf: no marker, no delete.
+SANDBOX_MARKER=.flea-test-sandbox
+# When this shell sourced the guard, never inherited: a crash report older than this is from an earlier run.
+SANDBOX_GUARD_START=$(date +%s)
+
+sandbox_refuse() {
+  printf 'REFUSED: %s\n' "$*" >&2
+  exit 1
+}
+
+# set -u catches an unset HOME and not an empty one, and every forbidden root below is written from
+# it: with HOME="" the $HOME entry silently contributes nothing and /.cache passes as a cache path.
+# Checked at call time and not only here, because a caller can empty HOME after sourcing this.
+sandbox_home_ok() {
+  [ -n "${HOME:-}" ] || sandbox_refuse "HOME is empty or unset, so no path this guard checks can be trusted"
+}
+sandbox_home_ok
+
+# One canonical form for every path this guard touches, checks and actions alike. realpath -m
+# collapses a trailing slash, an interior "//", a "." and a ".." and resolves symlinks, in one call
+# and without requiring the path to exist yet, which a first run always needs. Stripping trailing
+# slashes by hand only ever closed the instance in front of us: an interior "//" in HOME emptied the
+# forbidden list exactly the way a trailing one did.
+# corner: realpath comes from coreutils and is present on this box; an absent one fails closed here.
+sandbox_canon() {
+  local p
+  p=$(realpath -m -- "$1" 2>/dev/null) || return 1
+  [ -n "$p" ] || return 1
+  printf '%s' "$p"
+}
+
+# Non-empty, absolute, no parent traversal, and at least two components deep, so an unset variable
+# can never resolve this to /, to a top-level directory, or to somewhere above the one named.
+sandbox_plausible() {
+  local p="$1"
+  [ -n "$p" ] || return 1
+  case "$p" in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  case "$p" in
+    */../*|*/..|../*|..) return 1 ;;
+  esac
+  case "$p" in
+    /*/*) ;;
+    *) return 1 ;;
+  esac
+  return 0
+}
+
+# True when child is under parent, comparing whole components: /home/gmother is not under /home/gm.
+# Both sides are normalised first: a trailing slash on the parent silently matched nothing, which
+# emptied the whole forbidden-roots list whenever HOME carried one.
+sandbox_under() {
+  local child parent
+  # Both sides refuse rather than returning 1 on a resolve failure: a caller reads 1 as "not under",
+  # and reading "could not resolve" as "not forbidden" is how a root drops out of the guard's list.
+  child=$(sandbox_canon "$1") || sandbox_refuse "cannot resolve the path being checked: '$1'"
+  parent=$(sandbox_canon "$2") || sandbox_refuse "cannot resolve the root being checked against: '$2'"
+  [ -n "$parent" ] || sandbox_refuse "the root being checked against is empty"
+  case "$child/" in
+    "$parent"/*) return 0 ;;
+  esac
+  return 1
+}
+
+# The roots hard rule 9 names, plus the system trees. $HOME covers ~/Work, ~/.config, ~/.local,
+# ~/.cache and ~/tmp in one line, because every one of them is inside it.
+sandbox_forbidden() {
+  local p="$1" root canon
+  sandbox_home_ok
+  for root in "$HOME" /usr /etc /var /boot /root /srv /opt; do
+    # A root that cannot be canonicalised must not silently drop out of the list: sandbox_under
+    # answers "not under" for both "outside it" and "could not resolve it", and reading the second
+    # as the first is how a symlink loop under $HOME would remove $HOME from this list entirely.
+    canon=$(sandbox_canon "$root") || sandbox_refuse "cannot resolve the forbidden root '$root'"
+    sandbox_under "$p" "$canon" && return 0
+    [ "$p" = "$canon" ] && return 0
+    :
+  done
+  return 1
+}
+
+# The fixture root itself, checked once before anything writes under it. The root is
+# environment-overridable by design, which is exactly why it is checked rather than trusted.
+# SANDBOX_ROOT is the canonical fixture root, published so no caller re-derives it.
+sandbox_root_ok() {
+  sandbox_home_ok
+  # Canonicalise BEFORE validating: /home/ satisfies the depth test's second * with the empty string
+  # and reads as two components deep, so a raw check passes a root the canonical one refuses.
+  # The raw form first, for the same reason: a root written with a .. is a root nobody can audit.
+  sandbox_plausible "$FIXTURE_ROOT" \
+    || sandbox_refuse "FLEA_FIXTURE_ROOT is not an absolute path two components deep: '$FIXTURE_ROOT'"
+  SANDBOX_ROOT=$(sandbox_canon "$FIXTURE_ROOT") \
+    || sandbox_refuse "FLEA_FIXTURE_ROOT cannot be resolved: '$FIXTURE_ROOT'"
+  sandbox_plausible "$SANDBOX_ROOT" \
+    || sandbox_refuse "FLEA_FIXTURE_ROOT is not an absolute path two components deep: '$FIXTURE_ROOT'"
+  sandbox_forbidden "$SANDBOX_ROOT" \
+    && sandbox_refuse "FLEA_FIXTURE_ROOT is inside a directory hard rule 9 forbids: '$FIXTURE_ROOT'"
+  return 0
+}
+
+# Every path a suite creates or deletes passes here. Under the fixture root, never the root itself,
+# so no run can take out another run's sandbox alongside its own.
+# Validates one path and publishes its canonical form as SANDBOX_PATH, which is what every action
+# below acts on: a check on the canonical form and an action on the raw one is not the same check.
+sandbox_require() {
+  sandbox_root_ok
+  # The RAW form is what carries a .. or a relative prefix, and realpath resolves both away, so
+  # checking only the canonical form left two of sandbox_plausible's three arms unable to fire.
+  sandbox_plausible "$1" || sandbox_refuse "not an absolute path two components deep: '$1'"
+  SANDBOX_PATH=$(sandbox_canon "$1") || sandbox_refuse "cannot be resolved: '$1'"
+  sandbox_plausible "$SANDBOX_PATH" || sandbox_refuse "does not resolve to a usable path: '$1'"
+  # Containment in a root that sandbox_root_ok has already cleared is what keeps it out of every
+  # directory hard rule 9 forbids, so there is no second per-path check to go stale against it. The
+  # canonical form is also what makes this a symlink check: a path resolving out of the root fails.
+  sandbox_under "$SANDBOX_PATH" "$SANDBOX_ROOT" \
+    || sandbox_refuse "resolves to '$SANDBOX_PATH', which is outside the fixture root $SANDBOX_ROOT"
+  [ "$SANDBOX_PATH" = "$SANDBOX_ROOT" ] \
+    && sandbox_refuse "is the fixture root itself, which is never a target: '$1'"
+  return 0
+}
+
+# Test-owned means the path carries the marker itself, or sits directly inside something that does.
+sandbox_owned() {
+  local p="$1"
+  [ -f "$p/$SANDBOX_MARKER" ] && return 0
+  [ -f "${p%/*}/$SANDBOX_MARKER" ] && return 0
+  return 1
+}
+
+# Sample input: a sandbox holding leg/cache/quickshell/crashes/t2cdhbfmt answers "FAIL x.sh: Quickshell has crashed, report leg/cache/quickshell/crashes/t2cdhbfmt" and copies it under $FLEA_CI_SUITE_LOGS when set; with "opening" it answers "x.sh: stale crash report from an earlier run: ..." and copies nothing when the report also predates this run.
+# Read-only, and run before every removal because Quickshell's crash handler reruns the config and a rerun can pass, so a crash report is the only trace a suite leaves.
+sandbox_crash_report() {
+  local root=$1 when=${2:-} crash rel dest n mt
+  if [ ! -d "$root" ]; then
+    return 0
+  fi
+  while IFS= read -r crash; do
+    rel=${crash#"$root"/}
+    # Stale only when sandbox_make's clear finds a report older than this run; a later leg's clear of this run's crash still fails.
+    mt=$(stat -c %Y "$crash" 2>/dev/null) || mt=$SANDBOX_GUARD_START
+    if [ "$when" = opening ] && [ "$mt" -lt "$SANDBOX_GUARD_START" ]; then
+      printf '%s: stale crash report from an earlier run: %s\n' "${0##*/}" "$rel"
+      continue
+    fi
+    printf 'FAIL %s: Quickshell has crashed, report %s\n' "${0##*/}" "$rel"
+    if [ -z "${FLEA_CI_SUITE_LOGS:-}" ]; then
+      continue
+    fi
+    dest="$FLEA_CI_SUITE_LOGS/${0##*/}-crashes/${rel//\//_}"
+    if mkdir -p "$FLEA_CI_SUITE_LOGS/${0##*/}-crashes" 2>/dev/null; then
+      # A second report for one name gets the next free name, so a copy never nests inside the first and nothing is deleted.
+      if [ -e "$dest" ]; then
+        n=1
+        while [ -e "$dest.$n" ]; do n=$((n + 1)); done
+        dest="$dest.$n"
+      fi
+      if cp -a "$crash" "$dest" 2>/dev/null; then
+        continue
+      fi
+    fi
+    printf 'FAIL %s: cannot copy crash report %s to %s\n' "${0##*/}" "$crash" "$dest"
+  done < <(find "$root" -mindepth 3 -type d -path '*/quickshell/crashes/*' -prune 2>/dev/null)
+  return 0
+}
+
+# Delete a sandbox or a scratch inside one. A directory that exists and is owned by neither is
+# somebody else's and is refused; one that does not exist yet is fine, a first run has nothing to remove.
+# Every action takes its own copy of the checked path the instant sandbox_require returns, so a
+# nested call cannot clobber the global between the check and the act. The copy is a plain assignment
+# and never a command substitution: sandbox_refuse is an exit, and an exit inside $( ) ends only the
+# subshell, so a refusal there prints and the caller carries on with an empty path. None of the
+# scripts sourcing this set -e, so nothing else would have stopped them.
+sandbox_take() {
+  [ -n "${SANDBOX_PATH:-}" ] || sandbox_refuse "the checked path is empty, which is never a target"
+  SANDBOX_TAKEN=$SANDBOX_PATH
+}
+
+sandbox_remove() {
+  local p
+  sandbox_require "$1"
+  sandbox_take
+  p=$SANDBOX_TAKEN
+  sandbox_crash_report "$p" "${2:-}"
+  if [ -e "$p" ]; then
+    sandbox_owned "$p" \
+      || sandbox_refuse "$p is not marked and is not inside a marked sandbox, so this will not delete it"
+    rm -rf "$p" || sandbox_refuse "could not remove $p"
+  fi
+  return 0
+}
+
+# Remove whatever was there and build a fresh sandbox carrying its own marker.
+sandbox_make() {
+  local p
+  sandbox_remove "$1" opening
+  # Re-checked rather than reusing the copy sandbox_remove took, because that call is nested.
+  sandbox_require "$1"
+  sandbox_take
+  p=$SANDBOX_TAKEN
+  mkdir -p "$p" || sandbox_refuse "could not create $p"
+  : > "$p/$SANDBOX_MARKER" || sandbox_refuse "could not mark $p"
+  return 0
+}
+
+# A working directory inside a sandbox that is already marked. The marker stays on the sandbox root,
+# so nothing the guard writes appears in a listing the test is about to assert row counts on.
+sandbox_scratch() {
+  local p
+  sandbox_require "$1"
+  sandbox_take
+  p=$SANDBOX_TAKEN
+  # The canonical form, so a trailing slash cannot make ${p%/*} return the path itself and collapse
+  # this onto the sandbox's own marker, which would delete the whole sandbox and recreate it unmarked.
+  [ -f "${p%/*}/$SANDBOX_MARKER" ] \
+    || sandbox_refuse "$p is not directly inside a marked sandbox, so this will not delete it"
+  rm -rf "$p" || sandbox_refuse "could not remove $p"
+  mkdir -p "$p" || sandbox_refuse "could not create $p"
+  return 0
+}
+
+# The thumbnail cache is not a sandbox and never becomes one: it is the operator's own directory,
+# so this only asserts a caller's path is a real one under it before the caller touches it.
+sandbox_cache_require() {
+  local p cache
+  sandbox_home_ok
+  # The raw form first, the same order the two siblings use: realpath resolves a .. away, so checking
+  # only the canonical form leaves the caller's own defects unable to fire. This is the gate above
+  # the bench's rm -rf of the thumbnail cache.
+  sandbox_plausible "$1" || sandbox_refuse "not an absolute path two components deep: '$1'"
+  p=$(sandbox_canon "$1") || sandbox_refuse "cannot be resolved: '$1'"
+  cache=$(sandbox_canon "$HOME/.cache") || sandbox_refuse "cannot resolve the cache root"
+  sandbox_plausible "$p" || sandbox_refuse "does not resolve to a usable path: '$1'"
+  sandbox_under "$p" "$cache" || sandbox_refuse "outside $cache: '$1'"
+  [ "$p" = "$cache" ] && sandbox_refuse "is the cache root itself, which is never a target: '$1'"
+  return 0
+}
+
+# The files directory a direct gio trash lands in: GLib compares the item with HOME's device only, so it ignores a data home on another device.
+sandbox_trash_gio_dir() { sandbox_trash_files_dir "${1:-}" "${2:-${HOME:-}}" gio; }
+
+# The files directory the trash lands in: the home Trash where the backend renames in-process (not with rule "gio") or GLib keeps it home, else the item mount's top trash.
+sandbox_trash_files_dir() {
+  local item="${1:-}" home="${2:-${HOME:-}}" rule="${3:-}" parent idev hdev data top uid globaldir candidate owner folder fdev odev ancestor tdev
+  [ -n "$item" ] || return 1
+  [ -n "$home" ] || return 1
+  folder=$(dirname -- "$item" 2>/dev/null) || return 1
+  [ -n "$folder" ] || return 1
+  # A folder that was moved away still lies on its old device, so the nearest existing ancestor stands in for it.
+  while [ ! -e "$folder" ] && [ "$folder" != / ] && [ "$folder" != . ]; do folder=$(dirname -- "$folder" 2>/dev/null) || return 1; done
+  if [ -d "$item" ]; then parent=$item; else parent=$folder; fi
+  [ -n "$parent" ] || return 1
+  idev=$(stat -c %d -- "$parent" 2>/dev/null) || return 1
+  hdev=$(stat -c %d -- "$home" 2>/dev/null) || return 1
+  [ -n "$idev" ] && [ -n "$hdev" ] || return 1
+  data=${XDG_DATA_HOME:-$home/.local/share}
+  # Mirrors src/backend/hometrash.rs same_filesystem: the item's folder against the nearest existing folder at or above the home Trash.
+  fdev=$(stat -L -c %d -- "$folder" 2>/dev/null) || fdev=""
+  # The item's own device (lstat) must equal its folder's, so a nested volume goes to gio; a symlink item is judged as the link itself, which GLib trashes in place of its target, and an absent item passes.
+  odev=$(stat -c %d -- "$item" 2>/dev/null) || odev=$fdev
+  tdev=""
+  case "$data" in
+    /*)
+      ancestor=$data/Trash
+      while [ ! -e "$ancestor" ] && [ "$ancestor" != / ]; do ancestor=$(dirname -- "$ancestor") || break; done
+      tdev=$(stat -L -c %d -- "$ancestor" 2>/dev/null) || tdev=""
+      ;;
+  esac
+  if [ "$idev" = "$hdev" ] || { [ "$rule" != gio ] && [ -n "$fdev" ] && [ -n "$tdev" ] && [ "$fdev" = "$tdev" ] && [ "$odev" = "$fdev" ]; }; then
+    case "$data" in /*) ;; *) return 1 ;; esac
+    printf '%s/Trash/files\n' "$data"
+    return 0
+  fi
+  top=$(stat -c %m -- "$parent" 2>/dev/null) || return 1
+  case "$top" in /*) ;; *) return 1 ;; esac
+  # The root mount's top is "/", so its trash is /.Trash-$UID, never //.Trash-$UID.
+  top=${top%/}
+  uid=$(id -u 2>/dev/null) || return 1
+  [ -n "$uid" ] || return 1
+  globaldir=$top/.Trash
+  candidate=$top/.Trash/$uid
+  # The sticky bit lives on the global dir; lstat keeps a symlinked global dir from passing as one.
+  if [ -d "$globaldir" ] && [ ! -L "$globaldir" ] && [ -k "$globaldir" ]; then
+    # An absent per-user dir is usable only where its create would succeed; an existing one must be a user-owned directory.
+    if [ ! -e "$candidate" ] && [ ! -L "$candidate" ]; then
+      if [ -w "$globaldir" ] && [ -x "$globaldir" ]; then
+        printf '%s/files\n' "$candidate"
+      else
+        printf '%s/.Trash-%s/files\n' "$top" "$uid"
+      fi
+    else
+      owner=$(stat -c %u -- "$candidate" 2>/dev/null) || owner=""
+      if [ -d "$candidate" ] && [ ! -L "$candidate" ] && [ "$owner" = "$uid" ]; then
+        printf '%s/files\n' "$candidate"
+      else
+        printf '%s/.Trash-%s/files\n' "$top" "$uid"
+      fi
+    fi
+  else
+    printf '%s/.Trash-%s/files\n' "$top" "$uid"
+  fi
+  return 0
+}
+
+# Decodes the %XX escapes GLib writes in a trashinfo Path; a % outside an escape stays literal.
+sandbox_trash_unescape() {
+  local s=${1:-} pre hex ch
+  _SANDBOX_TRASH_UNESCAPED=
+  while :; do
+    case "$s" in *%*) ;; *) _SANDBOX_TRASH_UNESCAPED=$_SANDBOX_TRASH_UNESCAPED$s; return 0 ;; esac
+    pre=${s%%\%*}
+    s=${s#*\%}
+    case "$s" in [0-9abcdefABCDEF][0-9abcdefABCDEF]*) hex=${s%"${s#??}"}; s=${s#??} ;; *) _SANDBOX_TRASH_UNESCAPED=$_SANDBOX_TRASH_UNESCAPED$pre%; continue ;; esac
+    printf -v ch '%b' "\\0$(printf '%03o' "$((16#$hex))")"
+    _SANDBOX_TRASH_UNESCAPED=$_SANDBOX_TRASH_UNESCAPED$pre$ch
+  done
+}
+
+# Records owned mount-top trash names so an EXIT trap removes them even when the case fails.
+if [ -z "${_SANDBOX_TRASH_TRAP_INIT:-}" ]; then
+  _SANDBOX_TRASH_TRAP_INIT=1
+  _SANDBOX_TRASH_TRAP_JOBS=()
+  _SANDBOX_TRASH_TRAPPED=
+  _SANDBOX_TRASH_PREV_EXIT=
+fi
+sandbox_trash_trap_own() {
+  local trash=${1:-} root=${2:-} name live cmd prev= fresh=0
+  [ -n "$trash" ] && [ -n "$root" ] && [ $# -ge 3 ] || return 1
+  case "$trash" in /*) ;; *) return 1 ;; esac
+  case "$root" in /*) ;; *) return 1 ;; esac
+  shift 2
+  # The first registration in a shell drops the jobs it inherited from a parent shell, which runs them itself.
+  [ "$_SANDBOX_TRASH_TRAPPED" = "$BASHPID" ] || { fresh=1; _SANDBOX_TRASH_TRAP_JOBS=(); }
+  for name in "$@"; do
+    case "$name" in ""|*/*|*$'\t'*|*$'\n'*) return 1 ;; esac
+    _SANDBOX_TRASH_TRAP_JOBS+=("$trash"$'\t'"$root"$'\t'"$name")
+  done
+  # A subshell prints its parent's traps until it runs a trap command, so this reset of an unused signal leaves trap -p showing only this shell's own.
+  trap - URG
+  # trap -p quotes the command for eval, so set -- unquotes one with quotes inside it too.
+  live=$(trap -p EXIT 2>/dev/null) || live=
+  case "$live" in "trap -- "*) eval "set -- $live"; cmd=${3:-} ;; *) cmd= ;; esac
+  # Install when this shell has not yet, or when a later trap replaced ours, and chain the trap this shell set.
+  if [ "$fresh" = 1 ] || [ "$cmd" != sandbox_trash_trap_run ]; then
+    [ "$cmd" = sandbox_trash_trap_run ] || prev=$cmd
+    _SANDBOX_TRASH_PREV_EXIT=$prev
+    _SANDBOX_TRASH_TRAPPED=$BASHPID
+    trap sandbox_trash_trap_run EXIT
+  fi
+  return 0
+}
+
+# Runs every recorded owned removal, then the previously chained trap with the entering status.
+sandbox_trash_trap_run() {
+  local st=$? job trash rest root name
+  for job in ${_SANDBOX_TRASH_TRAP_JOBS[@]+"${_SANDBOX_TRASH_TRAP_JOBS[@]}"}; do
+    trash=${job%%$'\t'*}; rest=${job#*$'\t'}; root=${rest%%$'\t'*}; name=${rest#*$'\t'}
+    sandbox_trash_remove_own "$trash" "$root" "$name" 2>/dev/null || printf 'TRASH TRAP %s in %s was not removed\n' "$name" "$trash" >&2
+  done
+  # The subshell hands the chained trap the status this trap was entered with; errexit, on in every ui.sh case, would end the trap there.
+  set +e
+  (exit "$st")
+  eval "${_SANDBOX_TRASH_PREV_EXIT:-return $st}"
+  return "$st"
+}
+
+# Removes only owned trash entries: each named files/info pair whose .trashinfo Path resolves under the root.
+sandbox_trash_remove_own() {
+  local trash=${1:-} root=${2:-} name files info infodir path base mtop canon canonroot qdir rc=0
+  [ -n "$trash" ] && [ -n "$root" ] || return 1
+  case "$trash" in /*) ;; *) return 1 ;; esac
+  case "$root" in /*) ;; *) return 1 ;; esac
+  case "$trash" in */files) infodir=${trash%/files}/info ;; *) return 1 ;; esac
+  base=${trash%/files}
+  # The mount top behind a mount-top trash; a home trash has none, so a relative entry there stays foreign.
+  case "$base" in
+    */.Trash/*) mtop=${base%/.Trash/*}/ ;;
+    */.Trash-*) mtop=${base%/.Trash-*}/ ;;
+    *) mtop= ;;
+  esac
+  canonroot=$(sandbox_canon "$root") || return 1
+  [ -n "$canonroot" ] || return 1
+  shift 2
+  for name in "$@"; do
+    case "$name" in ""|*/*) return 1 ;; esac
+    files=$trash/$name
+    info=$infodir/$name.trashinfo
+    case "$files" in "$trash/"*) ;; *) return 1 ;; esac
+    case "$info" in "$infodir/"*) ;; *) return 1 ;; esac
+    # A name with no .trashinfo is already gone, so it stays a no-op.
+    [ -f "$info" ] || continue
+    # Sample .trashinfo line: "Path=/home/u/a%20b.txt".
+    path=$(sed -n 's/^Path=//p' -- "$info" 2>/dev/null | head -n 1) || { rc=2; continue; }
+    [ -n "$path" ] || { rc=2; continue; }
+    # GLib percent-escapes Path, so %XX decodes before the compare.
+    sandbox_trash_unescape "$path"
+    path=$_SANDBOX_TRASH_UNESCAPED
+    # GLib writes a mount-top Path relative to the mount top; a home trash has none, so a relative one stays foreign.
+    case "$path" in /*) canon=$path ;; *) [ -n "$mtop" ] || { rc=2; continue; }; canon=$mtop$path ;; esac
+    canon=$(sandbox_canon "$canon") || { rc=2; continue; }
+    # A trashed entry whose Path misses the root stays in place and turns the return to 2.
+    case "$canon/" in "$canonroot/"*) ;; *) rc=2; continue ;; esac
+    case "$files" in /*) ;; *) return 1 ;; esac
+    case "$info" in /*) ;; *) return 1 ;; esac
+    [ -n "$files" ] && [ -n "$info" ] || return 1
+    if [ -d "$files" ] && [ ! -L "$files" ]; then
+      # A trashed directory is moved into the case's own marked root, never deleted in the shared trash.
+      qdir=$root/.flea-trash-quarantine
+      mkdir -p -- "$qdir" || return 1
+      chmod u+w -- "$files" || return 1
+      mv -- "$files" "$qdir/" || return 1
+    elif [ -e "$files" ] || [ -L "$files" ]; then rm -f -- "$files" || return 1; fi
+    rm -f -- "$info" || return 1
+  done
+  return "$rc"
+}

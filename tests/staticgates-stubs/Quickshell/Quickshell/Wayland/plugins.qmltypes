@@ -1,0 +1,23 @@
+import QtQuick.tooling 1.2
+
+// Test-only qmllint stub: mirrors the attached shape of WlrLayershell so the scope resolves; only the members the tree reads are declared.
+Module {
+    Component {
+        file: "fleastubwlrlayershellattached.h"
+        name: "FleaStubWlrLayershellAttached"
+        accessSemantics: "reference"
+        prototype: "QObject"
+        Property { name: "namespace"; type: "string" }
+        Property { name: "layer"; type: "int" }
+        Property { name: "keyboardFocus"; type: "int" }
+    }
+    Component {
+        file: "fleastubwlrlayershell.h"
+        name: "FleaStubWlrLayershell"
+        accessSemantics: "reference"
+        prototype: "QObject"
+        exports: ["Quickshell.Wayland/WlrLayershell 1.0"]
+        isCreatable: false
+        attachedType: "FleaStubWlrLayershellAttached"
+    }
+}

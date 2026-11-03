@@ -1,0 +1,142 @@
+#!/bin/bash
+# Diffs the metrics contract against the running app's own seam, key by key, and fails on any drift.
+#   tools/flea-metrics-gate        against a Flea already running from this checkout's ui/
+# Start one first, on a listing of your own making, never a real directory (hard rule 9):
+#   QSG_RHI_BACKEND=vulkan FLEA_PATH=$(mktemp -d) FLEA_BIN=target/release/flea qs -p ui/boot &
+# The renderer is named because src/gui.rs owns that choice and a direct qs launch never runs it.
+# FLEA_RENDERER_AUTOMATIC stays unset, so no QML retry can relaunch Flea underneath the gate mid-run.
+# Reads the seam and never the source: a theme's shell.toml can pin body-small or row-padding-x, so
+# the only number that counts is the one the app resolved. A token that exists and is spelled right
+# can still be the wrong one, which is the defect this exists to catch.
+set -u
+cd "$(dirname "$0")/.." || exit 1
+ui=$PWD/ui
+# qs scopes its instances by runtime dir, and a plain ssh session does not export one.
+export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+# A path is not an instance selector, so the gate reads the pid it resolved and never a path.
+. "$PWD/tools/flea-ipc-pid"
+flea_pid=$(flea_ipc_pid "$ui") || exit 1
+
+# Sample seam output, one key=value per line, in the Blueprint board's order:
+#   family=JetBrainsMono Nerd Font
+#   baseSize=14
+#   rowHeight=37
+read_seam() {
+  qs ipc --pid "$flea_pid" call flea tokens 2>&1
+}
+
+# Style resolves the font family through fc-match after startup, so a read that lands before it
+# answers reports the alias; five short waits cover that without ever excusing a missing font.
+seam=$(read_seam)
+# The seam is built after the first listing, so a read just after launch can find no target yet.
+for _attempt in $(seq 1 50); do
+  case $seam in *baseSize=*) break ;; esac
+  sleep 0.2; seam=$(read_seam)
+done
+for _attempt in 1 2 3 4 5; do
+  case $seam in
+    family=monospace*) sleep 0.2; seam=$(read_seam) ;;
+    *) break ;;
+  esac
+done
+
+value_of() {
+  printf '%s\n' "$seam" | grep "^$1=" | cut -d= -f2-
+}
+
+# Anything without a baseSize line is qs explaining itself (no instance, dead instance, no such
+# function), and that explanation is the error.
+if [ -z "$(value_of baseSize)" ]; then
+  echo "flea-metrics-gate: Flea pid $flea_pid, from $ui, does not answer tokens():"
+  # qs follows its one-line reason with every dead instance it ever had, which is not evidence.
+  printf '%s\n' "$seam" | head -2 | sed 's/^/  /'
+  exit 1
+fi
+
+# The table below is written at omarchy base-size 14, so any other base is refused rather than diffed.
+contract_base=14
+base=$(value_of baseSize)
+if [ "$base" != "$contract_base" ]; then
+  echo "flea-metrics-gate: the table is written at base-size $contract_base and the seam reports [$base]; re-derive it before trusting a diff"
+  exit 1
+fi
+
+# Style.cornerRadius mirrors decoration:rounding, so the contract's own number is Hyprland's, read live.
+if [ -z "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]; then
+  HYPRLAND_INSTANCE_SIGNATURE=$(ls -t "/run/user/$(id -u)/hypr/" 2>/dev/null | head -1)
+  export HYPRLAND_INSTANCE_SIGNATURE
+fi
+# Sample: {"option": "decoration:rounding", "int": 8, "set": true }
+rounding=$(hyprctl -j getoption decoration:rounding 2>/dev/null | grep -o '"int": *[0-9]*' | grep -o '[0-9]*$')
+if [ -z "$rounding" ]; then
+  echo "flea-metrics-gate: hyprctl could not report decoration:rounding, so cornerRadius has no contract number"
+  exit 1
+fi
+
+# The mark retains the unrounded type-scale product, including its IEEE-754 representation.
+mark_contract=$(python3 -c 'print(13 * 1.45)') || exit 1
+# key|contract value|derivation. The four column widths depend on the family, which is why family is first.
+contract="family|JetBrainsMono Nerd Font|fc-match monospace, Style.font.resolvedFamily
+baseSize|14|[font] base-size in the user's shell.toml, layered over the theme's
+body|14|round(14 x 1.0), Style.font.body, what running text draws at
+bodySmall|13|round(14 x 0.917)
+caption|12|round(14 x 0.833)
+lineBoxRatio|1.8|Flea constant, leading above and below
+rowPaddingX|14|space(12)
+rowPaddingY|7|space(6)
+gap|9|space(8)
+hairline|1|space(1)
+rowHeight|37|round(13 x 1.8) + 2 x 7
+iconSize|23|37 - 2 x 7
+markSize|$mark_contract|13 x 1.45, the preserved unrounded mark token
+stateMarkSize|40|round(13 x 3.1), the Locked and Error mark States.dc.html draws
+heroMarkSize|48|round(13 x 3.7), the empty hero and the loading crawl States.dc.html draws
+strokeWidth|2|the overseer boards' shared stroke on the 24 unit glyph grid
+railRowHeight|29|round(37 x 0.78)
+railIconSize|15|29 - 2 x 7
+chromeHeight|27|round(37 x 0.72)
+chromeMarkSize|16|Style.font.icon, round(14 x 1.167), the canvas's chrome mark
+columnMode|70|9 ch x 7.8, JetBrainsMono's advance at 13 px
+columnSize|70|9 ch x 7.8
+columnDate|125|16 ch x 7.8
+columnPickerDate|80|80 x 13 / 13, the 80px date slot SendPicker.html draws
+columnKind|130|120 x 13 / 12
+menuWidth|257|space(220)
+cornerRadius|$rounding|hyprctl getoption decoration:rounding, read live above
+previewFraction|0.82|Flea constant, Quick-Look sized inset
+gridIconSize|46|2 x 23
+gridMinCellWidth|146|space(125), GridView.dc.html's five-column reference viewport over five tiles
+settingsPanelWidth|630|round(space(480) x 9/8), the roomier SettingsView board
+settingsRailWidth|169|630 - 459 - 2 outer hairlines, SettingsView rule 1
+settingsPaneWidth|459|round(space(350) x 9/8), the roomier Settings pane
+settingsRailPaddingY|10|10 x 13 / 13, the inset Settings.dc.html gives the rail column above its first row"
+
+checked=0
+drift=0
+while IFS='|' read -r key want why; do
+  [ -n "$key" ] || continue
+  checked=$((checked + 1))
+  got=$(value_of "$key")
+  if [ -z "$got" ]; then
+    echo "MISSING  $key: the seam reports no such key ($why)"
+    drift=$((drift + 1))
+  elif [ "$got" != "$want" ]; then
+    echo "DRIFT    $key: seam $got, contract $want ($why)"
+    drift=$((drift + 1))
+  else
+    echo "ok       $key=$got"
+  fi
+done <<< "$contract"
+
+# A key the seam reports and the table does not know is a token nobody has written a contract for.
+while IFS='=' read -r key _value; do
+  [ -n "$key" ] || continue
+  case "$contract" in
+    "$key|"* | *"
+$key|"*) ;;
+    *) echo "UNLISTED $key: the seam reports it and this table carries no contract for it"; drift=$((drift + 1)) ;;
+  esac
+done <<< "$seam"
+
+echo "flea-metrics-gate: $checked keys checked, $drift wrong"
+[ "$drift" -eq 0 ]

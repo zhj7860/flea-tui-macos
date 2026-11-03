@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# What an entrant actually thumbnailed, by format, so a count can be compared instead of a total.
+#   flea-bench-keys map <fixture> <map-file>        one "<md5> <ext>" line per fixture file
+#   flea-bench-keys classify <map-file> <keys-file> "jpg=601;png=189;webp=0" for the CSV
+# A thumbnailer with no plugin for a MIME type never attempts the file and writes no failure marker,
+# so a silent skip and work-not-done look identical in a bare total. The formats tell them apart.
+set -uo pipefail
+
+verb=${1:-}
+
+# The cache key is md5 of the file:// URI. The backend percent-encodes on GLib's measured literal
+# set, which this cannot reproduce in shell, so it refuses any name that would need encoding at all
+# rather than deriving a key that is quietly wrong for every entrant at once.
+name_is_plain() {
+  case $1 in
+    *[!A-Za-z0-9._-]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+case $verb in
+  map)
+    fixture=${2:-}
+    out=${3:-}
+    [ -n "$fixture" ] && [ -n "$out" ] || { echo "usage: flea-bench-keys map <fixture> <map-file>" >&2; exit 2; }
+    [ -d "$fixture" ] || { echo "flea-bench-keys: no fixture at $fixture" >&2; exit 1; }
+    : > "$out" || exit 1
+    while IFS= read -r name; do
+      if ! name_is_plain "$name"; then
+        echo "flea-bench-keys: '$name' needs percent-encoding, which this cannot derive; every key would be wrong" >&2
+        exit 1
+      fi
+      case $name in
+        *.*) ext=${name##*.} ;;
+        *) ext=none ;;
+      esac
+      key=$(printf 'file://%s/%s' "$fixture" "$name" | md5sum | cut -d' ' -f1)
+      printf '%s %s\n' "$key" "$ext" >> "$out"
+    done < <(ls -U "$fixture")
+    # join needs both sides sorted in the same collation, so both ends of this tool use LC_ALL=C.
+    LC_ALL=C sort -o "$out" "$out"
+    [ -s "$out" ] || { echo "flea-bench-keys: the map is empty, so the fixture held nothing" >&2; exit 1; }
+    ;;
+
+  classify)
+    map=${2:-}
+    keys=${3:-}
+    [ -n "$map" ] && [ -n "$keys" ] || { echo "usage: flea-bench-keys classify <map-file> <keys-file>" >&2; exit 2; }
+    [ -s "$map" ] || { echo "flea-bench-keys: no map at $map" >&2; exit 1; }
+    if [ ! -s "$keys" ]; then
+      # An entrant that produced nothing is a real result and prints as one, never as an error.
+      printf 'none=0\n'
+      exit 0
+    fi
+    # Every extension the fixture holds gets a row even when it is zero, because "webp 0" is the
+    # capability claim this whole section exists to make and a missing row reads as untested.
+    total=0
+    out=""
+    matched=$(LC_ALL=C join -j 1 -o 1.2 "$map" "$keys")
+    for ext in $(cut -d' ' -f2 "$map" | LC_ALL=C sort -u); do
+      n=$(printf '%s\n' "$matched" | grep -c "^$ext$")
+      out="${out:+$out;}$ext=$n"
+      total=$(( total + n ))
+    done
+    # A key the fixture does not explain is a thumbnail of something else, which means the cache was
+    # not clean and the row is not comparable. It is named rather than folded into a total.
+    produced=$(wc -l < "$keys")
+    unknown=$(( produced - total ))
+    printf '%s;unknown=%s\n' "$out" "$unknown"
+    ;;
+
+  *)
+    echo "usage: flea-bench-keys map|classify ..." >&2
+    exit 2
+    ;;
+esac

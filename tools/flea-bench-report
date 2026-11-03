@@ -1,0 +1,678 @@
+#!/usr/bin/env bash
+# The field run's numbers, laid out the way the design canvas's Bench board requires: every timing
+# printed beside the work that produced it, the two groups never sharing a table, and an entrant
+# that did not do the same work sitting below a rule with the reason rather than plotted as fast.
+# A work column nobody measured reads "not measured" and never "0 thumbnails", and a group where
+# no entrant's work was measured is not ranked at all.
+#
+#   tools/flea-bench-report <run.csv> [capability.md]
+#
+# Reads every column by header name. A positional read is how a column gets silently mis-mapped the
+# next time the harness grows one, which already happened here once when preview_ms was appended.
+#
+# Everything the run has to satisfy is checked in the block below, in the main shell, before a single
+# line of the report is printed. An "exit 1" inside a $( ) only kills the subshell, so a check
+# further down would let this file print a wrong number and still exit 0, which is the exact failure
+# it exists to prevent.
+#
+# The box's hostname and the fixture's absolute path are never printed: this output is pasted into a
+# public README and the operator's machine names are not public.
+set -uo pipefail
+
+die() { echo "flea-bench-report: $*" >&2; exit 1; }
+
+if [ "${1:-}" = "--selftest" ] || [ "${1:-}" = "selftest" ]; then
+  run_selftest=1
+fi
+
+# Counted rows carry write_clean 1 where the column exists; older files hold no such column.
+selftest() {
+  local tmp fail=0
+  tmp=$(mktemp -d) || { echo "flea-bench-report selftest: no temp directory" >&2; return 1; }
+  # Hard rule 9: the root is absolute, non-empty, under mktemp's own base (TMPDIR or /tmp) and holds its marker.
+  local base=${TMPDIR:-/tmp}
+  base=${base%/}
+  [ -n "$tmp" ] && [ -d "$tmp" ] && [ "${tmp#/}" != "$tmp" ] && [ "${tmp#"$base"/}" != "$tmp" ] \
+    || { echo "flea-bench-report selftest: bad temp path" >&2; return 1; }
+  printf 'selftest' > "$tmp/.bench-report-selftest" && [ -f "$tmp/.bench-report-selftest" ] \
+    || { echo "flea-bench-report selftest: temp root holds no marker" >&2; rm -rf "$tmp"; return 1; }
+  trap 'rm -rf "$tmp"' EXIT
+  local head="id,run,mapped_ms,settled_ms,pss_kb,cpu_s,child_pss_kb,thumbs_n,pss_anon_kb,uss_kb,drm_kb,thumbs_by_dir,cpu_tree_s,thumbs_by_format,ranked,preview_ms,cpu_reaped_s,cpu_sys_s,dirty_wb_kb,pgpgout_pre_kb,pgpgout_launch_kb,write_clean,rerun,first_rows_ms"
+  local man="flea gui source abc1234 (clean), release binary built 2026-09-23, 100 bytes
+dolphin gui dolphin 1.2.3-4"
+  local csv="$tmp/run.csv"
+  {
+    printf '%s\n' "$head"
+    printf '%s\n' "flea,1,424,2400,73628,0.41,6936,0,1,1,1,-,9.99,-,unranked: writes in flight (dirty_wb 20480 kB pgpgout_pre 3 kB pgpgout_launch 9000 kB),-,0.59,0.10,20480,3,9000,0,0,-"
+    printf '%s\n' "flea,1,424,900,73628,0.41,6936,0,1,1,1,-,0.41,-,yes,-,0.59,0.10,0,0,0,1,1,-"
+    printf '%s\n' "flea,2,409,950,74000,0.40,6900,0,1,1,1,-,0.40,-,yes,-,0.60,0.10,0,0,0,1,0,-"
+    printf '%s\n' "dolphin,1,1735,5394,207868,9.25,0,500,1,1,1,-,9.26,-,yes,-,9.25,0.10,0,0,0,1,0,-"
+  } > "$csv"
+  {
+    printf '# Field bench manifest\n\n## Entrants\n\n```\n%s\n```\n\n' "$man"
+    printf -- '- fixture payload: 2 visible entries\n- thumbnailable denominator: 0, from 0\n- date: 2026-09-30T18:50:14-04:00\n- TUI terminal: kitty\n- TUI preview target: /tmp/x.jpg\n'
+  } > "$tmp/run.manifest.md"
+  local out
+  out=$("$0" "$csv" 2>"$tmp/err") || { echo "flea-bench-report selftest FAILED: write-guard-report refused a contaminated row plus its clean rerun:" >&2; cat "$tmp/err" >&2; fail=1; }
+  case "$out" in
+    *"925 ms"*) ;;
+    *) echo "flea-bench-report selftest FAILED: write-guard-median missed 925 ms:" >&2; printf '%s\n' "$out" >&2; fail=1 ;;
+  esac
+  case "$out" in
+    *"2,400 ms"*|*"2400"*) echo "flea-bench-report selftest FAILED: write-guard-median counted the dirty row" >&2; fail=1 ;;
+  esac
+  case "$out" in
+    *"different 'ranked' verdicts"*) echo "flea-bench-report selftest FAILED: write-guard-verdict still dies on the dirty row" >&2; fail=1 ;;
+  esac
+  local old="$tmp/old.csv"
+  {
+    printf 'id,run,mapped_ms,settled_ms,pss_kb,cpu_s,child_pss_kb,thumbs_n,pss_anon_kb,uss_kb,drm_kb,thumbs_by_dir,cpu_tree_s,thumbs_by_format,ranked,preview_ms\n'
+    printf '%s\n' "flea,1,424,900,73628,0.41,6936,0,1,1,1,-,0.41,-,yes,-"
+    printf '%s\n' "dolphin,1,1735,5394,207868,9.25,0,500,1,1,1,-,9.26,-,yes,-"
+  } > "$old"
+  cp "$tmp/run.manifest.md" "$tmp/old.manifest.md"
+  "$0" "$old" > /dev/null 2>"$tmp/olderr" || { echo "flea-bench-report selftest FAILED: legacy file without write_clean refused:" >&2; cat "$tmp/olderr" >&2; fail=1; }
+  # An entrant whose every row is write_clean 0 dies naming that, not a verdict disagreement.
+  local dirty="$tmp/dirty.csv"
+  {
+    printf '%s\n' "$head"
+    printf '%s\n' "flea,1,424,900,73628,0.41,6936,0,1,1,1,-,0.41,-,yes,-,0.59,0.10,0,0,0,1,0,-"
+    printf '%s\n' "dolphin,1,1735,5394,207868,9.25,0,500,1,1,1,-,9.26,-,unranked: writes in flight,-,9.25,0.10,20480,3,9000,0,0,-"
+  } > "$dirty"
+  cp "$tmp/run.manifest.md" "$tmp/dirty.manifest.md"
+  if "$0" "$dirty" > /dev/null 2>"$tmp/dirtyerr"; then
+    echo "flea-bench-report selftest FAILED: all-dirty-entrant-refused: the report printed with dolphin counting no run" >&2; fail=1
+  else
+    case "$(cat "$tmp/dirtyerr")" in
+      *"dolphin has no counted run"*"write_clean 0"*) ;;
+      *) echo "flea-bench-report selftest FAILED: all-dirty-entrant-names: wrong refusal:" >&2; cat "$tmp/dirtyerr" >&2; fail=1 ;;
+    esac
+  fi
+  trap - EXIT
+  rm -rf "$tmp"
+  if [ "$fail" -ne 0 ]; then return 1; fi
+  echo "flea-bench-report selftest: write-guard-report, write-guard-median, legacy-no-write-clean, all-dirty-entrant, all cells match"
+  return 0
+}
+
+if [ "${run_selftest:-}" = 1 ]; then
+  selftest
+  exit $?
+fi
+
+CSV=${1:-}
+[ -n "$CSV" ] || { echo "usage: flea-bench-report <run.csv> [capability.md]" >&2; exit 2; }
+[ -s "$CSV" ] || { echo "flea-bench-report: no results at $CSV" >&2; exit 1; }
+MANIFEST="${CSV%.csv}.manifest.md"
+[ -s "$MANIFEST" ] \
+  || { echo "flea-bench-report: no manifest beside the results at $MANIFEST" >&2; exit 1; }
+CAPABILITY=${2:-$(dirname "$CSV")/capability.md}
+
+# Sample header, and the only shape this file parses:
+# id,run,mapped_ms,settled_ms,pss_kb,cpu_s,child_pss_kb,thumbs_n,pss_anon_kb,uss_kb,drm_kb,
+# thumbs_by_dir,cpu_tree_s,thumbs_by_format,ranked,preview_ms
+# flea,1,754,1227,105779,0.75,5323,0,76112,81964,148216,-,0.90,-,yes,-
+header=$(head -1 "$CSV")
+# Field count of the header, so a row carrying a comma inside a value can be named as such.
+header_n=$(printf '%s' "$header" | tr ',' '\n' | grep -c .)
+
+col_of() {
+  local want=$1 i=0 f
+  while IFS= read -r f; do
+    i=$(( i + 1 ))
+    [ "$f" = "$want" ] && { printf '%s' "$i"; return 0; }
+  done < <(printf '%s\n' "$header" | tr ',' '\n')
+  return 1
+}
+
+for c in id run mapped_ms settled_ms pss_kb child_pss_kb thumbs_n cpu_tree_s thumbs_by_format \
+         ranked preview_ms; do
+  col_of "$c" > /dev/null || die "the CSV header has no '$c' column"
+done
+id_col=$(col_of id)
+run_col=$(col_of run)
+mapped_col=$(col_of mapped_ms)
+settled_col=$(col_of settled_ms)
+pss_col=$(col_of pss_kb)
+child_col=$(col_of child_pss_kb)
+thumbs_col=$(col_of thumbs_n)
+cpu_col=$(col_of cpu_tree_s)
+fmt_col=$(col_of thumbs_by_format)
+ranked_col=$(col_of ranked)
+preview_col=$(col_of preview_ms)
+# The write guard keeps every row and counts only write_clean=1; older files hold no such column.
+write_clean_col=""
+col_of "write_clean" > /dev/null && write_clean_col=$(col_of write_clean)
+
+# Counted rows of one entrant: only write_clean=1 rows where the column exists, else every row.
+id_rows() {
+  if [ -n "$write_clean_col" ]; then
+    awk -F, -v id="$1" -v wc="$write_clean_col" 'NR > 1 && $1 == id && $wc == 1' "$CSV"
+  else
+    grep "^$1," "$CSV"
+  fi
+}
+id_row1() { id_rows "$1" | head -1; }
+
+# Entrants in the order the harness ran them, which is the order the manifest lists them in.
+ids=()
+while IFS= read -r id; do
+  case " ${ids[*]:-} " in *" $id "*) continue ;; esac
+  ids+=("$id")
+done < <(tail -n +2 "$CSV" | cut -d, -f"$id_col")
+[ ${#ids[@]} -gt 0 ] || die "$CSV has no result rows"
+
+runs=$(tail -n +2 "$CSV" | cut -d, -f"$run_col" | sort -u | grep -c .)
+
+# The group comes from the manifest's own entrant block, written from what the harness launched,
+# rather than from a list kept in here that goes stale the first time the field changes.
+# Sample line: "flea       gui  source fc89a96 (clean), release binary built 2026-..., 883992 bytes"
+entrant_line() { grep -m1 -E "^$1 +(gui|tui) " "$MANIFEST" | tr -s ' '; }
+kind_of() { entrant_line "$1" | cut -d' ' -f2; }
+version_of() { entrant_line "$1" | cut -d' ' -f3-; }
+# One entrant's Version cell, from its manifest line only: a package version, or a source ref with (dirty).
+# Sample input: "flea       gui  source 1bd18d9 (clean), release binary built 2026-09-23T00:14:24-04:00, 2706072 bytes".
+short_version() {
+  local line rest sha dirty
+  line=$(entrant_line "$1")
+  [ -n "$line" ] || die "the manifest has no entrant line for '$1', so its version is unknown"
+  rest=${line#* }
+  rest=${rest#* }
+  case "$rest" in
+    "NOT INSTALLED") printf 'NOT INSTALLED'; return 0 ;;
+    unpackaged\ at\ *) printf 'unpackaged'; return 0 ;;
+    source\ *) rest=${rest#source } ;;
+    *" "*)
+      case "$rest" in *" "*" "*) die "the manifest version line for entrant '$1' is unparseable" ;; esac
+      printf '%s' "${rest##* }"; return 0 ;;
+    *) die "the manifest version line for entrant '$1' is unparseable" ;;
+  esac
+  case "$rest" in
+    *\ committed\ *) printf '%s' "${rest%% *}"; return 0 ;;
+  esac
+  sha=${rest%% *}
+  rest=${rest#* }
+  case "$rest" in "("* ) dirty=$rest ;; *) dirty=${rest#* } ;; esac
+  case "$dirty" in "("* ) ;; *) die "the manifest version line for entrant '$1' is unparseable" ;; esac
+  dirty=${dirty#\(}
+  dirty=${dirty%%\)*}
+  case "$sha" in absent|unreadable) printf '%s' "$sha"; return 0 ;; esac
+  case "$dirty" in
+    clean) printf '%s' "$sha" ;;
+    DIRTY) printf '%s (dirty)' "$sha" ;;
+    *) die "the manifest version line for entrant '$1' is unparseable" ;;
+  esac
+}
+ranked_of() { id_row1 "$1" | cut -d, -f"$ranked_col"; }
+
+# Runs that disagree on the verdict mean the harness changed its mind mid-run, which is a broken
+# result rather than a number to average.
+for id in "${ids[@]}"; do
+  case "$(kind_of "$id")" in
+    gui|tui) ;;
+    *) die "the manifest gives no gui or tui kind for entrant '$id'" ;;
+  esac
+  # Every entrant's version parses before a single line of the report is printed.
+  short_version "$id" > /dev/null
+  # A comma inside a field shifts every later column, write_clean too, so the raw rows are checked before the guard filter.
+  while IFS= read -r row; do
+    cols=$(printf '%s\n' "$row" | tr ',' '\n' | grep -c .)
+    [ "$cols" -le "$header_n" ] || die "$id's row has $cols fields against the header's $header_n, so a field holds a comma: $(printf '%s' "$row" | cut -d, -f"$ranked_col")"
+  done < <(awk -F, -v id="$id" 'NR > 1 && $1 == id' "$CSV")
+  # An entrant the write guard dropped in full has nothing to rank or average, which is not a disagreement.
+  if [ -z "$(id_rows "$id")" ]; then
+    if [ -n "$write_clean_col" ]; then
+      die "$id has no counted run: every one of its rows carries write_clean 0, so the report has nothing to say about it"
+    fi
+    die "$id has no row in $CSV, so the report has nothing to say about it"
+  fi
+  n=$(id_rows "$id" | cut -d, -f"$ranked_col" | sort -u | grep -c .)
+  [ "$n" -eq 1 ] || die "$id carries $n different 'ranked' verdicts across its counted runs"
+done
+
+# Every value in a counted column is a whole number or one of the harness's did-not-happen markers.
+# "unmeasurable" is one of those markers: the run looked and the instrument could not see this
+# entrant's work, which is not a count of zero. Every CPU value carries exactly two decimals.
+for col in "$mapped_col" "$settled_col" "$pss_col" "$child_col" "$thumbs_col" "$preview_col"; do
+  name=$(printf '%s' "$header" | cut -d, -f"$col")
+  while IFS= read -r v; do
+    case "$v" in
+      -|n/a|-1|""|unmeasurable) continue ;;
+      *[!0-9]*) die "the $name column holds '$v', which is not a whole number" ;;
+    esac
+  done < <(tail -n +2 "$CSV" | cut -d, -f"$col")
+done
+while IFS= read -r v; do
+  case "$v" in
+    -|*.[0-9][0-9]) continue ;;
+    *) die "the cpu_tree_s column holds '$v', which is not two decimals" ;;
+  esac
+done < <(tail -n +2 "$CSV" | cut -d, -f"$cpu_col")
+
+manifest_field() {
+  local line
+  line=$(grep -m1 "^- $1: " "$MANIFEST")
+  printf '%s' "${line#- $1: }"
+}
+
+for f in 'fixture payload' 'thumbnailable denominator' 'date' 'TUI terminal' 'TUI preview target'; do
+  grep -q "^- $f: " "$MANIFEST" || die "the manifest has no '$f' line"
+done
+payload=$(manifest_field 'fixture payload')
+thumbable=$(manifest_field 'thumbnailable denominator')
+thumbable_n=${thumbable%%,*}
+run_date=$(manifest_field date)
+tui_term=$(manifest_field 'TUI terminal')
+preview_target=$(manifest_field 'TUI preview target')
+[ "${preview_target#/}" = "$preview_target" ] || preview_target="${preview_target##*/}"
+
+# Whether the harness took this entrant's thumbnail count at all. The count and the per-format
+# breakdown are written in the same branch, so a "-" format is the run saying it never looked and
+# the count beside it is unmeasured, where "none=0" beside a 0 is a real and damning nothing.
+work_measured() {
+  local row n f
+  row=$(id_row1 "$1")
+  n=$(printf '%s' "$row" | cut -d, -f"$thumbs_col")
+  f=$(printf '%s' "$row" | cut -d, -f"$fmt_col")
+  # "unmeasurable" is the run having looked and the cache having shown it nothing, which is a
+  # measurement this group took; only "-", "n/a" and an empty cell mean it never looked at all.
+  case "$n" in -|n/a|"") return 1 ;; esac
+  [ "$f" != "-" ]
+}
+
+# The reason a group cannot be ranked at all, or nothing when it can. A run either drops the
+# thumbnail cache for every entrant or for none, so a group that is half measured was appended
+# from two runs and its rows are not each other's comparison.
+if [ "$thumbable_n" != "0" ]; then
+  for kind in gui tui; do
+    measured=0
+    unmeasured=0
+    for id in "${ids[@]}"; do
+      [ "$(kind_of "$id")" = "$kind" ] || continue
+      if work_measured "$id"; then
+        measured=$(( measured + 1 ))
+      else
+        unmeasured=$(( unmeasured + 1 ))
+      fi
+    done
+    [ "$measured" -gt 0 ] && [ "$unmeasured" -gt 0 ] \
+      && die "the $kind group has a thumbnail count for $measured entrants and none for $unmeasured, so its rows came from different runs"
+  done
+fi
+
+# A fixture holding no thumbnailable file has no thumbnail work to compare, so its zeros are the
+# fixture and not a missing measurement, and that group ranks on its other columns as before.
+group_refusal() {
+  local want=$1 id seen=0
+  [ "$thumbable_n" = "0" ] && return 0
+  for id in "${ids[@]}"; do
+    [ "$(kind_of "$id")" = "$want" ] || continue
+    seen=1
+    work_measured "$id" && return 0
+  done
+  [ "$seen" -eq 1 ] || return 0
+  printf 'No thumbnail count was taken in this run, so nothing here is known to have done the same work'
+}
+
+# ---------------------------------------------------------------- number handling
+
+kib_per_mib=1024
+
+# 17124 printed as "17,124". printf offers no locale-free grouping and these columns run to six
+# digits, which is unreadable unbroken.
+group() {
+  local n=$1 out=""
+  while [ ${#n} -gt 3 ]; do
+    out=",${n: -3}$out"
+    n=${n:0:${#n}-3}
+  done
+  printf '%s%s' "$n" "$out"
+}
+
+# "7.41" seconds becomes 741 hundredths, so every median below stays integer arithmetic. The two
+# decimals were checked above, which is why nothing here has to handle another shape.
+centis() { printf '%d' $(( 10#${1%.*} * 100 + 10#${1#*.} )); }
+
+fmt_ms() { printf '%s ms' "$(group "$1")"; }
+fmt_secs() { printf '%d.%02d s' $(( $1 / 100 )) $(( $1 % 100 )); }
+# Rounded to the nearest tenth of a MiB, not truncated: 105779 kB is 103.299 MiB and printing that
+# as 103.2 loses a tenth the reader can check back against the raw kB.
+fmt_mib() {
+  local tenths=$(( ( $1 * 20 / kib_per_mib + 1 ) / 2 ))
+  printf '%d.%d MiB' $(( tenths / 10 )) $(( tenths % 10 ))
+}
+
+# Median of the integers on stdin, printed as "<median> <count>". Even counts average the two
+# central values. The count travels with the number because a median of two runs is not a median of
+# three and the reader has to be told which one they are looking at.
+median_n() {
+  local -a v=()
+  local x n mid
+  while IFS= read -r x; do
+    [ -n "$x" ] && v+=("$x")
+  done < <(sort -n)
+  n=${#v[@]}
+  [ "$n" -gt 0 ] || { printf '0 0'; return 0; }
+  mid=$(( n / 2 ))
+  if [ $(( n % 2 )) -eq 1 ]; then
+    printf '%d %d' "${v[mid]}" "$n"
+  else
+    printf '%d %d' $(( ( v[mid - 1] + v[mid] ) / 2 )) "$n"
+  fi
+}
+
+# The widest gap between any two runs of one number, in tenths. Hard rule 7: a timing is a range or a
+# magnitude, so a row whose runs disagree by more than 2x says so instead of hiding behind a median.
+spread10() {
+  local -a v=()
+  local x
+  while IFS= read -r x; do
+    [ -n "$x" ] && v+=("$x")
+  done < <(sort -n)
+  [ ${#v[@]} -ge 2 ] && [ "${v[0]}" -gt 0 ] || { printf '10'; return 0; }
+  printf '%d' $(( v[${#v[@]} - 1] * 10 / v[0] ))
+}
+
+# ---------------------------------------------------------------- the run's own rows
+
+# Every value of one column for one entrant, one per line, with the harness's did-not-happen markers
+# dropped. -1 is not a time: broot records -1, 666 and 672 for preview_ms, and averaging the -1 in
+# would invent a number a third faster than anything that was measured.
+values() {
+  local v
+  while IFS= read -r v; do
+    case "$v" in
+      -|-1|n/a|""|unmeasurable) continue ;;
+    esac
+    printf '%s\n' "$v"
+  done < <(id_rows "$1" | cut -d, -f"$2")
+}
+
+cpu_values() {
+  local v
+  while IFS= read -r v; do
+    [ "$v" = "-" ] && continue
+    printf '%s\n' "$(centis "$v")"
+  done < <(id_rows "$1" | cut -d, -f"$2")
+}
+
+# A sentence for a row whose runs disagree by more than 2x, or nothing at all. Returns 1 when there
+# is nothing to say, so a caller can append it with && and never collect an empty note.
+spread_note() {
+  local sp n
+  sp=$(values "$1" "$2" | spread10)
+  [ "$sp" -gt 20 ] || return 1
+  n=$(values "$1" "$2" | grep -c .)
+  printf "\`%s\`'s %d %s span %d.%dx, so its median is a magnitude and not a number" \
+    "$1" "$n" "$3" $(( sp / 10 )) $(( sp % 10 ))
+}
+
+# ---------------------------------------------------------------- the report
+
+echo "# Field bench report: ${CSV##*/}"
+echo
+echo "Derived by \`tools/flea-bench-report\` from \`${CSV##*/}\` and \`${MANIFEST##*/}\`. Every"
+echo "number below is a median of $runs runs unless its row says otherwise."
+echo
+echo "- fixture: $payload"
+echo "- thumbnailable: $thumbable"
+echo "- run date: ${run_date:0:10}, cold cache, one box, $runs runs per entrant"
+echo "- TUI terminal: $tui_term, preview target \`$preview_target\`"
+echo
+echo "Entrant versions, read off the installed artefact by the harness:"
+echo
+for id in "${ids[@]}"; do
+  echo "- \`$id\` ($(kind_of "$id")) $(version_of "$id")"
+done
+
+# One group's table. Ranked rows first, sorted by time to settle; anything that did not do the
+# same work goes below the rule with the reason spelled out, never plotted as fast.
+group_table() {
+  local want=$1
+  local id kind verdict reason row settled_cell sp child cn work_cell refusal
+  local mapped mapped_n settled settled_n thumbs thumbs_n pss pss_n cpu cpu_n
+  local -a ranked_rows=() unranked_rows=() notes=()
+
+  refusal=$(group_refusal "$want")
+
+  for id in "${ids[@]}"; do
+    kind=$(kind_of "$id")
+    [ "$kind" = "$want" ] || continue
+    verdict=$(ranked_of "$id")
+    read -r mapped mapped_n < <(values "$id" "$mapped_col" | median_n)
+    read -r settled settled_n < <(values "$id" "$settled_col" | median_n)
+    read -r thumbs thumbs_n < <(values "$id" "$thumbs_col" | median_n)
+    read -r pss pss_n < <(values "$id" "$pss_col" | median_n)
+    read -r cpu cpu_n < <(cpu_values "$id" "$cpu_col" | median_n)
+
+    # The group's refusal is spelled out in full above its table, so the cell carries the short form.
+    reason=""
+    [ -n "$refusal" ] && reason="no thumbnail count in this run"
+    if [ "$verdict" != "yes" ]; then
+      [ -n "$reason" ] && reason="$reason; "
+      reason="${reason}${verdict#unranked: }"
+    fi
+    if [ "$settled_n" -eq 0 ]; then
+      [ -n "$reason" ] && reason="$reason; "
+      reason="${reason}never settled in any of the $runs runs"
+    fi
+
+    # A count nobody took is not a count of zero, which is the whole reason this column exists.
+    work_cell="$thumbs thumbnails"
+    case "$(id_row1 "$id" | cut -d, -f"$thumbs_col")" in
+      -|n/a|""|unmeasurable) work_cell="not measured" ;;
+    esac
+    [ -n "$refusal" ] && work_cell="not measured"
+    settled_cell="never settled"
+    [ "$settled_n" -gt 0 ] && settled_cell="$(fmt_ms "$settled")"
+    row="| \`$id\` | $(short_version "$id") | $(fmt_ms "$mapped") | $settled_cell | $work_cell |"
+    row="$row $(fmt_mib "$pss") | $(fmt_secs "$cpu") | $settled_n |"
+
+    if [ -n "$reason" ]; then
+      unranked_rows+=("| \`$id\` | $(short_version "$id") | $settled_cell | $work_cell | $reason |")
+    else
+      # The board sorts on time to settle, so that is the printf key the sort below reads.
+      ranked_rows+=("$(printf '%012d' "$settled")|$row")
+    fi
+
+    sp=$(spread_note "$id" "$settled_col" "settle times") && notes+=("$sp")
+    sp=$(spread_note "$id" "$pss_col" "memory samples") && notes+=("$sp")
+    read -r child cn < <(values "$id" "$child_col" | median_n)
+    [ "$child" -gt 0 ] && notes+=("\`$id\` runs a second process the harness sampled separately: $(fmt_mib "$child") more, $(fmt_mib $(( pss + child ))) for the pair")
+  done
+
+  [ ${#ranked_rows[@]} -gt 0 ] || [ ${#unranked_rows[@]} -gt 0 ] || return 0
+  if [ ${#ranked_rows[@]} -gt 0 ]; then
+    echo
+    echo "| entrant | version | first window | settled listing | work done | memory, PSS | CPU, process tree | runs |"
+    echo "|---|---|---|---|---|---|---|---|"
+    printf '%s\n' "${ranked_rows[@]}" | sort -n | cut -d'|' -f2-
+  fi
+  if [ ${#unranked_rows[@]} -gt 0 ]; then
+    echo
+    if [ -n "$refusal" ]; then
+      echo "**Nothing in this group is ranked.**"
+      echo "$refusal."
+      echo "The times below are measurements and not places, and they stay below the rule until a run"
+      echo "with \`DROP_THUMBS=yes\` gives this column a count."
+    else
+      echo "**Not ranked.** An entrant whose work was not measured cannot be compared on time, and one that"
+      echo "never settled has no time."
+    fi
+    echo
+    echo "| entrant | version | settled listing | work done | why it is not ranked |"
+    echo "|---|---|---|---|---|"
+    printf '%s\n' "${unranked_rows[@]}"
+  fi
+  if [ ${#notes[@]} -gt 0 ]; then
+    echo
+    printf -- '- %s\n' "${notes[@]}"
+    echo "- The CPU column charges every entrant its whole process tree, so an out-of-process"
+    echo "  thumbnailer is counted. The memory column does not: it sampled only the window process"
+    echo "  for every entrant above without a line of its own, which understates any entrant whose"
+    echo "  thumbnailing happens elsewhere."
+  fi
+}
+
+# Where flea placed on one column of one group, and by how much. Printed for every column rather
+# than only the ones where flea is first, so a column where it is not first is never left out.
+place() {
+  local label=$1 fmt=$2 col=$3 want=$4 mode=$5
+  local id v n val name i=0 rank=0 total
+  local first="" first_id="" second="" second_id="" mine="" gap="" ratio=""
+  local -a rows=()
+  for id in "${ids[@]}"; do
+    [ "$(kind_of "$id")" = "$want" ] || continue
+    [ "$(ranked_of "$id")" = "yes" ] || continue
+    if [ "$mode" = cpu ]; then
+      read -r v n < <(cpu_values "$id" "$col" | median_n)
+    else
+      read -r v n < <(values "$id" "$col" | median_n)
+    fi
+    [ "$n" -gt 0 ] || continue
+    rows+=("$(printf '%012d %s' "$v" "$id")")
+  done
+  total=${#rows[@]}
+  [ "$total" -gt 0 ] || return 0
+  while read -r val name; do
+    i=$(( i + 1 ))
+    [ "$i" -eq 1 ] && { first=$(( 10#$val )); first_id=$name; }
+    [ "$i" -eq 2 ] && { second=$(( 10#$val )); second_id=$name; }
+    [ "$name" = flea ] && { rank=$i; mine=$(( 10#$val )); }
+  done < <(printf '%s\n' "${rows[@]}" | sort -n)
+  [ "$rank" -gt 0 ] || { echo "- **$label:** flea produced no number on this column"; return 0; }
+  # Words up to ten, digits past it, because no group in this harness has ever had eleven entrants
+  # and an unset array index under set -u would take the whole report down if it ever did.
+  local ordinal=(zeroth first second third fourth fifth sixth seventh eighth ninth tenth)
+  local cardinal=(zero one two three four five six seven eight nine ten)
+  local rank_word=$rank total_word=$total
+  [ "$rank" -le 10 ] && rank_word=${ordinal[$rank]}
+  [ "$total" -le 10 ] && total_word=${cardinal[$total]}
+  if [ "$rank" -eq 1 ] && [ -n "$second" ] && [ "$mine" -gt 0 ]; then
+    ratio=$(( second * 100 / mine ))
+    gap=", ahead of \`$second_id\` at $($fmt "$second"), $(( ratio / 100 )).$(( ratio % 100 / 10 ))$(( ratio % 10 ))x"
+  elif [ "$rank" -gt 1 ] && [ "$first" -gt 0 ]; then
+    ratio=$(( mine * 100 / first ))
+    gap=", behind \`$first_id\` at $($fmt "$first"), $(( ratio / 100 )).$(( ratio % 100 / 10 ))$(( ratio % 10 ))x"
+  fi
+  echo "- **$label:** $($fmt "$mine"), $rank_word of $total_word$gap"
+}
+
+echo
+echo "## GUI group"
+group_table gui
+
+echo
+echo "### Where flea placed, column by column"
+echo
+gui_refusal=$(group_refusal gui)
+if [ -n "$gui_refusal" ]; then
+  echo "$gui_refusal."
+  echo "A place is a place among entrants that did the same work, so this run gives flea none on any"
+  echo "column. Re-run the media group with \`DROP_THUMBS=yes\` and read the places off that."
+else
+  echo "The denominator is the entrants that both did the same work and produced a number on that"
+  echo "column, so it moves between columns: an entrant that never settled has no settle time while"
+  echo "its first-window, memory and CPU numbers still stand."
+  echo
+  place "Time to first window" fmt_ms "$mapped_col" gui ms
+  place "Time to a settled listing" fmt_ms "$settled_col" gui ms
+  place "Memory, PSS" fmt_mib "$pss_col" gui ms
+  place "CPU, process tree" fmt_secs "$cpu_col" gui cpu
+fi
+
+echo
+echo "## TUI group"
+echo
+echo "Judged apart and on a different measure. A TUI previews the cursor file where a GUI renders a"
+echo "grid, so the number is time to first preview and never a thumbnail count. Every entrant runs"
+echo "under $tui_term in the configuration its own project documents. An entrant that recorded no"
+echo "preview in any run reads N/A, never 0."
+echo
+echo "| entrant | version | first window | settled listing | time to first preview | preview runs |"
+echo "|---|---|---|---|---|---|"
+for id in "${ids[@]}"; do
+  [ "$(kind_of "$id")" = tui ] || continue
+  read -r m mn < <(values "$id" "$mapped_col" | median_n)
+  read -r s sn < <(values "$id" "$settled_col" | median_n)
+  read -r p pn < <(values "$id" "$preview_col" | median_n)
+  cell="N/A"
+  [ "$pn" -gt 0 ] && cell=$(fmt_ms "$p")
+  echo "| \`$id\` | $(short_version "$id") | $(fmt_ms "$m") | $(fmt_ms "$s") | $cell | $pn of $runs |"
+done
+echo
+if [ "$thumbable_n" = "0" ]; then
+  echo "No preview was measured on this fixture: it holds no thumbnailable file, so every cell above"
+  echo "reads N/A and the settled column is the only comparable number in this group."
+  echo
+fi
+echo "A preview cell of N/A means no run recorded one. A count below $runs means the rest of that"
+echo "entrant's runs recorded -1, which is the harness saying it never saw a preview, not a fast"
+echo "one: -1 is dropped rather than averaged in."
+for id in "${ids[@]}"; do
+  [ "$(kind_of "$id")" = tui ] || continue
+  note=$(spread_note "$id" "$settled_col" "settle times") && echo "- $note"
+  note=$(spread_note "$id" "$pss_col" "memory samples") && echo "- $note"
+  note=$(spread_note "$id" "$preview_col" "preview times") && echo "- $note"
+done
+
+# The field run cannot answer what an entrant can thumbnail, only how far it got before it settled,
+# because the fixture's names sort by format. tools/flea-bench-capability answers the other question
+# with one file per format and a generous timeout, and this is its table.
+if [ "$thumbable_n" != "0" ]; then
+  echo
+  echo "## Format coverage"
+  echo
+  if [ ! -s "$CAPABILITY" ]; then
+    echo "Not available: no capability file at \`$CAPABILITY\`. The field run's per-format counts"
+    echo "below say how far each entrant got, not what it can do, and must not be read as coverage."
+  else
+    formats=$(grep -m1 '^Formats offered: ' "$CAPABILITY" | cut -d: -f2-)
+    [ -n "$formats" ] || die "$CAPABILITY has no 'Formats offered:' line"
+    echo "From \`${CAPABILITY##*/}\`, written by \`tools/flea-bench-capability\`: one file per format,"
+    echo "a private cache per entrant, no ranking and no timing. A filled cell is a thumbnail the"
+    echo "entrant actually produced, counted by md5 key against the fixture's own map. Speed is not"
+    echo "the only column."
+    echo
+    row="| entrant |"
+    rule="|---|"
+    for f in $formats; do row="$row $f |"; rule="$rule---|"; done
+    echo "$row"
+    echo "$rule"
+    for id in "${ids[@]}"; do
+      [ "$(kind_of "$id")" = gui ] || continue
+      line=$(grep -m1 -- "- \*\*$id\*\* thumbnails " "$CAPABILITY") || continue
+      can=${line#*thumbnails }
+      row="| \`$id\` |"
+      for f in $formats; do
+        case ",${can//, /,}," in
+          *",$f,"*) row="$row yes |" ;;
+          *) row="$row - |" ;;
+        esac
+      done
+      echo "$row"
+    done
+    echo
+    echo "txt is the control: no thumbnailer draws a text file, so an entrant claiming one there is"
+    echo "a broken measurement rather than a capable entrant."
+  fi
+
+  echo
+  echo "### How far each entrant got, which is a different question"
+  echo
+  echo "The field run's own per-format counts. The fixture's names sort by format, so these say"
+  echo "where an entrant stopped, not what it can do. Flea's row is the viewport it drew, by design."
+  echo
+  echo "| entrant | version | thumbnails | by format, run 1 |"
+  echo "|---|---|---|---|"
+  for id in "${ids[@]}"; do
+    [ "$(kind_of "$id")" = gui ] || continue
+    read -r t tn < <(values "$id" "$thumbs_col" | median_n)
+    byfmt=$(id_row1 "$id" | cut -d, -f"$fmt_col")
+    # values() drops the sentinel, so a median of nothing comes back as 0. That 0 is the absence of
+    # a measurement and printing it here is the exact claim this column must never make.
+    work_measured "$id" || t="not measured"
+    [ "$byfmt" = unmeasurable ] && t="not measured"
+    echo "| \`$id\` | $(short_version "$id") | $t | \`$byfmt\` |"
+  done
+fi

@@ -1,0 +1,21 @@
+import QtQuick.tooling 1.2
+
+// Test-only qmllint stub: mirrors the attached shape of QtQuick.Layouts so the Layout scope resolves; only the member the tree reads is declared.
+Module {
+    Component {
+        file: "fleastublayoutattached.h"
+        name: "FleaStubLayoutAttached"
+        accessSemantics: "reference"
+        prototype: "QObject"
+        Property { name: "fillWidth"; type: "bool" }
+    }
+    Component {
+        file: "fleastublayout.h"
+        name: "FleaStubLayout"
+        accessSemantics: "reference"
+        prototype: "QObject"
+        exports: ["QtQuick.Layouts/Layout 1.0"]
+        isCreatable: false
+        attachedType: "FleaStubLayoutAttached"
+    }
+}

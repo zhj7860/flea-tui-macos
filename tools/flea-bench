@@ -1,0 +1,88 @@
+#!/bin/bash
+# Reproduces the backend half of the acceptance table, see AGENTS.md "Testing".
+set -u
+# Hard rule 9's guard, which owns FIXTURE_ROOT and every create and delete below.
+. "$(dirname "$0")/../tools/flea-sandbox-guard"
+
+
+BIN=${BIN:-./target/release/flea}
+D=${D:-$FIXTURE_ROOT/flea-bench-btrfs}
+marker=.flea-bench-fixture
+N=${N:-100000}
+WINDOW=${WINDOW:-350}
+COLD=${COLD:-0}
+
+if [ ! -x "$BIN" ]; then
+  echo "build first: cargo build --release"
+  exit 1
+fi
+
+# corner: tmpfs pages are the filesystem, so drop_caches cannot evict them, see AGENTS.md.
+parent=$(dirname "$D")
+fstype=$(findmnt -no FSTYPE --target "$parent" 2>/dev/null)
+# An empty answer is a findmnt that failed, and reading it as not-tmpfs would pass the gate above an rm -rf.
+if [ -z "$fstype" ]; then
+  echo "flea-bench: findmnt could not name the filesystem holding $parent"
+  exit 1
+fi
+if [ "$fstype" = "tmpfs" ]; then
+  echo "flea-bench: $D is on tmpfs, where a cold run measures nothing"
+  echo "flea-bench: set D to a path on real storage, for example \$FIXTURE_ROOT/flea-bench-btrfs"
+  exit 1
+fi
+
+if [ "$COLD" = "1" ]; then
+  # corner: any readdir here warms what the cold run measures, see AGENTS.md.
+  if [ ! -d "$D" ]; then
+    echo "flea-bench: $D does not exist, build it with a warm run first"
+    exit 1
+  fi
+else
+  if [ "$(ls -U "$D" 2>/dev/null | wc -l)" != "$N" ]; then
+    echo "building a $N file directory at $D, this takes a minute"
+    # Its own marker, like flea-media-fixture and flea-matched-fixture: the name says which fixture
+    # a directory is, so a bench rebuild can never take out the media or matched tree.
+    sandbox_require "$D"
+    if [ -e "$D" ]; then
+      [ -f "$D/$marker" ] || { echo "flea-bench: $D exists and carries no $marker, refusing to delete it"; exit 1; }
+      rm -rf "$D" || { echo "flea-bench: could not remove $D"; exit 1; }
+    fi
+    mkdir -p "$D" || { echo "flea-bench: could not create $D"; exit 1; }
+    # ls -U hides it, so the N-file count this script keeps is unaffected by the marker.
+    : > "$D/$marker" || { echo "flea-bench: could not mark $D"; exit 1; }
+    python3 -c "
+import os, sys
+d, n = sys.argv[1], int(sys.argv[2])
+for i in range(n):
+    open(os.path.join(d, 'some_file_name_%d.txt' % i), 'w').close()
+" "$D" "$N"
+    sync
+    if [ "$(ls -U "$D" | wc -l)" != "$N" ]; then
+      echo "flea-bench: building $D produced $(ls -U "$D" | wc -l) files, not $N"
+      exit 1
+    fi
+  fi
+  echo "flea-bench: warm mode, the directory check above warms the cache"
+  echo "flea-bench: for a cold read, drop caches then run COLD=1 $0"
+fi
+
+echo "=== backend, $N entries on $fstype, $([ "$COLD" = "1" ] && echo cold || echo warm) ==="
+out=$(printf '{"c":"list","path":"%s","first":%s}\n{"c":"quit"}\n' "$D" "$WINDOW" | "$BIN" --backend)
+if [ -z "$out" ]; then
+  echo "flea-bench: $BIN --backend produced no output"
+  exit 1
+fi
+echo "  phase 1 read : $(echo "$out" | head -1 | grep -oE '"read":[0-9.]+' | cut -d: -f2) ms"
+echo "  phase 1 sort : $(echo "$out" | head -1 | grep -oE '"sort":[0-9.]+' | cut -d: -f2) ms"
+echo "  window stat  : $(echo "$out" | sed -n 2p | grep -oE '"ms":[0-9.]+' | cut -d: -f2) ms"
+echo "  rows in first window: $(echo "$out" | sed -n 2p | grep -o '"n":"' | wc -l | tr -d ' ')"
+
+pid=$$
+PW=/run/user/$(id -u)/flea-bench-prewarm-$pid.json
+start=$(date +%s%3N)
+if ! "$BIN" --prewarm "$D" "$WINDOW" "$PW"; then
+  echo "flea-bench: $BIN --prewarm failed"
+  exit 1
+fi
+echo "  prewarm total: $(( $(date +%s%3N) - start )) ms"
+rm -f "$PW"

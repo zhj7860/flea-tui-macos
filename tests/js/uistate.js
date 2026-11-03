@@ -1,0 +1,489 @@
+.import "../../ui/js/UiState.js" as UiState
+.import "sourcefixture.js" as Source
+
+// ui/ViewState.qml's writer bookkeeping and the patch it builds. The window shows the column change
+// the instant it is made and the state file learns about it through a process, so the only thing
+// that can tell the two apart is the writer's own exit status. A book that records the patch before
+// the process runs reports a save that never happened, and then refuses the retry that would have
+// fixed it.
+
+var OLD = "{\"columns\":[\"name\",\"size\",\"date\"]}"
+var NEW = "{\"columns\":[\"name\",\"date\"]}"
+var THIRD = "{\"columns\":[\"name\"]}"
+
+
+// Execute the production async boundary with controlled process completion order.
+function sharedSettle() {
+    var source = Source.source("ui/ViewState.qml")
+    var settler = { running: false }
+    var disk = { value: '{"keys":"vim","columns":["name","size","date"],"density":"compact"}' }
+    var stateFile = { text: function () { return disk.value } }
+    var root = { state: JSON.parse(disk.value), unsaved: {}, writeBook: UiState.book(),
+                 writeRevision: 0, settleRevision: 0, settleMode: "", settleDirty: false,
+                 pruneQueued: "", pruneInflight: "", settleAnswer: {}, favouritesReadError: "",
+                 writes: [], failures: 0 }
+    root.run = function (patch) { root.writes.push(patch) }
+    root.saveFailed = function () { root.failures += 1 }
+    root.favouritesReadFailed = function () { throw new Error("unexpected favourites read failure") }
+    var functions = { changeKey: "key, value", owe: "key, next, owed", patch: "", save: "",
+                      rememberNavigation: "path, tabs", wrote: "exitCode", applyShared: "text",
+                      settleStart: "mode", settleLanded: "half", settleNext: "", settleDone: "exitCode, out",
+                      finishPrune: "failed", pruneFailed: "", syncFavourites: "text" }
+    function compile(body, parameters) {
+        return new Function("root", "UiState", "settler", "stateFile", "Quickshell",
+            "return function (" + parameters + ") {" + body + "}")(
+                root, UiState, settler, stateFile, { env: function () { return "" } })
+    }
+    for (var name in functions)
+        root[name] = compile(Source.block(source, "function " + name + "(", "ui/ViewState.qml"), functions[name])
+    var processSource = source.substring(source.indexOf("property var settler: Process"))
+    var stopped = compile(Source.block(processSource, "onRunningChanged:", "ui/ViewState.qml settler"), "")
+    function finish(text, exitFirst, idleLast) {
+        // A real exit precedes runningChanged, but either half can reach settleDone while running is still true.
+        settler.running = idleLast
+        root.settleLanded(exitFirst ? { code: 0 } : { text: text })
+        root.settleLanded(exitFirst ? { text: text } : { code: 0 })
+        if (idleLast) {
+            settler.running = false
+            stopped()
+        }
+    }
+    return { root: root, settler: settler, disk: disk, finish: finish }
+}
+
+function run(check) {
+    check("a fresh book has landed nothing of its own", UiState.book().saved, "")
+    check("and nothing is in flight behind it", UiState.book().inflight, "")
+    check("so the first change a window makes starts a write", UiState.asked(UiState.book(), NEW).start, NEW)
+
+    // A book whose last writer landed OLD, which is what the short-circuit compares against. A fresh
+    // book cannot stand in for it: a window's own read of ui.json is not a patch that window sent.
+    var held = { saved: OLD, inflight: "", pending: "" }
+    var same = UiState.asked(held, OLD)
+    check("a patch the last landed write already stored starts nothing", same.start, "")
+
+    var asked = UiState.asked(held, NEW)
+    check("a change starts a write", asked.start, NEW)
+    check("and the change is in flight, not saved", asked.inflight, NEW)
+    check("the file is still known to hold what it held", asked.saved, OLD)
+
+    // Scenario A: ~/.local/state is unwritable, so src/main.rs prints its sentence and exits 2.
+    var refused = UiState.exited(asked, 2, NEW)
+    check("a refused write is not believed", refused.saved, OLD)
+    check("a refused write is reported", refused.failed, true)
+    check("and it leaves no writer in flight", refused.inflight, "")
+
+    // The whole cost of believing it: the identical toggle can never even be attempted again.
+    check("an identical retry is attempted after a refusal", UiState.asked(refused, NEW).start, NEW)
+
+    var landed = UiState.exited(asked, 0, "")
+    check("a write that exited zero is believed", landed.saved, NEW)
+    check("and it is not reported", landed.failed, false)
+    check("a patch the landed write already stored starts nothing", UiState.asked(landed, NEW).start, "")
+
+    // One writer at a time, and the newest patch waits rather than being dropped on the floor.
+    var queued = UiState.asked(asked, THIRD)
+    check("a second change queues behind the running writer", queued.pending, THIRD)
+    check("and starts nothing of its own", queued.start, "")
+    check("the running writer still carries the first", queued.inflight, NEW)
+    // Toggling back to what the queue already asks for must not send the same bytes twice.
+    check("the queued patch is not sent twice", UiState.asked(queued, THIRD).start, "")
+
+    // The window's own read of the file. main() leaves a ui.json it cannot read as a JSON object
+    // exactly as the operator wrote it, so the window draws the defaults and has to be what says so.
+    check("a document the window can read is read", UiState.fromFile(OLD).state.columns[2], "date")
+    check("and nothing is said about it", UiState.fromFile(OLD).unreadable, false)
+    check("a trailing comma reads as the full default shape", JSON.stringify(UiState.fromFile("{\"columns\":[\"name\"],}").state), "{}")
+    check("and the pane is told to say so", UiState.fromFile("{\"columns\":[\"name\"],}").unreadable, true)
+    check("a document that is not an object is the same", UiState.fromFile("[1,2]").unreadable, true)
+    check("no file at all is a first launch and says nothing", UiState.fromFile("").unreadable, false)
+    var favouritesDraft = { view: "columns", places: { sidebarWidth: 256, favourites: [{ label: "Before", path: "/before" }] } }
+    var refresh = UiState.refreshedFavourites(favouritesDraft, '{"view":"grid","places":{"sidebarWidth":160,"favourites":[17,{"label":"New","path":"/new"},{"label":"New","path":"/new"}]}}')
+    check("external favourites preserve invalid and duplicate originals", JSON.stringify(refresh.state.places.favourites), '[17,{"label":"New","path":"/new"},{"label":"New","path":"/new"}]')
+    check("external favourites leave the active view alone", refresh.state.view, "columns")
+    check("external favourites leave other Places drafts alone", refresh.state.places.sidebarWidth, 256)
+    check("refresh does not mutate its input", favouritesDraft.places.favourites[0].label, "Before")
+    check("malformed external bytes retain visible records", UiState.refreshedFavourites(favouritesDraft, '{').state, favouritesDraft)
+    check("malformed external bytes report a read error", UiState.refreshedFavourites(favouritesDraft, '{').error.length > 0, true)
+    check("empty live bytes retain visible records", UiState.refreshedFavourites(favouritesDraft, '').state, favouritesDraft)
+    check("empty live bytes report a read error", UiState.refreshedFavourites(favouritesDraft, '').error.length > 0, true)
+    check("nonarray external favourites retain visible records", UiState.refreshedFavourites(favouritesDraft, '{"places":{"favourites":17}}').state, favouritesDraft)
+    check("malformed Places group retains visible records", UiState.refreshedFavourites(favouritesDraft, '{"places":[]}').state, favouritesDraft)
+    check("missing favourites group is the empty new store", UiState.refreshedFavourites(favouritesDraft, '{}').state.places.favourites.length, 0)
+    check("unchanged favourites keep the existing state object", UiState.refreshedFavourites(favouritesDraft, JSON.stringify(favouritesDraft)).state, favouritesDraft)
+    var a = {label:"A", path:"/a"}, b = {label:"B", path:"/b"}, c = {label:"C", path:"/c"}
+    var before = [a, b], ownAdd = UiState.favouritesAfter(before, {op:"add", record:c})
+    check("own add expects every original sibling plus its new record", JSON.stringify(ownAdd), JSON.stringify([a, b, c]))
+    check("a concurrent removal in the successful response is still external", JSON.stringify(ownAdd) === JSON.stringify([b, c]), false)
+    check("own reorder preserves records and predicts their new order", JSON.stringify(UiState.favouritesAfter(before, {op:"move", index:1, to:0})), JSON.stringify([b, a]))
+    check("own removal predicts only its captured index removal", JSON.stringify(UiState.favouritesAfter(before, {op:"remove", index:0})), JSON.stringify([b]))
+    check("own relabel preserves its stored path", JSON.stringify(UiState.favouritesAfter(before, {op:"rename", index:1, label:"Renamed"})), JSON.stringify([a, {label:"Renamed", path:"/b"}]))
+    check("expected operation never mutates the held records", JSON.stringify(before), JSON.stringify([a, b]))
+
+    // The document the window holds, rebuilt rather than mutated: a var property notifies on
+    // assignment and not on a reach-in, and a whole-group assignment would take one writer's half
+    // of display or places as the whole of it.
+    var held = { columns: ["name"], display: { textSize: { mode: "system" } } }
+    check("one key is replaced and the rest carried",
+          JSON.stringify(UiState.withKey(held, "keys", "windows")),
+          '{"columns":["name"],"display":{"textSize":{"mode":"system"}},"keys":"windows"}')
+    check("a group merges into what is beside it rather than replacing the group",
+          JSON.stringify(UiState.withGroup({ places: { sidebarWidth: 240, showHome: true } },
+                                           "places", { showHome: false })),
+          '{"places":{"sidebarWidth":240,"showHome":false}}')
+    check("a group that is not there yet is created",
+          JSON.stringify(UiState.withGroup({}, "display", { textSize: { mode: 16 } })),
+          '{"display":{"textSize":{"mode":16}}}')
+    check("and neither writer mutates the document it was handed",
+          JSON.stringify(held), '{"columns":["name"],"display":{"textSize":{"mode":"system"}}}')
+
+    // The lost update this whole file exists to keep out. Two windows read one document; window A
+    // changes the keys preset and window B, still holding the read from before that change, saves a
+    // text size. What B owes the state file is built over an EMPTY document rather than over its own
+    // read, so the patch names what B changed and nothing else: src/uistate.rs merges key by key and
+    // keeps every key a patch leaves out, and no lock can protect a key the caller overwrites by name.
+    var owed = UiState.withGroup({}, "display", { textSize: { mode: 16 } })
+    check("a text-size change owes the text size alone",
+          JSON.stringify(owed), '{"display":{"textSize":{"mode":16}}}')
+    check("and the patch cannot name keys at all", JSON.stringify(owed).indexOf("keys"), -1)
+    check("nor columns", JSON.stringify(owed).indexOf("columns"), -1)
+    check("nor the hidden menu set", JSON.stringify(owed).indexOf("hidden"), -1)
+    check("a window that has changed nothing owes an empty patch", JSON.stringify({}), "{}")
+
+    // The coalesce the old whole-document snapshot used to provide: a second change behind a running
+    // writer joins the patch already owed rather than replacing it, so neither is dropped.
+    check("a second change joins the patch already owed",
+          JSON.stringify(UiState.withKey(owed, "keys", "windows")),
+          '{"display":{"textSize":{"mode":16}},"keys":"windows"}')
+    check("and a second change to the same group joins it too",
+          JSON.stringify(UiState.withGroup(owed, "display", { hidden: ["paste"] })),
+          '{"display":{"textSize":{"mode":16},"hidden":["paste"]}}')
+
+    // The two documents differ, and that is the point of running the rebuild over both. A sub-key a
+    // newer Flea left in `display` stays in what this window DRAWS, and never enters the patch: this
+    // Flea has no rule for it, and src/uistate.rs refuses a whole patch that names one.
+    var read = { display: { textSize: { mode: "system" }, aKeyThisBuildHasNeverHeardOf: true } }
+    check("the document keeps a newer Flea's own sub-key",
+          JSON.stringify(UiState.withGroup(read, "display", { textSize: { mode: 16 } })),
+          '{"display":{"textSize":{"mode":16},"aKeyThisBuildHasNeverHeardOf":true}}')
+    check("and the patch beside it never carries one", JSON.stringify(owed).indexOf("NeverHeardOf"), -1)
+
+    // A map entry owes itself alone: the document draws the whole map, the patch names one entry.
+    var entryOwed = UiState.withGroup({}, "folderSorts", { "/a": { key: "size", reverse: true } })
+    check("a folder sort owes its entry alone",
+          JSON.stringify(entryOwed), '{"folderSorts":{"/a":{"key":"size","reverse":true}}}')
+    var twoOwed = UiState.withGroup(entryOwed, "folderSorts", { "/b": { key: "name", reverse: false } })
+    check("a second folder joins the patch already owed",
+          JSON.stringify(twoOwed), '{"folderSorts":{"/a":{"key":"size","reverse":true},"/b":{"key":"name","reverse":false}}}')
+    check("a landed entry clears out of the map",
+          JSON.stringify(UiState.acknowledged(twoOwed, '{"folderSorts":{"/a":{"key":"size","reverse":true}}}')),
+          '{"folderSorts":{"/b":{"key":"name","reverse":false}}}')
+    // Backend.forgetFolderSort owes leaf[path] = null through ViewState.changeMapEntries, so the forget is driven through that same withGroup call.
+    var forgetOwed = UiState.withGroup({}, "folderSorts", { "/a": null })
+    check("a forget owes its null entry alone",
+          JSON.stringify(forgetOwed), '{"folderSorts":{"/a":null}}')
+    check("and a landed forget clears too",
+          JSON.stringify(UiState.acknowledged(forgetOwed, '{"folderSorts":{"/a":null}}')), "{}")
+    check("a width owes its edge alone",
+          JSON.stringify(UiState.withGroup({}, "columnWidths", { size: 120 })), '{"columnWidths":{"size":120}}')
+
+    // Tabs040 callout 2: lastTabs is a whole value (src/uischema.rs Rule::LastTabs stands or
+    // falls together), so a landed half must not leave the other half owed alone: a patch naming
+    // paths without index is one the backend refuses whole.
+    check("a half-landed lastTabs keeps the whole owed strip",
+          JSON.stringify(UiState.acknowledged({ lastTabs: { paths: ["/a", "/b"], index: 0 } },
+                                              '{"lastTabs":{"paths":["/a","/a"],"index":0}}')),
+          '{"lastTabs":{"paths":["/a","/b"],"index":0}}')
+    check("a fully landed lastTabs clears",
+          JSON.stringify(UiState.acknowledged({ lastTabs: { paths: ["/a", "/b"], index: 0 } },
+                                              '{"lastTabs":{"paths":["/a","/b"],"index":0}}')),
+          '{}')
+
+    var drained = UiState.exited(queued, 0, THIRD)
+    check("the queued patch starts when the writer exits", drained.start, THIRD)
+    check("and the exited writer's own patch is what the file now holds", drained.saved, NEW)
+    check("a refusal underneath a queue still runs the queue", UiState.exited(queued, 2, THIRD).start, THIRD)
+    check("and still reports the refusal", UiState.exited(queued, 2, THIRD).failed, true)
+    check("a writer that exits with nothing behind it starts nothing", UiState.exited(asked, 0, "{}").start, "")
+    // A size stepped up and back down under one writer: what was queued differs from what is in
+    // flight, so it queued, and the landed patch then takes the whole of it back out again.
+    check("a queued writer with nothing left owed under it is not launched",
+          UiState.exited(queued, 0, "{}").start, "")
+    check("and nothing is left in flight for the pane to wait on",
+          UiState.exited(queued, 0, "{}").inflight, "")
+
+    // What a landed writer stored comes out of what the window owes, and only that. Waiting for the
+    // whole queue to drain instead left a stored setting owed, so it rode along inside every later
+    // patch and overwrote whatever another window or the CLI had put there in the meantime.
+    check("a landed setting is no longer owed",
+          JSON.stringify(UiState.acknowledged({ keys: "windows" }, '{"keys":"windows"}')), "{}")
+    check("a setting the writer never carried stays owed",
+          JSON.stringify(UiState.acknowledged({ keys: "windows", columns: ["name"] }, '{"keys":"windows"}')),
+          '{"columns":["name"]}')
+    check("an array setting is compared whole",
+          JSON.stringify(UiState.acknowledged({ columns: ["name", "size"] }, '{"columns":["name","size"]}')), "{}")
+    check("and a different array is not cleared by it",
+          JSON.stringify(UiState.acknowledged({ columns: ["name"] }, '{"columns":["name","size"]}')),
+          '{"columns":["name"]}')
+
+    // Leaf-accurate, because changeLeaf owes the leaf alone: clearing the group would drop a leaf
+    // beside it that no writer has taken yet, and keeping the group would re-send the one that landed.
+    var twoLeaves = { display: { textSize: { mode: 16 }, hidden: ["paste"] } }
+    check("a landed leaf is cleared out of the group it sits in",
+          JSON.stringify(UiState.acknowledged(twoLeaves, '{"display":{"textSize":{"mode":16}}}')),
+          '{"display":{"hidden":["paste"]}}')
+    check("and the group goes when its last owed leaf does",
+          JSON.stringify(UiState.acknowledged({ display: { textSize: { mode: 16 } } },
+                                              '{"display":{"textSize":{"mode":16}}}')), "{}")
+    check("and nothing is mutated in place",
+          JSON.stringify(twoLeaves), '{"display":{"textSize":{"mode":16},"hidden":["paste"]}}')
+    check("bytes that are not a patch clear nothing",
+          JSON.stringify(UiState.acknowledged({ keys: "windows" }, "not json")), '{"keys":"windows"}')
+
+    // A change made WHILE the writer ran is a newer value for a setting that writer carried, and the
+    // file does not have that one: the older value landing must not clear it.
+    check("a newer value for a landed setting is still owed",
+          JSON.stringify(UiState.acknowledged({ keys: "mac" }, '{"keys":"windows"}')), '{"keys":"mac"}')
+    check("and a newer value for a landed leaf is too",
+          JSON.stringify(UiState.acknowledged({ display: { textSize: { mode: 20 } } },
+                                              '{"display":{"textSize":{"mode":16}}}')),
+          '{"display":{"textSize":{"mode":20}}}')
+
+    // The interleave all of the above exists for, driven through the book. A window saves the keys
+    // preset; while that writer runs it changes the text size, so the queued patch carries both. The
+    // preset lands, and what the queued writer STARTS with has to be rebuilt from what is still owed:
+    // the bytes waiting in `pending` were built before the preset landed and still name it.
+    var ownKeys = UiState.withKey({}, "keys", "windows")
+    var alsoSize = UiState.withGroup(ownKeys, "display", { textSize: { mode: 16 } })
+    var first = UiState.asked(UiState.book(), JSON.stringify(ownKeys))
+    check("the preset starts a writer", first.start, '{"keys":"windows"}')
+    var behind = UiState.asked(first, JSON.stringify(alsoSize))
+    check("the text size queues behind it carrying both",
+          behind.pending, '{"keys":"windows","display":{"textSize":{"mode":16}}}')
+    var stillOwes = UiState.acknowledged(alsoSize, behind.inflight)
+    check("the landed preset drops out of what is owed",
+          JSON.stringify(stillOwes), '{"display":{"textSize":{"mode":16}}}')
+    var drainedAfter = UiState.exited(behind, 0, JSON.stringify(stillOwes))
+    check("so the queued writer starts with the text size alone",
+          drainedAfter.start, '{"display":{"textSize":{"mode":16}}}')
+    check("and cannot name the preset another window may have changed since",
+          drainedAfter.start.indexOf("keys"), -1)
+
+    // The failure arm of the same interleave: nothing landed, so nothing is acknowledged and the
+    // queued writer still carries the refused setting as well as the newer one.
+    var refusedUnder = UiState.exited(behind, 2, JSON.stringify(alsoSize))
+    check("a refused writer leaves its own setting in the patch behind it",
+          refusedUnder.start, '{"keys":"windows","display":{"textSize":{"mode":16}}}')
+    check("and the refusal is still reported", refusedUnder.failed, true)
+
+    // xw4: one window's Settings change applies in every other open window. Per-window state is
+    // the view a window shows, its widths, its dual pair, where it was, and the sweep and stamp
+    // keys; everything else is a preference some panel or toggle writes.
+    for (var w = 0; w < ["view", "pickerView", "columnWidths", "dual", "lastPath", "lastTabs"].length; w++)
+        check("a window key is never taken from the file",
+              UiState.isWindowKey(["view", "pickerView", "columnWidths", "dual", "lastPath", "lastTabs"][w]), true)
+    check("a setting key is", UiState.isWindowKey("hidden"), false)
+    check("and so is a group key", UiState.isWindowKey("display"), false)
+    var other = { hidden: false, density: "compact", view: "list", lastPath: "/a",
+                  display: { textSize: { mode: "system" } }, sort: { key: "name", reverse: false },
+                  places: { showUnmounted: true, favourites: [{ label: "Old", path: "/old" }] } }
+    var changedFile = '{"hidden":true,"density":"normal","view":"grid","lastPath":"/b",' +
+        '"display":{"textSize":{"mode":16}},"sort":{"key":"size","reverse":false},' +
+        '"places":{"showUnmounted":false,"favourites":[]},"stateVersion":3}'
+    var applied = UiState.applyExternal(other, {}, changedFile)
+    check("a changed preference applies", applied.state.hidden, true)
+    check("with its group beside it", applied.state.display.textSize.mode, 16)
+    check("while a window's own sort stays put", applied.state.sort.key, "name")
+    check("a Places leaf applies too", applied.state.places.showUnmounted, false)
+    check("while the view stays the window's own", applied.state.view, "list")
+    check("and where it was stays too", applied.state.lastPath, "/a")
+    check("favourites are never taken here", JSON.stringify(applied.state.places.favourites), '[{"label":"Old","path":"/old"}]')
+    var sameFile = JSON.stringify(other)
+    // An owed key keeps the window's own value against a file that says otherwise; without the owed branch each of these takes the file's.
+    var ownState = { hidden: false, density: "compact" }
+    var ownKept = UiState.applyExternal(ownState, { hidden: false }, '{"hidden":true,"density":"normal"}')
+    check("an owed whole key keeps the window's own value", ownKept.state.hidden, false)
+    check("while a key beside it still applies", ownKept.state.density, "normal")
+    check("and a file holding nothing new moves nothing",
+          UiState.applyExternal(other, {}, sameFile).changed, false)
+    check("a half-written file is ignored", UiState.applyExternal(other, {}, "{").changed, false)
+    check("a non-object file is too", UiState.applyExternal(other, {}, "[1,2]").changed, false)
+    check("an empty read is too", UiState.applyExternal(other, {}, "").changed, false)
+    var racing = { hidden: false, display: { textSize: { mode: 16 }, hyprlandIcons: false } }
+    var raced = UiState.applyExternal(racing, { display: { textSize: { mode: 16 } } },
+        '{"hidden":true,"display":{"textSize":{"mode":20},"hyprlandIcons":true}}')
+    check("an owed leaf keeps the window's own value", raced.state.display.textSize.mode, 16)
+    check("while a leaf beside it still applies", raced.state.display.hyprlandIcons, true)
+    check("and a whole key beside that does too", raced.state.hidden, true)
+    var maps = { folderSorts: { "/a": { key: "size", reverse: true } } }
+    var mapped = UiState.applyExternal(maps, { folderSorts: { "/a": { key: "size", reverse: true } } },
+        '{"folderSorts":{"/a":{"key":"name","reverse":false},"/b":{"key":"name","reverse":false}}}')
+    check("an owed map entry keeps the window's own", mapped.state.folderSorts["/a"].key, "size")
+    check("while another window's entry applies", mapped.state.folderSorts["/b"].key, "name")
+    check("a key a newer Flea wrote is kept verbatim",
+          UiState.applyExternal({}, {}, '{"aKeyThisBuildHasNeverHeardOf":true}').state.aKeyThisBuildHasNeverHeardOf, true)
+
+    // xw4-r2 finding 2: a window's sort is its own, the file still records the last one for new windows.
+    check("sort joins the window keys", UiState.isWindowKey("sort"), true)
+    var sortHeld = { sort: { key: "name", reverse: false } }
+    var sortFile = '{"sort":{"key":"size","reverse":true},"hidden":true}'
+    var sortApplied = UiState.applyExternal(sortHeld, {}, sortFile)
+    check("another window's sort never lands", JSON.stringify(sortApplied.state.sort), '{"key":"name","reverse":false}')
+    check("while a preference beside it still does", sortApplied.state.hidden, true)
+
+    // TallPreviews: the facts mode is remembered like the view, so another window's `i` never flips this window's column.
+    check("previewFacts joins the window keys", UiState.isWindowKey("previewFacts"), true)
+    var factsApplied = UiState.applyExternal({ previewFacts: "compact" }, {}, '{"previewFacts":"full","hidden":true}')
+    check("another window's facts mode never lands, while a preference beside it does",
+          factsApplied.state.previewFacts + "|" + factsApplied.state.hidden, "compact|true")
+
+    // xw4-r2 finding 3: rail, preview column and grid zoom stay per window, Finder's rule.
+    check("rail is a window leaf", UiState.isWindowLeaf("places", "rail"), true)
+    check("preview column is too", UiState.isWindowLeaf("preview", "column"), true)
+    check("and so is the grid zoom", UiState.isWindowLeaf("preview", "thumbSize"), true)
+    check("but a Places switch beside it is not", UiState.isWindowLeaf("places", "showUnmounted"), false)
+    var railHeld = { places: { rail: "hidden", showUnmounted: true, favourites: [] } }
+    var railFile = '{"places":{"rail":"shown","showUnmounted":false,"favourites":[]}}'
+    var railApplied = UiState.applyExternal(railHeld, {}, railFile)
+    check("another window's rail never lands", railApplied.state.places.rail, "hidden")
+    check("while its Places switch still does", railApplied.state.places.showUnmounted, false)
+    var zoomHeld = { preview: { column: false, thumbSize: "large", loadOn: "automatic" } }
+    var zoomFile = '{"preview":{"column":true,"thumbSize":"small","loadOn":"manual"}}'
+    var zoomApplied = UiState.applyExternal(zoomHeld, {}, zoomFile)
+    check("another window's preview column never lands", zoomApplied.state.preview.column, false)
+    check("and its grid zoom neither", zoomApplied.state.preview.thumbSize, "large")
+    check("while its load switch still does", zoomApplied.state.preview.loadOn, "manual")
+
+    // xw4-r2 finding 1: raw bytes are only a guard; empty or garbage never applies.
+    check("empty text is not an object", UiState.parsesAsObject(""), false)
+    check("garbage is not either", UiState.parsesAsObject("{"), false)
+    check("but a settled document is", UiState.parsesAsObject('{"hidden":true}'), true)
+
+    // Only a schema-invalid patch prunes; a transient failure keeps today's retry and loses nothing.
+    check("a bogus column set prunes off the patch", UiState.isPatchInvalid('{"columns":["name","size","bogus"]}'), true)
+    check("while a valid one retries", UiState.isPatchInvalid('{"columns":["name","size","date"]}'), false)
+    check("and a null places group prunes too", UiState.isPatchInvalid('{"places":null}'), true)
+
+    // A refused patch never blocks later saves: its keys drop and revert to the settled values.
+    var owedBogus = { columns: ["name", "size", "bogus"], density: "compact" }
+    var settledDefaults = { columns: ["name", "size", "date"], density: "compact" }
+    var pruned = UiState.dropInvalid(owedBogus, '{"columns":["name","size","bogus"]}')
+    check("a refused key drops out of what is owed", pruned.columns, undefined)
+    check("and the refusal names it", JSON.stringify(UiState.invalidKeys('{"columns":["name","size","bogus"]}')), '["columns"]')
+    var reverted = UiState.revertedState({ columns: ["name", "size", "bogus"] },
+        '{"columns":["name","size","bogus"]}', settledDefaults)
+    check("and the state heals to the settled value", JSON.stringify(reverted.columns), '["name","size","date"]')
+    // A refused patch drops only its schema-refused keys: a valid key beside it and a newer owed value both survive.
+    var twoKey = UiState.dropInvalid({ columns: ["name", "size", "bogus"], density: "normal" },
+        '{"columns":["name","size","bogus"],"density":"normal"}')
+    check("a valid key beside a refusal survives the prune", twoKey.density, "normal")
+    check("while the refused key still drops", twoKey.columns, undefined)
+    check("and only the refused key is named", JSON.stringify(UiState.invalidKeys('{"columns":["name","size","bogus"],"density":"normal"}')), '["columns"]')
+    var newer = UiState.dropInvalid({ columns: ["name"], density: "normal" },
+        '{"columns":["name","size","bogus"],"density":"normal"}')
+    check("a newer owed value the refused writer never carried survives too", JSON.stringify(newer.columns), '["name"]')
+    var revertTwo = UiState.revertedState({ columns: ["name", "size", "bogus"], density: "normal" },
+        '{"columns":["name","size","bogus"],"density":"normal"}', settledDefaults)
+    check("the revert heals only the refused key", JSON.stringify(revertTwo.columns), '["name","size","date"]')
+    check("and leaves a valid key alone", revertTwo.density, "normal")
+    var revertNewer = UiState.revertedState({ columns: ["name"], density: "normal" },
+        '{"columns":["name","size","bogus"],"density":"normal"}', settledDefaults)
+    check("and a newer value for the refused key survives the revert", JSON.stringify(revertNewer.columns), '["name"]')
+    // A prune settle that never answers still drops what the schema refused, so no save strands behind a phantom writer.
+    var failed = UiState.dropInvalid({ columns: ["name", "size", "bogus"], density: "normal" },
+        '{"columns":["name","size","bogus"],"density":"normal"}')
+    check("a failed settle still drops the refused key", failed.columns, undefined)
+    check("and keeps the valid one queued behind it", failed.density, "normal")
+    // A settler's exit and its collected text land in either order, so only a whole answer is ever read.
+    check("half an answer is not whole", UiState.whole({ code: 0 }), false)
+    check("both halves are", UiState.whole(UiState.landed({ code: 0 }, { text: "{}" })), true)
+    check("in either order", UiState.whole(UiState.landed({ text: "{}" }, { code: 0 })), true)
+    check("a program that never started is told from a real exit", UiState.neverRan({}, false), true)
+    check("and a real exit never is", UiState.neverRan({ code: 0 }, false), false)
+    // A refused write queues its prune behind a running settle; the settle's end spends the prune before a dirty re-read.
+    check("a prune behind a running settle queues", UiState.pruneAsk(true, '{"columns":[]}').queue, '{"columns":[]}')
+    check("and starts nothing", UiState.pruneAsk(true, '{"columns":[]}').start, "")
+    check("while an idle settler starts it at once", UiState.pruneAsk(false, '{"columns":[]}').start, '{"columns":[]}')
+    // A half-landed settle still counts as running, so a refused write behind it queues.
+    check("an exit without its text still counts as running", UiState.settleBusy(false, "apply", { code: 0 }), true)
+    check("and text without its exit does too", UiState.settleBusy(false, "apply", { text: "{}" }), true)
+    check("while a whole answer does not", UiState.settleBusy(false, "apply", { code: 0, text: "{}" }), false)
+    check("and an idle settler neither", UiState.settleBusy(false, "", {}), false)
+    check("a half-landed prune queues behind it", UiState.pruneAsk(UiState.settleBusy(false, "apply", { code: 0 }), '{"columns":[]}').queue, '{"columns":[]}')
+    check("and never starts over it", UiState.pruneAsk(UiState.settleBusy(false, "apply", { text: "{}" }), '{"columns":[]}').start, "")
+    check("a queued prune spends before a dirty re-read", UiState.settleNext(true, '{"columns":[]}'), "prune")
+    check("a dirty flag alone re-reads", UiState.settleNext(true, ""), "apply")
+    check("and a quiet settle ends idle", UiState.settleNext(false, ""), "idle")
+
+    // A snapshot cannot rewind a local change once its writer has cleared the owed value.
+    for (var beforeIntent of [true, false]) {
+        for (var exitFirst of [true, false]) {
+            for (var idleLast of [true, false]) {
+                var race = sharedSettle()
+                var label = "read " + (beforeIntent ? "before intent" : "before acknowledgement") +
+                    (exitFirst ? ", exit first" : ", text first") + (idleLast ? ", idle last" : ", already idle")
+                if (beforeIntent) race.root.applyShared(race.disk.value)
+                race.root.changeKey("keys", "mac")
+                if (!beforeIntent) race.root.applyShared(race.disk.value)
+                race.disk.value = '{"keys":"mac"}'
+                race.root.wrote(0)
+                race.finish('{"keys":"vim"}', exitFirst, idleLast)
+                check(label + ": the older snapshot cannot rewind Mac", race.root.state.keys, "mac")
+                check(label + ": the write was acknowledged", JSON.stringify(race.root.unsaved), "{}")
+                check(label + ": the stale result starts a fresh read", race.root.settleMode, "apply")
+                // A newer external edit is still accepted by the fresh read and never starts a writer.
+                race.disk.value = '{"keys":"windows","density":"normal"}'
+                race.finish(race.disk.value, !exitFirst, idleLast)
+                check(label + ": a newer external preset still lands", race.root.state.keys, "windows")
+                check(label + ": an external key beside it still lands", race.root.state.density, "normal")
+                check(label + ": the fresh read drains", race.root.settleMode + "|" + race.root.settleDirty, "|false")
+                check(label + ": external reads never write", race.root.writes.length, 1)
+            }
+        }
+    }
+
+    // Navigation has its own local writer entry, and it invalidates an older whole-document snapshot too.
+    var navigation = sharedSettle()
+    navigation.root.applyShared(navigation.disk.value)
+    navigation.root.rememberNavigation("/a", { paths: ["/a"], index: 0 })
+    navigation.finish('{"keys":"default"}', true, false)
+    check("navigation keeps an older snapshot from applying beside its write", navigation.root.state.keys, "vim")
+    check("navigation asks for a fresh read", navigation.root.settleMode, "apply")
+
+    // A failed valid write keeps its owed value, applies unrelated external changes, and adds no phantom retry.
+    var failedWrite = sharedSettle()
+    failedWrite.root.changeKey("keys", "mac")
+    failedWrite.root.applyShared(failedWrite.disk.value)
+    failedWrite.root.wrote(2)
+    failedWrite.finish('{"keys":"vim","density":"normal"}', false, true)
+    check("a failed writer keeps the local preset", failedWrite.root.state.keys, "mac")
+    check("and still owes it", JSON.stringify(failedWrite.root.unsaved), '{"keys":"mac"}')
+    check("while an unrelated external change applies", failedWrite.root.state.density, "normal")
+    check("the failed writer is reported once", failedWrite.root.failures, 1)
+    check("and no writer or read is stranded", failedWrite.root.writeBook.inflight + "|" + failedWrite.root.settleMode, "|")
+
+    // A stale apply spends a queued prune first, keeps the dirty read, then retries only the valid owed key.
+    for (var pruneIdleLast of [true, false]) {
+        var prune = sharedSettle()
+        prune.root.changeKey("columns", ["name", "bogus"])
+        prune.root.applyShared(prune.disk.value)
+        prune.root.changeKey("density", "normal")
+        prune.root.wrote(2)
+        prune.finish(prune.disk.value, true, pruneIdleLast)
+        check("a queued prune precedes the stale read retry", prune.root.settleMode, "prune")
+        check("the dirty read survives the queued prune", prune.root.settleDirty, true)
+        prune.finish(prune.disk.value, false, pruneIdleLast)
+        check("the prune restores only the refused columns", JSON.stringify(prune.root.state.columns), '["name","size","date"]')
+        check("the valid local key survives the prune", prune.root.state.density, "normal")
+        check("only the valid key is retried", prune.root.writeBook.inflight, '{"density":"normal"}')
+        check("a queued valid write starts once after pruning", prune.root.writes.join("|"), '{"columns":["name","bogus"]}|{"density":"normal"}')
+        prune.root.wrote(0)
+        prune.finish(prune.disk.value, true, pruneIdleLast)
+        check("the post-prune acknowledgement also invalidates its old read", prune.root.state.density, "normal")
+        prune.disk.value = '{"columns":["name","size","date"],"density":"normal","hidden":true}'
+        prune.finish(prune.disk.value, false, pruneIdleLast)
+        check("the post-prune fresh read still accepts an external change", prune.root.state.hidden, true)
+        check("pruning and rereading leave no owed keys or pending process",
+              JSON.stringify(prune.root.unsaved) + "|" + prune.root.writeBook.inflight + "|" + prune.root.settleMode, "{}||")
+    }
+}

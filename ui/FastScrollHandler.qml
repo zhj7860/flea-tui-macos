@@ -1,0 +1,476 @@
+import QtQuick
+import "js/Scroll.js" as Scroll
+import "js/Motion.js" as Motion
+import "js/MenuWheel.js" as MenuWheel
+
+// A MouseArea because Flickable eats wheel before a child WheelHandler; presses pass through, arithmetic in Scroll.js.
+MouseArea {
+    id: root
+    objectName: "fleaScroll"
+
+    required property var flickable
+    property var ctrlWheelAction: null
+    property bool tailRunning: false
+    property bool returnRunning: false
+    // A menu highlight steps here; null everywhere else, so pixel scrolling is untouched.
+    property bool stepMode: false
+    property real stepRowHeight: 0
+    property var stepBy: null
+    property real stepAccum: 0
+    // The notch remainder in raw angleDelta units and the phaseless-pixel remainder in raw
+    // pixels; both reset when the menu opens, so one menu never spends another's travel.
+    property real notchAccum: 0
+    property real pixelAccum: 0
+
+    function resetSteps() {
+        root.stepAccum = 0
+        root.notchAccum = 0
+        root.pixelAccum = 0
+    }
+
+    // Field names per axis, built once so each routine serves both in the order of the pair it replaces.
+    readonly property var axisY: ({ pos: "contentY", last: "lastY", over: "overY", vel: "vy", size: "height", limits: Scroll.limitsY })
+    readonly property var axisX: ({ pos: "contentX", last: "lastX", over: "overX", vel: "vx", size: "width", limits: Scroll.limitsX })
+
+    anchors.fill: parent
+    acceptedButtons: Qt.LeftButton | Qt.RightButton | Qt.MiddleButton
+    propagateComposedEvents: true
+    z: 1000
+
+    function scrollDistance(pixelDelta, angleDelta) {
+        return Scroll.distance(pixelDelta, angleDelta, Application.styleHints.wheelScrollLines,
+                               Theme.scroll.notchPx, Theme.scroll.multiplier)
+    }
+
+    function tailActive() {
+        var found = Scroll.tailState(root.flickable, false)
+        return found !== null && found.active
+    }
+
+    function stopTail() {
+        Scroll.stopTail(root.flickable)
+        root.tailRunning = false
+        if (root.flickable)
+            root.flickable.cancelFlick()
+    }
+
+    function returnActive() {
+        var found = Scroll.tailState(root.flickable, false)
+        return found !== null && found.retActive
+    }
+
+    // An axis the view cannot scroll takes no delta at all.
+    function scrollsX() {
+        var f = root.flickable
+        if (!f || f.flickableDirection === Flickable.VerticalFlick)
+            return false
+        return Scroll.rangesX(f)
+    }
+    function scrollsY() {
+        var f = root.flickable
+        if (!f || f.flickableDirection === Flickable.HorizontalFlick)
+            return false
+        return Scroll.rangesY(f)
+    }
+
+    // Any foreign write ends the return; a press holds it instead of snapping to the bound.
+    function stopReturn(snap) {
+        var f = root.flickable
+        if (!f) {
+            root.returnRunning = false
+            return
+        }
+        var found = Scroll.tailState(f, false)
+        if (found !== null) {
+            found.retActive = false
+            found.retElapsed = 0
+            found.overY = 0
+            found.overX = 0
+        }
+        root.returnRunning = false
+        if (snap) {
+            var ly = Scroll.limitsY(f)
+            var lx = Scroll.limitsX(f)
+            var ty = Math.max(ly.min, Math.min(ly.max, f.contentY))
+            var tx = Math.max(lx.min, Math.min(lx.max, f.contentX))
+            if (ty !== f.contentY || tx !== f.contentX) {
+                var live = Scroll.tailState(f, true)
+                live.lastY = ty
+                live.lastX = tx
+                f.contentY = ty
+                f.contentX = tx
+                f.cancelFlick()
+            }
+        }
+    }
+
+    function overscrolled() {
+        var found = Scroll.tailState(root.flickable, false)
+        if (found !== null && (found.overY !== 0 || found.overX !== 0))
+            return true
+        var f = root.flickable
+        var ly = Scroll.limitsY(f)
+        var lx = Scroll.limitsX(f)
+        return f.contentY < ly.min - 0.01 || f.contentY > ly.max + 0.01
+            || f.contentX < lx.min - 0.01 || f.contentX > lx.max + 0.01
+    }
+
+    function writeAxis(value, ax) {
+        var f = root.flickable
+        var lim = ax.limits(f)
+        var at = Math.max(lim.min, Math.min(lim.max, value))
+        Scroll.tailState(f, true)[ax.last] = at
+        f[ax.pos] = at
+    }
+
+    function writeRawAxis(at, ax) {
+        Scroll.tailState(root.flickable, true)[ax.last] = at
+        root.flickable[ax.pos] = at
+    }
+
+    // Banks raw travel past the bound and returns the rubber-band spot; the first overshoot banks its raw travel.
+    function bankOver(st, lim, want, dim, ax) {
+        var below = want < lim.min
+        var beyond = below ? lim.min - want : want - lim.max
+        var prev = Math.abs(st[ax.over])
+        var acc = prev === 0 ? beyond : prev + Math.max(0, beyond - Scroll.overResist(prev, dim))
+        st[ax.over] = below ? -acc : acc
+        var shown = Scroll.overResist(acc, dim)
+        return below ? lim.min - shown : lim.max + shown
+    }
+
+    // Past the bound travel resists; banked travel from a swapped listing is dropped.
+    function touchAxis(delta, ax) {
+        var f = root.flickable
+        var lim = ax.limits(f)
+        var st = Scroll.tailState(f, true)
+        if (st[ax.over] !== 0 && f[ax.pos] >= lim.min - 0.01 && f[ax.pos] <= lim.max + 0.01)
+            st[ax.over] = 0
+        var d = Math.max(1, f[ax.size])
+        if (st[ax.over] === 0) {
+            var want = f[ax.pos] - delta
+            if (want >= lim.min && want <= lim.max)
+                writeAxis(want, ax)
+            else
+                writeRawAxis(bankOver(st, lim, want, d, ax), ax)
+            return
+        }
+        var m = Math.abs(st[ax.over])
+        var below = st[ax.over] < 0
+        var nm = below ? m + delta : m - delta
+        if (nm <= 0) {
+            var inside = below ? lim.min + (-nm) : lim.max + nm
+            st[ax.over] = 0
+            writeAxis(inside, ax)
+            return
+        }
+        var shown = Scroll.overResist(nm, d)
+        st[ax.over] = below ? -nm : nm
+        writeRawAxis(st[ax.over] < 0 ? lim.min - shown : lim.max + shown, ax)
+    }
+
+    // A past-bound lift returns on Omarchy's duration, at once under reduced motion.
+    function startReturn() {
+        var f = root.flickable
+        if (!f)
+            return
+        var st = Scroll.tailState(f, true)
+        var ly = Scroll.limitsY(f)
+        var lx = Scroll.limitsX(f)
+        var needY = f.contentY < ly.min - 0.01 || f.contentY > ly.max + 0.01
+        var needX = f.contentX < lx.min - 0.01 || f.contentX > lx.max + 0.01
+        if (!needY && !needX) {
+            st.overY = 0
+            st.overX = 0
+            root.returnRunning = false
+            return
+        }
+        var toY = f.contentY < ly.min ? ly.min : (f.contentY > ly.max ? ly.max : f.contentY)
+        var toX = f.contentX < lx.min ? lx.min : (f.contentX > lx.max ? lx.max : f.contentX)
+        if (Theme.reducedMotion) {
+            st.overY = 0
+            st.overX = 0
+            st.retActive = false
+            root.returnRunning = false
+            st.lastY = toY
+            st.lastX = toX
+            f.contentY = toY
+            f.contentX = toX
+            f.cancelFlick()
+            return
+        }
+        st.retFromY = f.contentY
+        st.retToY = toY
+        st.retFromX = f.contentX
+        st.retToX = toX
+        st.retElapsed = 0
+        st.retDur = Motion.durMs.open
+        st.retActive = true
+        st.overY = 0
+        st.overX = 0
+        root.returnRunning = true
+    }
+
+    // One frame of the return; the FrameAnimation below and the headless probe both enter here.
+    function advanceReturn(dtMs) {
+        var found = Scroll.tailState(root.flickable, false)
+        if (found === null || !found.retActive) {
+            root.returnRunning = false
+            return 0
+        }
+        var dt = Math.max(0, Number(dtMs) || 0)
+        if (dt <= 0)
+            return 0
+        found.retElapsed += dt
+        var ny = Scroll.returnAt(found.retFromY, found.retToY, found.retElapsed, found.retDur)
+        var nx = Scroll.returnAt(found.retFromX, found.retToX, found.retElapsed, found.retDur)
+        var moved = Math.abs(ny - root.flickable.contentY) + Math.abs(nx - root.flickable.contentX)
+        found.lastY = ny
+        found.lastX = nx
+        root.flickable.contentY = ny
+        root.flickable.contentX = nx
+        if (found.retElapsed >= found.retDur) {
+            found.retActive = false
+            found.overY = 0
+            found.overX = 0
+            root.returnRunning = false
+        }
+        return moved
+    }
+
+    // One axis of a tail frame; the caller runs Y before X. Returns the distance moved.
+    function advanceOne(found, step, dt, ax) {
+        if (step.dx === 0)
+            return 0
+        var f = root.flickable
+        var before = f[ax.pos]
+        var want = before - step.dx
+        var lim = ax.limits(f)
+        if (want >= lim.min && want <= lim.max) {
+            writeAxis(want, ax)
+            if (f[ax.pos] === before) {
+                found[ax.vel] = 0
+                return 0
+            }
+            return Math.abs(f[ax.pos] - before)
+        }
+        // The frame's raw travel joins the banked total shown through resistance.
+        var at = bankOver(found, lim, want, Math.max(1, f[ax.size]), ax)
+        found[ax.vel] = Scroll.overDecel(found[ax.vel], dt)
+        writeRawAxis(at, ax)
+        return Math.abs(f[ax.pos] - before)
+    }
+
+    // Past the bound the tail integrates through stroke resistance and brakes to a peak.
+    function advanceTail(dtMs) {
+        var found = Scroll.tailState(root.flickable, false)
+        if (found === null || !found.active) {
+            root.tailRunning = false
+            return 0
+        }
+        var dt = Math.max(0, Number(dtMs) || 0)
+        if (dt <= 0)
+            return 0
+        var stepY = Scroll.tailStep(found.vy, dt)
+        var stepX = Scroll.tailStep(found.vx, dt)
+        found.vy = stepY.v
+        found.vx = stepX.v
+        var moved = advanceOne(found, stepY, dt, root.axisY) + advanceOne(found, stepX, dt, root.axisX)
+        if (!Scroll.tailLive(found.vx, found.vy)) {
+            found.active = false
+            found.vx = 0
+            found.vy = 0
+            root.tailRunning = false
+            if (root.overscrolled())
+                root.startReturn()
+        }
+        return moved
+    }
+
+    function startTail() {
+        var found = Scroll.tailState(root.flickable, true)
+        if (found.overY !== 0 || found.overX !== 0)
+            return
+        // A repeated End carries no new samples, so it never stops a live tail.
+        if (found.samples.length === 0 && found.active)
+            return
+        var v = Scroll.liftVelocity(found.samples, Scroll.now())
+        found.samples = []
+        if (v.vx === 0 && v.vy === 0) {
+            found.active = false
+            root.tailRunning = false
+            return
+        }
+        found.vx = v.vx
+        found.vy = v.vy
+        found.active = true
+        root.tailRunning = true
+    }
+
+    function stepRows(steps) {
+        for (var i = 0; i < Math.abs(steps); i++)
+            root.stepBy(steps > 0 ? 1 : -1)
+    }
+
+    // Menu step: one row a notch of angleDelta, one row per row height of touchpad travel or phaseless pixels, no tail, always consumed.
+    function stepWheel(wheel, phase) {
+        if (Scroll.isTouchpad(phase)) {
+            if (phase === Qt.ScrollBegin)
+                root.stepAccum = 0
+            var folded = MenuWheel.touchSteps(root.stepAccum, Scroll.touchDistance(wheel.pixelDelta.y),
+                                              root.stepRowHeight)
+            root.stepAccum = folded.rest
+            stepRows(folded.steps)
+            return true
+        }
+        if (Scroll.movesByPixels(phase, wheel.pixelDelta.y, wheel.angleDelta.y)) {
+            var held = MenuWheel.touchSteps(root.pixelAccum, Number(wheel.pixelDelta.y), root.stepRowHeight)
+            root.pixelAccum = held.rest
+            stepRows(held.steps)
+            return true
+        }
+        var notched = MenuWheel.notchSteps(root.notchAccum, Number(wheel.angleDelta.y) || 0)
+        root.notchAccum = notched.rest
+        stepRows(notched.steps)
+        return true
+    }
+
+    function handleWheel(wheel) {
+        var phase = wheel.phase !== undefined ? wheel.phase : Qt.NoScrollPhase
+        if (root.stepMode && root.stepBy !== null) {
+            wheel.accepted = root.stepWheel(wheel, phase)
+            return wheel.accepted
+        }
+        if ((wheel.modifiers & Qt.ControlModifier) && root.ctrlWheelAction !== null) {
+            wheel.accepted = root.ctrlWheelAction(wheel)
+            if (wheel.accepted) {
+                root.stopTail()
+                root.stopReturn(true)
+                return true
+            }
+        }
+        if (Scroll.isTouchpad(phase)) {
+            // A new stroke ends the old tail; an End never stops a live tail on one view.
+            if (phase === Qt.ScrollBegin) {
+                root.stopTail()
+                root.stopReturn(true)
+                // The Begin carries no pixels and anchors the lift's span.
+                Scroll.pushSample(root.flickable, Scroll.now(), 0, 0)
+            } else if (phase !== Qt.ScrollEnd && root.tailActive()) {
+                root.stopTail()
+            } else if (root.returnActive()) {
+                root.stopReturn(true)
+            }
+            var down = Scroll.touchDistance(wheel.pixelDelta.y)
+            var across = Scroll.touchDistance(wheel.pixelDelta.x)
+            // A dead axis takes no delta, so samples and overscroll never name it.
+            if (!root.scrollsY())
+                down = 0
+            if (!root.scrollsX())
+                across = 0
+            if ((down === 0 && across === 0) || !root.flickable.interactive) {
+                if (phase === Qt.ScrollEnd && root.flickable.interactive) {
+                    // An accepted End stops at the first handler, so a second one never kills its tail.
+                    // Left unaccepted, the view snaps to the bound in the same delivery and kills the return.
+                    if (root.overscrolled()) {
+                        root.startReturn()
+                        wheel.accepted = true
+                        return true
+                    }
+                    root.startTail()
+                    if (root.tailActive()) {
+                        wheel.accepted = true
+                        return true
+                    }
+                }
+                wheel.accepted = false
+                return false
+            }
+            Scroll.pushSample(root.flickable, Scroll.now(), across, down)
+            var previousY = root.flickable.contentY
+            var previousX = root.flickable.contentX
+            root.flickable.cancelFlick()
+            if (down !== 0)
+                touchAxis(down, root.axisY)
+            // A tilt or a diagonal touchpad stroke pans a content wider than the view, a zoomed PDF page.
+            if (across !== 0)
+                touchAxis(across, root.axisX)
+            wheel.accepted = Scroll.moved(previousY, root.flickable.contentY) || Scroll.moved(previousX, root.flickable.contentX)
+            if (phase === Qt.ScrollEnd) {
+                if (root.overscrolled())
+                    root.startReturn()
+                else
+                    root.startTail()
+                // A tail started here is accepted above by movement, or here when nothing moved.
+                if (root.tailActive())
+                    wheel.accepted = true
+            }
+            return wheel.accepted
+        }
+        if (root.tailActive())
+            root.stopTail()
+        if (root.returnActive())
+            root.stopReturn(true)
+        var notchDown = root.scrollDistance(wheel.pixelDelta.y, wheel.angleDelta.y)
+        var notchAcross = root.scrollDistance(wheel.pixelDelta.x, wheel.angleDelta.x)
+        if ((notchDown === 0 && notchAcross === 0) || !root.flickable.interactive) {
+            wheel.accepted = false
+            return false
+        }
+        var notchY = root.flickable.contentY
+        var notchX = root.flickable.contentX
+        root.flickable.cancelFlick()
+        if (notchDown !== 0)
+            writeAxis(notchY - notchDown, root.axisY)
+        if (notchAcross !== 0)
+            writeAxis(notchX - notchAcross, root.axisX)
+        wheel.accepted = Scroll.moved(notchY, root.flickable.contentY) || Scroll.moved(notchX, root.flickable.contentX)
+        return wheel.accepted
+    }
+
+    // A wheel is the operator moving the view, ahead of the write it makes.
+    signal wheeled()
+    onWheel: function (wheel) { root.wheeled(); root.handleWheel(wheel) }
+    // A press stops the tail and the return where they are for the row Qt picked; left
+    // unaccepted it takes no grab, so the view's own release fixup returns the held overscroll.
+    function handlePress(mouse) { root.stopTail(); root.stopReturn(false); mouse.accepted = false }
+    onPressed: function (mouse) { root.handlePress(mouse) }
+
+    Connections {
+        target: root.flickable
+        // Any content write the tail or the return did not make ends it: showCursor, restore,
+        // cursor keys, the band. Each records every value it writes, so any other value is another.
+        function onContentYChanged() {
+            var found = Scroll.tailState(root.flickable, false)
+            if (found === null)
+                return
+            if (found.active && root.flickable.contentY !== found.lastY)
+                root.stopTail()
+            else if (found.retActive && root.flickable.contentY !== found.lastY)
+                root.stopReturn(false)
+        }
+        function onContentXChanged() {
+            var found = Scroll.tailState(root.flickable, false)
+            if (found === null)
+                return
+            if (found.active && root.flickable.contentX !== found.lastX)
+                root.stopTail()
+            else if (found.retActive && root.flickable.contentX !== found.lastX)
+                root.stopReturn(false)
+        }
+        function onMovementStarted() { root.stopTail(); root.stopReturn(true) }
+    }
+
+    FrameAnimation {
+        running: root.tailRunning || root.returnRunning
+        // frameTime is seconds; both animations integrate milliseconds.
+        onTriggered: {
+            if (root.tailRunning)
+                root.advanceTail(frameTime * 1000)
+            else if (root.returnRunning)
+                root.advanceReturn(frameTime * 1000)
+        }
+    }
+
+    Component.onDestruction: Scroll.forgetTail(root.flickable)
+}

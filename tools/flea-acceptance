@@ -1,0 +1,429 @@
+#!/usr/bin/env bash
+# Derive current requirements and drive owned native fixtures; required UNDRIVEN rows exit 2.
+# --inventory is read-only. Native runs require the caller's FLEA_SOURCE_SHA and FLEA_BINARY_SHA256.
+# The 30-board manifest identifies design authority; native screenshots still require inspection.
+set -uo pipefail
+cd "$(dirname "$0")/.." || exit 1
+REPO=$PWD
+. "$REPO/tools/flea-sandbox-guard"
+# Sourced for its function definitions; nothing in it touches the display until drive_all runs.
+. "$REPO/tools/flea-acceptance-drive"
+
+DRIVE=0
+INVENTORY=0
+# A named group after --drive runs only that group, so confirming one fix costs minutes rather than
+# a whole display slot. Groups: key menu omarchy pointer.
+DRIVE_GROUPS=""
+case "${1:-}" in
+  --drive)
+    DRIVE=1; shift
+    drive_validate_groups "$@" || exit 2
+    DRIVE_GROUPS="$*" ;;
+  --inventory) INVENTORY=1 ;;
+  "") ;;
+  *) printf 'usage: %s [--inventory|--drive [key|menu|omarchy|pointer ...]]\n' "$0" >&2; exit 2 ;;
+esac
+
+BIN=${FLEA_BIN:-${BIN:-$REPO/target/release/flea}}
+BOARD_MANIFEST="$REPO/.superpowers/flea/design-completion-20260908/references/SHA256SUMS"
+# Long enough for a worker to answer on a four-file directory, short enough that seventeen of them
+# is not a coffee break.
+ASYNC_WAIT_S=${ASYNC_WAIT_S:-1.5}
+
+PASSED=0
+FAILED=0
+UNDRIVEN=0
+
+pass() { printf 'PASS %-12s %s\n' "$1" "$2"; PASSED=$(( PASSED + 1 )); }
+bad()  { printf 'FAIL %-12s %s: %s\n' "$1" "$2" "$3"; FAILED=$(( FAILED + 1 )); }
+skip() { printf 'UNDRIVEN %-8s %s: %s\n' "$1" "$2" "$3"; UNDRIVEN=$(( UNDRIVEN + 1 )); }
+
+die() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
+
+# A derivation that comes back empty is a broken derivation, not an empty product, and an empty
+# checklist passes. Every list below goes through this.
+require_list() {
+  local what=$1 n=$2
+  [ "$n" -gt 0 ] || die "derived 0 $what, so the checklist would pass by being empty"
+}
+
+# ---- the five derivations ----------------------------------------------------------------------
+
+# Sample input, docs/protocol.md: "### list" between the "## Requests" and "## Responses" headings.
+derive_requests() {
+  awk '/^## Requests/,/^## Responses/' "$REPO/docs/protocol.md" \
+    | sed -n 's/^### //p'
+}
+
+# Sample input, docs/protocol.md: "### listed" after the "## Responses" heading.
+derive_responses() {
+  sed -n '/^## Responses/,$p' "$REPO/docs/protocol.md" | sed -n 's/^### //p'
+}
+
+# Sample input, ui/js/Menu.js: 'var columns = [["mode", "Mode"], ["size", "Size"], ["date", "Date Modified"], ["kind", "Kind"]]'
+derive_header_keys() {
+  sed -n '/^[[:space:]]*var columns = \[\[/p' "$REPO/ui/js/Menu.js" \
+    | tr '[],' '\n' \
+    | sed -n 's/^[[:space:]]*"\([a-z][a-z]*\)"[[:space:]]*$/\1/p'
+}
+
+validate_header_keys() {
+  local key expected seen=" "
+  [ "$#" -gt 0 ] || die "ui/js/Menu.js yielded 0 header keys"
+  for key in "$@"; do
+    case "$seen" in
+      *" $key "*) die "ui/js/Menu.js contains duplicate header key: $key" ;;
+    esac
+    case "$key" in
+      mode|size|date|kind) ;;
+      *) die "ui/js/Menu.js contains unexpected header key: $key" ;;
+    esac
+    seen="$seen$key "
+  done
+  for expected in mode size date kind; do
+    case "$seen" in
+      *" $expected "*) ;;
+      *) die "ui/js/Menu.js is missing header key: $expected" ;;
+    esac
+  done
+}
+
+# Sample manifest row: '<64 lowercase hex characters>  Window.html'.
+derive_artboards() {
+  python3 - "$BOARD_MANIFEST" "${FLEA_BOARD_DIR:-}" <<'PY'
+import hashlib, pathlib, re, sys
+manifest, directory = pathlib.Path(sys.argv[1]), sys.argv[2]
+rows = manifest.read_text().splitlines()
+names = set()
+for row in rows:
+    match = re.fullmatch(r'([0-9a-f]{64})  ([A-Za-z0-9_-]+\.html)', row)
+    if not match or match[2] in names:
+        raise SystemExit('invalid or duplicate current board manifest row: ' + row)
+    digest, name = match.groups()
+    names.add(name)
+    if directory and hashlib.sha256((pathlib.Path(directory) / name).read_bytes()).hexdigest() != digest:
+        raise SystemExit('authoritative board changed: ' + name)
+    print(name + '|' + digest)
+if len(names) != 30:
+    raise SystemExit('current board manifest must contain exactly 30 immutable HTML boards')
+PY
+}
+
+# Every suite in tests/, which is a derivation from the directory itself so a suite added tomorrow
+# shows up here rather than nowhere. Sample input: the file list of tests/*.sh.
+derive_suites() {
+  for f in "$REPO"/tests/*.sh; do
+    [ -f "$f" ] && basename "$f"
+  done
+}
+
+# Which executable file, if any, names a suite. A grep is evidence about characters and not about
+# invocation, so this reports what NAMES a suite and never claims the suite is run: this repo has no
+# runner script and no CI at all, so every one of them is run by a person or not at all. An uninvoked
+# suite reads as coverage and is not, which is how a nine-check drag suite sat unrun.
+suite_named_by() {
+  grep -rl "$1" "$REPO"/tests "$REPO"/tools "$REPO"/packaging "$REPO"/PKGBUILD 2>/dev/null \
+    | grep -v "/tests/$1$" | sed "s|$REPO/||" | tr '\n' ' '
+}
+
+# Sample input, ui/NetworkMounts.qml: 'group: "network", kind: "share"'
+# The group is what says this is a sidebar entry rather than any other object with a kind: matching
+# on kind alone collected PreviewMedia.qml's default property value, "audio", as a sidebar kind. The
+# shape is the filter, not a file list, so a new file that builds entries is picked up on its own.
+derive_sidebar_kinds() {
+  grep 'group: "' "$REPO"/ui/*.qml \
+    | sed -n 's/.*kind: "\([a-z][a-z]*\)".*/\1/p' | LC_ALL=C sort -u
+}
+
+# ---- the request drivers -----------------------------------------------------------------------
+
+# One line per request: the request name, the response type the doc says it answers with, and the
+# JSON to send after the opening list. The names on the left are checked against the derived list
+# below, so a request added to the doc and not to this table is reported rather than skipped, and a
+# response named here that the doc does not list is reported too.
+declare -a REQUEST_DRIVERS=(
+  'list|listed|'
+  'listpaths|rows|{"c":"listpaths","paths":["@SB@/a.txt"],"first":2}'
+  'window|rows|{"c":"window","start":0,"count":2}'
+  'sort|listed|{"c":"sort","by":"name","desc":true}'
+  'search|searched|{"c":"search","path":"@SB@","query":"a","hidden":false}'
+  'searchcancel|searched|{"c":"search","path":"@SB@","query":"a","hidden":false}
+{"c":"searchcancel"}'
+  'thumb|thumbed|{"c":"thumb","rows":[0]}'
+  'thumbcancel|thumbed|{"c":"thumb","rows":[0]}
+{"c":"thumbcancel","rows":[0]}'
+  'dirsize|dirsized|{"c":"dirsize","rows":[0]}'
+  'dirsizecancel|dirsized|{"c":"dirsize","rows":[0]}
+{"c":"dirsizecancel"}'
+  'transfer|transferstarted|{"c":"transfer","op":"copy","paths":["@SB@/a.txt"],"dest":"@SB@/dest"}'
+  'transfercancel|transferstarted|{"c":"transfer","op":"copy","paths":["@SB@/a.txt"],"dest":"@SB@/dest"}
+{"c":"transfercancel","id":1}'
+  'collisions|collisions|{"c":"collisions","id":1,"paths":["@SB@/a.txt"],"dest":"@SB@/dest"}'
+  'trash|trashed|{"c":"trash","paths":["@SB@/b.txt"]}'
+  'rename|renamed|{"c":"rename","path":"@SB@/a.txt","to":"renamed.txt"}'
+  'duplicate|duplicated|{"c":"duplicate","path":"@SB@/a.txt"}'
+  'mkdir|made|{"c":"mkdir","path":"@SB@","name":"made-here"}'
+  'meta|meta|{"c":"meta","row":0,"text":true,"media":false,"archive":false}'
+  'jump|jumped|{"c":"jump","id":1,"favourites":["@SB@/sub"],"recent":["@SB@/a.txt"]}'
+  'devs|devs|{"c":"devs","paths":["@SB@","@SB@/a.txt"]}'
+  'undo|undone|{"c":"trash","paths":["@SB@/b.txt"]}
+@WAIT@
+{"c":"undo"}'
+  'quit|listed|'
+)
+
+# One backend session per request, which keeps the state trivial: list, then the request, then quit.
+# An error line is a failure even when the expected type also arrived, because the wire says an
+# error is the answer to a request that could not be served.
+#
+# What this proves and what it does not: for most requests it proves the wire accepts the request
+# and answers with the documented type. For the three cancels it proves the same, and NOT that the
+# work stopped, because the work they cancel finishes faster than a cancel can be typed at it. Those
+# three are honest coverage of the request and not of the cancellation.
+# A body's lines, with a line of @WAIT@ meaning "let the backend finish before the next one". undo
+# needs it: it cannot undo an operation the backend has not recorded yet, and without the pause it
+# answered "there is nothing to undo" and looked like a product defect.
+emit_body() {
+  local body=$1 line
+  [ -n "$body" ] || return 0
+  while IFS= read -r line; do
+    if [ "$line" = "@WAIT@" ]; then
+      sleep "$ASYNC_WAIT_S"
+    else
+      printf '%s\n' "$line"
+    fi
+  done <<< "$body"
+}
+
+# A cancel's effect is not observable on a four-file directory: the work it cancels finishes faster
+# than the cancel can be typed at it. What IS reliable is that the backend accepts the request, does
+# not answer an error, and is still answering afterwards, so that is what these assert. This is
+# honest coverage of the request and not of the cancellation.
+drive_cancel() {
+  local name=$1 body=$2 out dir
+  dir=$(fresh_dir "$name") || die "cannot create request fixture: $name"
+  body=${body//@SB@/$dir}
+  out=$( { printf '{"c":"list","path":"%s","first":8,"hidden":true}\n' "$dir"
+           emit_body "$body"
+           sleep "$ASYNC_WAIT_S"
+           printf '{"c":"window","start":0,"count":2}\n'
+           printf '{"c":"quit"}\n'; } | "$BIN" --backend 2>&1 ) \
+    || { bad request "$name" "backend pipeline failed: $out"; return; }
+  case $out in
+    *'"t":"error"'*)
+      bad request "$name" "the backend answered error: $(printf '%s' "$out" | grep -m1 '"t":"error"')"
+      return ;;
+  esac
+  case $out in
+    *'"t":"rows"'*) pass request "$name" ;;
+    *) bad request "$name" "the backend stopped answering after the cancel" ;;
+  esac
+}
+
+drive_request() {
+  local name=$1 want=$2 body=$3 out dir
+  # Its own directory per request, because rename and trash and duplicate MUTATE: the first shape of
+  # this shared one sandbox, rename moved a.txt out from under duplicate, and duplicate reported an
+  # error that was the battery's fault and looked like the product's.
+  dir=$(fresh_dir "$name") || die "cannot create request fixture: $name"
+  body=${body//@SB@/$dir}
+  # The sleep is the whole reason search, dirsize and meta failed here first: they answer from a
+  # worker, and a quit typed immediately behind the request closes the backend before the answer.
+  out=$( { printf '{"c":"list","path":"%s","first":8,"hidden":true}\n' "$dir"
+           emit_body "$body"
+           sleep "$ASYNC_WAIT_S"
+           printf '{"c":"quit"}\n'; } | "$BIN" --backend 2>&1 ) \
+    || { bad request "$name" "backend pipeline failed: $out"; return; }
+  case $out in
+    *'"t":"error"'*)
+      bad request "$name" "the backend answered error: $(printf '%s' "$out" | grep -m1 '"t":"error"')"
+      return ;;
+  esac
+  case $out in
+    *"\"t\":\"$want\""*) pass request "$name" ;;
+    *) bad request "$name" "no $want line in the answer" ;;
+  esac
+}
+
+# quit is the one request whose effect is the absence of an answer, so it gets its own driver: a
+# second list after it must go unanswered. Sending it through the shared driver would have proved
+# only that the first list was answered, which is not a test of quit at all.
+drive_quit() {
+  local out n dir
+  dir=$(fresh_dir quit) || die "cannot create request fixture: quit"
+  out=$( { printf '{"c":"list","path":"%s","first":8,"hidden":true}\n' "$dir"
+           printf '{"c":"quit"}\n'
+           printf '{"c":"list","path":"%s","first":8,"hidden":true}\n' "$dir"; } | "$BIN" --backend 2>&1 ) \
+    || { bad request quit "backend pipeline failed: $out"; return; }
+  n=$(printf '%s\n' "$out" | grep -c '"t":"listed"')
+  if [ "$n" = 1 ]; then
+    pass request quit
+  else
+    bad request quit "the backend answered $n listed lines, so it kept reading after quit"
+  fi
+}
+
+# ---- setup -------------------------------------------------------------------------------------
+
+if [[ "$INVENTORY" == 1 ]]; then
+  derive_bindings && derive_menu_actions && derive_artboards
+  exit $?
+fi
+
+mapfile -t HEADER_KEYS < <(derive_header_keys)
+validate_header_keys "${HEADER_KEYS[@]}"
+[ -x "$BIN" ] || die "$BIN is missing, so run cargo build --release first"
+[ -f "$REPO/docs/protocol.md" ] || die "docs/protocol.md is missing, so the request list cannot be derived"
+[ -r "$BOARD_MANIFEST" ] || die "current 30-board SHA256 manifest is missing: $BOARD_MANIFEST"
+
+if [[ "$DRIVE" == 0 ]] || drive_wants omarchy; then
+  [ -r "$OMARCHY_CLIPBOARD_LUA" ] || die "$OMARCHY_CLIPBOARD_LUA is missing, so the Omarchy chord list cannot be derived"
+fi
+
+sandbox_root_ok
+[[ -d "$FIXTURE_ROOT" && -f "$FIXTURE_ROOT/$SANDBOX_MARKER" ]] || die "fixture parent requires its own marker: $FIXTURE_ROOT"
+SB=$(mktemp -d "$FIXTURE_ROOT/flea-acceptance.XXXXXXXX") || die "could not create owned acceptance sandbox"
+SB=$(realpath -e "$SB") || die "acceptance sandbox cannot be resolved"
+printf 'Flea native acceptance\n' > "$SB/$SANDBOX_MARKER"
+DRIVE_EVIDENCE="$SB/evidence"
+drive_guard "$DRIVE_EVIDENCE"
+mkdir "$DRIVE_EVIDENCE" || die "could not create acceptance evidence directory"
+# The fixture the drive lists, inside the sandbox but a scratch of its own, so the guard's marker
+# file stays up on $SB and never appears in a listing whose row count a check asserts.
+DRIVE_FIXTURE="$SB/drive"
+# The window goes before the sandbox it is listing does, or the teardown deletes a tree a live
+# backend is still walking.
+acceptance_exit_status=0
+trap 'acceptance_exit_status=$?; trap - EXIT; drive_stop "$acceptance_exit_status"; exit $?' EXIT
+trap 'exit 130' INT
+trap 'exit 143' HUP TERM
+drive_private_state
+BIN=$(realpath -e "$BIN") || die "candidate binary cannot be resolved"
+drive_provenance
+python3 "$REPO/tools/flea-keymap-gen" "$SB/Keymap.js" "$REPO/keys.toml" || die "keymap regeneration failed"
+cmp -s "$SB/Keymap.js" "$REPO/ui/js/Keymap.js" || die "generated Keymap.js differs from keys.toml; regenerate before native use"
+BINDINGS="$SB/bindings"
+derive_bindings > "$BINDINGS" || die "key matrix derivation failed"
+[[ -s "$BINDINGS" ]] || die "derived no key rows"
+derive_artboards > "$SB/boards" || die "current board authority check failed"
+if [[ "$DRIVE" == 1 ]]; then drive_session_setup; fi
+drive_private_trash
+
+# The same starting shape for every request, built fresh so no driver can see another's writes.
+fresh_dir() {
+  local d="$SB/$1"
+  drive_guard "$d"
+  sandbox_scratch "$d"
+  mkdir -p "$d/dest" "$d/sub" || return 1
+  printf 'alpha' > "$d/a.txt" || return 1
+  printf 'beta' > "$d/b.txt" || return 1
+  printf '%s' "$d"
+}
+
+echo "flea-acceptance, checklist derived at $(date -Is)"
+echo
+
+# ---- requests, driven --------------------------------------------------------------------------
+
+if [[ "$DRIVE" == 0 ]]; then
+mapfile -t REQUESTS < <(derive_requests)
+require_list "requests from docs/protocol.md" "${#REQUESTS[@]}"
+mapfile -t RESPONSES < <(derive_responses)
+require_list "responses from docs/protocol.md" "${#RESPONSES[@]}"
+
+for name in "${REQUESTS[@]}"; do
+  row=""
+  for r in "${REQUEST_DRIVERS[@]}"; do
+    case $r in "$name|"*) row=$r; break ;; esac
+  done
+  if [ -z "$row" ]; then
+    bad request "$name" "the doc lists this request and this battery has no driver for it"
+    continue
+  fi
+  want=${row#*|}
+  want=${want%%|*}
+  body=${row#*|*|}
+  # A driver expecting a response the doc does not document is a driver written from memory.
+  known=no
+  for resp in "${RESPONSES[@]}"; do
+    [ "$resp" = "$want" ] && { known=yes; break; }
+  done
+  if [ "$known" = no ]; then
+    bad request "$name" "expects a '$want' line, which docs/protocol.md does not document"
+    continue
+  fi
+  case $name in
+    quit) drive_quit ;;
+    *cancel) drive_cancel "$name" "$body" ;;
+    *) drive_request "$name" "$want" "$body" ;;
+  esac
+done
+fi
+
+# ---- the four groups this battery derives and does not yet drive ---------------------------------
+
+echo
+# Every derivation, not only the two the request loop needed: an empty list here is a broken
+# derivation and it would report as a clean run with nothing in it.
+mapfile -t KEY_ROWS < "$BINDINGS"
+require_list "key matrix rows from Keymap.js" "${#KEY_ROWS[@]}"
+mapfile -t MENU_ACTIONS < <(derive_menu_actions)
+require_list "menu actions from ui/js/Menu.js" "${#MENU_ACTIONS[@]}"
+mapfile -t ARTBOARDS < "$SB/boards"
+require_list "artboards from current SHA256 manifest" "${#ARTBOARDS[@]}"
+mapfile -t SIDEBAR_KINDS < <(derive_sidebar_kinds)
+require_list "sidebar entry kinds from ui/" "${#SIDEBAR_KINDS[@]}"
+
+if [[ "$DRIVE" == 0 ]] || drive_wants omarchy; then
+  mapfile -t OMARCHY_CHORDS < <(derive_omarchy_clipboard_binds)
+  require_list "Omarchy chords from $OMARCHY_CLIPBOARD_LUA" "${#OMARCHY_CHORDS[@]}"
+fi
+mapfile -t POINTER_ROWS < <(derive_pointer)
+require_list "pointer rows from keys.toml" "${#POINTER_ROWS[@]}"
+mapfile -t SUITES < <(derive_suites)
+require_list "test suites from tests/" "${#SUITES[@]}"
+
+if [ "$DRIVE" = 1 ]; then
+  drive_all
+else
+  for a in "${KEY_ROWS[@]}"; do
+    skip key "$a" "bound in keys.toml; --drive presses it on a real window"
+  done
+  for a in "${MENU_ACTIONS[@]}"; do
+    skip menu "$a" "an entry from ui/js/Menu.js; --drive chooses it on a real window"
+  done
+  # Read line by line: a chord's name carries spaces, and a $( ) loop split "SUPER + C" into three
+  # items and reported twenty-six of them where there are ten.
+  while IFS= read -r a; do
+    skip omarchy "$a" "an Omarchy operation that must keep working inside Flea; --drive presses it"
+  done < <(derive_omarchy_names)
+  while IFS='|' read -r where press rowkind does; do
+    skip pointer "$(pointer_name "$where" "$press" "$rowkind")" \
+      "does $does; declared in keys.toml [[pointer]]; --drive clicks it on a real window"
+  done < <(derive_pointer)
+fi
+# Reported whether or not --drive ran: this group is about what runs the product's own tests, and
+# nothing here runs them. Making this battery the runner would triple its headless time and the
+# suites build their own sandboxes, so that is a recommendation and not a change made at release.
+if [[ -z "$DRIVE_GROUPS" ]]; then
+for a in "${SUITES[@]}"; do
+  named=$(suite_named_by "$a")
+  if [ -z "$named" ]; then
+    skip suite "$a" "no executable file in this repo names it, and there is no runner script and no CI, so nothing runs it but a person"
+  else
+    skip suite "$a" "named by ${named% }, which is not proof it is run; this repo has no runner script and no CI"
+  fi
+done
+for a in "${ARTBOARDS[@]}"; do
+  skip artboard "$a" "native specimen matching and inspection are recorded separately in coverage.md"
+done
+for a in $(derive_sidebar_kinds); do
+  skip sidebar "$a" "a sidebar entry kind in ui/, not driven here"
+done
+fi
+
+echo
+printf 'flea-acceptance: %s passed, %s failed, %s derived but undriven\n' "$PASSED" "$FAILED" "$UNDRIVEN"
+[ "$FAILED" -eq 0 ] || exit 1
+[ "$UNDRIVEN" -eq 0 ] || exit 2
+exit 0

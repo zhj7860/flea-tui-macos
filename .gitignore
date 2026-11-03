@@ -1,0 +1,26 @@
+/target
+**/*.rs.bk
+
+# Editor and IDE droppings
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+__pycache__/
+
+# OS droppings
+.DS_Store
+Thumbs.db
+
+# Session artefacts: working documents for this project's own build sessions, never shipped.
+docs/baseline-*.md
+docs/live-battery-*.md
+docs/release-ledger.md
+docs/pending/
+
+# Session and build-tracking state, never shipped.
+.superpowers/
+
+# Python bytecode from importing extensionless helpers, never shipped.
+__pycache__/

@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+. "$(dirname "$0")/headless-commons.sh"
+# A list row and a grid tile build no more than they need, counted offscreen with no display or display lock.
+set -u
+. "$(dirname "$0")/../tools/flea-sandbox-guard"
+cd "$(dirname "$0")/.." || exit 1
+
+if ! command -v qs >/dev/null; then
+    echo "rowcost.sh: qs is not installed, cannot build a row or a tile"
+    exit 1
+fi
+
+test_root="$FIXTURE_ROOT/flea-rowcost-$$"
+sandbox_make "$test_root"
+cleanup() { sandbox_remove "$test_root"; }
+trap cleanup EXIT
+
+mkdir -p "$test_root/config" "$test_root/home" "$test_root/state" "$test_root/runtime" || exit 1
+chmod 700 "$test_root/runtime" || exit 1
+# The probe imports ui/ as Flea, and ui/'s qs.Commons resolves against this root, as it does from ui/boot.
+ln -s "$PWD/ui" "$test_root/config/flea" || exit 1
+headless_commons "$test_root" || exit 1
+ln -s "$(readlink -f ui/boot/Ui)" "$test_root/config/Ui" || exit 1
+ln -s "$PWD/tests/langmark-count.js" "$test_root/config/langmark-count.js" || exit 1
+cp tests/rowcost.qml "$test_root/config/shell.qml" || exit 1
+
+output=$(env -u DISPLAY -u WAYLAND_DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE \
+    HOME="$test_root/home" XDG_STATE_HOME="$test_root/state" XDG_RUNTIME_DIR="$test_root/runtime" \
+    QT_QPA_PLATFORM=offscreen QT_QPA_PLATFORMTHEME=generic QT_FORCE_STDERR_LOGGING=1 \
+    timeout 20 qs -p "$test_root/config" 2>&1)
+
+# Sample input, one probe line: "  INFO qml: ROWCOST PASS row=19 grid=14"
+pass_count=$(printf '%s\n' "$output" | grep -c 'ROWCOST PASS')
+fail_count=$(printf '%s\n' "$output" | grep -c 'ROWCOST FAIL')
+if [ "$pass_count" -ne 1 ] || [ "$fail_count" -ne 0 ]; then
+    printf 'FAIL a delegate built more than its ceiling, or its rename wiring broke\n'
+    printf '%s\n' "$output" | grep -aE 'ROWCOST|ERROR|error'
+    printf '%s\n' "$output"
+    exit 1
+fi
+printf '%s\n' "$output" | grep -o 'ROWCOST PASS.*'
+printf '%s\n' "$output" | grep -ao 'LANGCOST .*'

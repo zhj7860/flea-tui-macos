@@ -1,0 +1,685 @@
+#!/usr/bin/env bash
+# Which formats can each GUI entrant actually thumbnail? The field bench cannot answer that and it
+# was being read as though it could: on the 2000-file fixture nautilus produced 400 mp4 and zero of
+# 600 jpg, because the names sort by format and it settled before reaching the photos. That column
+# measures how far an entrant got. This measures what it can do.
+#
+# Eight files, one per format, a private thumbnail cache per entrant, and a generous timeout, so
+# every entrant has every format in front of it and time to do all of them. Nothing is ranked and no
+# timing is taken: this is a capability claim and nothing else.
+#
+# Read-only against the operator's box. The fixture and every cache live inside a sandbox this
+# script creates through tools/flea-sandbox-guard, and no entrant is given $HOME/.cache.
+set -uo pipefail
+cd "$(dirname "$0")/.." || exit 1
+FLEA_REPO=$PWD
+. "$FLEA_REPO/tools/flea-sandbox-guard"
+
+export PATH="$HOME/.local/bin:$PATH"
+eval "$(omarchy-drive env)"
+
+MEDIA=${MEDIA:-$FIXTURE_ROOT/flea-media-btrfs}
+FLEA_UI="$FLEA_REPO/ui"
+FLEA_BIN="$FLEA_REPO/target/release/flea"
+STRATA_BIN=${STRATA_BIN:-$HOME/Work/strata/target/release/strata}
+# The one entrant in this field that persists no thumbnail. strata renders each one in a sandboxed
+# helper that writes result.png into /tmp/strata-preview-<pid>-<n> and deletes the directory on drop
+# (src/sandbox.rs:382 names it, :53 the file, :397 removes it), so it fills the screen and leaves
+# this tool's cache empty. A live watch sees that work; a cache count is structurally blind to it.
+TRANSIENT_ID=${TRANSIENT_ID:-strata}
+TRANSIENT_PREFIX=${TRANSIENT_PREFIX:-/tmp/strata-preview-}
+# Generous on purpose. A capability answer must not be a timing answer in disguise, so an entrant
+# gets far longer than it could possibly need for eight files.
+CAP_TIMEOUT_S=${CAP_TIMEOUT_S:-45}
+# One entrant for remeasurement; every mode refuses matching pre-existing processes instead of closing them.
+CAP_ONLY=${CAP_ONLY:-}
+OUT=${1:-$HOME/bench/capability.md}
+
+SB="$FIXTURE_ROOT/flea-capability-$$"
+fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
+
+declare -a PROCESS_TARGETS=()
+declare -a TARGET_PIDS=()
+declare -a OWNED_PIDS=()
+declare -a BOUNDARY_PIDS=()
+declare -A OWNED_STARTS=()
+declare -a WATCH_PIDS=()
+declare -A WATCH_STARTS=()
+OWNED_ROOT_PID=
+OWNED_UNIT=
+OWNED_BOUNDARY_VERIFIED=no
+OWNED_UNIT_INVOCATION=
+OWNED_CONTROL_GROUP=
+OWNED_UNIT_SEQUENCE=0
+
+process_command() {
+  ps -o command= -p "$1" 2>/dev/null
+}
+
+# Sample input: `/proc/4123/stat` starts `4123 (flea) S 4100 4123 4123 ...` and field 22 is starttime.
+process_identity() {
+  local pid=$1 stat rest
+  local -a fields=()
+  stat=$(< "/proc/$pid/stat") || return 1
+  rest=${stat##*) }
+  read -r -a fields <<< "$rest"
+  [ "${#fields[@]}" -ge 20 ] || return 1
+  PROCESS_STATE=${fields[0]}
+  PROCESS_START=${fields[19]}
+}
+
+read_unit_properties() {
+  local unit=$1 output key value
+  UNIT_LOAD_STATE=
+  UNIT_ACTIVE_STATE=
+  UNIT_SUB_STATE=
+  UNIT_MAIN_PID=
+  UNIT_CONTROL_GROUP=
+  UNIT_INVOCATION=
+  UNIT_KILL_MODE=
+  output=$(systemctl --user show "$unit" --no-pager \
+    --property=LoadState --property=ActiveState --property=SubState --property=MainPID \
+    --property=ControlGroup --property=InvocationID --property=KillMode 2>/dev/null) || return 1
+  while IFS='=' read -r key value; do
+    case "$key" in
+      LoadState) UNIT_LOAD_STATE=$value ;;
+      ActiveState) UNIT_ACTIVE_STATE=$value ;;
+      SubState) UNIT_SUB_STATE=$value ;;
+      MainPID) UNIT_MAIN_PID=$value ;;
+      ControlGroup) UNIT_CONTROL_GROUP=$value ;;
+      InvocationID) UNIT_INVOCATION=$value ;;
+      KillMode) UNIT_KILL_MODE=$value ;;
+    esac
+  done <<< "$output"
+  [ -n "$UNIT_LOAD_STATE" ]
+}
+
+unit_name_available() {
+  read_unit_properties "$1" || return 1
+  [ "$UNIT_LOAD_STATE" = not-found ]
+}
+
+owned_unit_active() {
+  [ -n "$OWNED_UNIT" ] || return 1
+  read_unit_properties "$OWNED_UNIT" || return 1
+  [ "$UNIT_LOAD_STATE" = loaded ] \
+    && [ "$UNIT_ACTIVE_STATE" = active ] \
+    && [ "$UNIT_SUB_STATE" = running ] \
+    && [ "$UNIT_MAIN_PID" = "$OWNED_ROOT_PID" ] \
+    && [ "$UNIT_CONTROL_GROUP" = "$OWNED_CONTROL_GROUP" ] \
+    && [ "$UNIT_INVOCATION" = "$OWNED_UNIT_INVOCATION" ] \
+    && [ "$UNIT_KILL_MODE" = control-group ]
+}
+
+read_boundary_pids() {
+  local cgroup_file pid
+  case "$OWNED_CONTROL_GROUP" in /*) ;; *) return 1 ;; esac
+  cgroup_file="/sys/fs/cgroup$OWNED_CONTROL_GROUP/cgroup.procs"
+  [ -r "$cgroup_file" ] || return 1
+  BOUNDARY_PIDS=()
+  while IFS= read -r pid; do
+    case "$pid" in *[!0-9]*|'') return 1 ;; esac
+    BOUNDARY_PIDS+=("$pid")
+  done < "$cgroup_file"
+}
+
+boundary_contains() {
+  local pid
+  for pid in "${BOUNDARY_PIDS[@]}"; do
+    [ "$pid" = "$1" ] && return 0
+  done
+  return 1
+}
+
+pids_for_target() {
+  local comm=$1 token=${2:-} pid command
+  TARGET_PIDS=()
+  for pid in $(pgrep -x "$comm" 2>/dev/null); do
+    command=$(process_command "$pid") || continue
+    if [ -n "$token" ]; then
+      case "$command" in *"$token"*) ;; *) continue ;; esac
+    fi
+    TARGET_PIDS+=("$pid")
+  done
+}
+
+select_process_targets() {
+  if [ "$CAP_ONLY" = flea ]; then
+    PROCESS_TARGETS=("qs|$FLEA_UI" "flea|")
+  elif [ -n "$CAP_ONLY" ]; then
+    PROCESS_TARGETS=("$CAP_ONLY|")
+  else
+    PROCESS_TARGETS=(
+      "qs|$FLEA_UI" "flea|" "nautilus|" "thunar|" "pcmanfm|" "nemo|"
+      "dolphin|" "strata|" "tumblerd|"
+    )
+  fi
+}
+
+owned_recorded() {
+  local owned_pid
+  for owned_pid in "${OWNED_PIDS[@]}"; do
+    [ "$owned_pid" = "$1" ] && return 0
+  done
+  return 1
+}
+
+remember_owned_pid() {
+  local pid=$1
+  case "$pid" in *[!0-9]*|'') return 1 ;; esac
+  boundary_contains "$pid" || return 1
+  process_identity "$pid" || return 1
+  if owned_recorded "$pid"; then
+    [ "${OWNED_STARTS[$pid]}" = "$PROCESS_START" ]
+    return
+  fi
+  OWNED_PIDS+=("$pid")
+  OWNED_STARTS[$pid]=$PROCESS_START
+}
+
+owned_matches() {
+  local pid=$1
+  [ -n "${OWNED_STARTS[$pid]:-}" ] || return 1
+  owned_unit_active || return 1
+  read_boundary_pids || return 1
+  boundary_contains "$pid" || return 1
+  process_identity "$pid" || return 1
+  [ "$PROCESS_START" = "${OWNED_STARTS[$pid]}" ]
+}
+
+capture_owned_boundary() {
+  local pid owned_pid
+  [ -n "$OWNED_UNIT" ] || return 0
+  owned_unit_active || return 1
+  read_boundary_pids || return 1
+  boundary_contains "$OWNED_ROOT_PID" || return 1
+  for pid in "${BOUNDARY_PIDS[@]}"; do
+    remember_owned_pid "$pid" || return 1
+  done
+  for owned_pid in "${OWNED_PIDS[@]}"; do
+    process_identity "$owned_pid" || continue
+    [ "$PROCESS_START" = "${OWNED_STARTS[$owned_pid]}" ] || return 1
+    case "$PROCESS_STATE" in Z*) continue ;; esac
+    boundary_contains "$owned_pid" || return 1
+  done
+  OWNED_BOUNDARY_VERIFIED=yes
+}
+
+owned_alive() {
+  owned_matches "$1" || return 1
+  case "$PROCESS_STATE" in Z*) return 1 ;; esac
+  return 0
+}
+
+require_no_foreign_processes() {
+  local row comm token pid command found=0
+  for row in "${PROCESS_TARGETS[@]}"; do
+    IFS='|' read -r comm token <<< "$row"
+    pids_for_target "$comm" "$token"
+    for pid in "${TARGET_PIDS[@]}"; do
+      owned_matches "$pid" && continue
+      command=$(process_command "$pid")
+      printf 'REFUSED: pid %s is not owned by this capability run: %s\n' "$pid" "$command" >&2
+      found=1
+    done
+  done
+  [ "$found" -eq 0 ]
+}
+
+start_unit_boundary() {
+  local unit=$1 cmd=$2
+  systemd-run --user --quiet --collect "--unit=$unit" \
+    --property=Type=exec --property=KillMode=control-group --property=Delegate=no \
+    --property=SendSIGKILL=yes --property=TimeoutStopSec=10s -- \
+    /bin/bash -c '
+      /bin/bash -c "$1" >/dev/null 2>&1 &
+      entrant_pid=$!
+      wait "$entrant_pid" 2>/dev/null || true
+      exec /usr/bin/sleep infinity
+    ' flea-capability-guardian "$cmd"
+}
+
+start_owned_entrant() {
+  local cmd=$1 unit launch_polls=100 poll_s=0.01
+  OWNED_PIDS=()
+  BOUNDARY_PIDS=()
+  OWNED_STARTS=()
+  OWNED_ROOT_PID=
+  OWNED_UNIT=
+  OWNED_BOUNDARY_VERIFIED=no
+  OWNED_UNIT_INVOCATION=
+  OWNED_CONTROL_GROUP=
+  OWNED_UNIT_SEQUENCE=$(( OWNED_UNIT_SEQUENCE + 1 ))
+  unit="flea-capability-${BASHPID}-${OWNED_UNIT_SEQUENCE}.service"
+  unit_name_available "$unit" \
+    || fail "the capability unit $unit already exists or could not be enumerated"
+  start_unit_boundary "$unit" "$cmd" \
+    || fail "the capability unit $unit could not start"
+  OWNED_UNIT=$unit
+  while [ "$launch_polls" -gt 0 ]; do
+    if read_unit_properties "$OWNED_UNIT" \
+      && [ "$UNIT_LOAD_STATE" = loaded ] \
+      && [ "$UNIT_ACTIVE_STATE" = active ] \
+      && [ "$UNIT_SUB_STATE" = running ] \
+      && [ "$UNIT_KILL_MODE" = control-group ] \
+      && [ -n "$UNIT_INVOCATION" ] \
+      && [ -n "$UNIT_CONTROL_GROUP" ] \
+      && [ "${UNIT_MAIN_PID:-0}" -gt 0 ]; then
+      OWNED_ROOT_PID=$UNIT_MAIN_PID
+      OWNED_UNIT_INVOCATION=$UNIT_INVOCATION
+      OWNED_CONTROL_GROUP=$UNIT_CONTROL_GROUP
+      capture_owned_boundary || break
+      return 0
+    fi
+    sleep "$poll_s"
+    launch_polls=$(( launch_polls - 1 ))
+  done
+  fail "the capability unit $OWNED_UNIT did not expose its verified control-group boundary"
+}
+
+stop_unit_boundary() {
+  systemctl --user stop "$1"
+}
+
+owned_unit_stopped() {
+  read_unit_properties "$OWNED_UNIT" || return 1
+  [ "$UNIT_LOAD_STATE" = not-found ] && return 0
+  [ "$UNIT_INVOCATION" = "$OWNED_UNIT_INVOCATION" ] \
+    && [ "$UNIT_ACTIVE_STATE" = inactive ] \
+    && [ "${UNIT_MAIN_PID:-0}" -eq 0 ]
+}
+
+owned_boundary_empty() {
+  local cgroup_file
+  cgroup_file="/sys/fs/cgroup$OWNED_CONTROL_GROUP/cgroup.procs"
+  [ ! -e "$cgroup_file" ] && return 0
+  read_boundary_pids || return 1
+  [ "${#BOUNDARY_PIDS[@]}" -eq 0 ]
+}
+
+# A stopped unit's members may still read as running under load, so the stop path polls this long.
+OWNED_STOP_DRAIN_S=2
+
+stop_owned_entrants() {
+  local pid poll_s=0.05 boundary_status=0 drain_end drain_pid drain_state
+  [ -n "$OWNED_UNIT" ] || return 0
+  if ! capture_owned_boundary; then
+    [ "$OWNED_BOUNDARY_VERIFIED" = no ] || return 1
+    boundary_status=1
+  fi
+  stop_unit_boundary "$OWNED_UNIT" || return 1
+  owned_unit_stopped || return 1
+  if [ -n "$OWNED_CONTROL_GROUP" ]; then
+    drain_end=$(( SECONDS + ${OWNED_STOP_DRAIN_S:-2} ))
+    while ! owned_boundary_empty; do
+      [ "$SECONDS" -ge "$drain_end" ] && break
+      sleep "$poll_s"
+    done
+    if ! owned_boundary_empty; then
+      read_boundary_pids 2>/dev/null || true
+      drain_pid=${BOUNDARY_PIDS[0]:-unknown}
+      drain_state=unknown
+      process_identity "$drain_pid" 2>/dev/null && drain_state=$PROCESS_STATE
+      printf 'FAIL: capability unit %s still holds pid %s in state %s after a %ss drain\n' "$OWNED_UNIT" "$drain_pid" "$drain_state" "${OWNED_STOP_DRAIN_S:-2}" >&2
+      return 1
+    fi
+  fi
+  sleep "$poll_s"
+  for pid in "${OWNED_PIDS[@]}"; do
+    process_identity "$pid" || continue
+    [ "$PROCESS_START" = "${OWNED_STARTS[$pid]}" ] \
+      && { printf 'FAIL: capability unit %s left owned pid %s alive after control-group cleanup\n' "$OWNED_UNIT" "$pid" >&2; return 1; }
+  done
+  OWNED_PIDS=()
+  BOUNDARY_PIDS=()
+  OWNED_STARTS=()
+  OWNED_ROOT_PID=
+  OWNED_UNIT=
+  OWNED_BOUNDARY_VERIFIED=no
+  OWNED_UNIT_INVOCATION=
+  OWNED_CONTROL_GROUP=
+  [ "$boundary_status" -eq 0 ]
+}
+
+kill_entrants() {
+  local foreign_status=0 stop_status=0
+  capture_owned_boundary || foreign_status=1
+  require_no_foreign_processes || foreign_status=1
+  stop_owned_entrants || stop_status=1
+  [ "$foreign_status" -ne 0 ] || require_no_foreign_processes || foreign_status=1
+  [ "$foreign_status" -eq 0 ] && [ "$stop_status" -eq 0 ]
+}
+
+remember_watch() {
+  local pid=$1
+  process_identity "$pid" || return 1
+  WATCH_PIDS+=("$pid")
+  WATCH_STARTS[$pid]=$PROCESS_START
+}
+
+watch_owned() {
+  local pid=$1
+  [ -n "${WATCH_STARTS[$pid]:-}" ] || return 1
+  process_identity "$pid" || return 1
+  [ "$PROCESS_START" = "${WATCH_STARTS[$pid]}" ]
+}
+
+stop_watches() {
+  local pid
+  for pid in "${WATCH_PIDS[@]}"; do
+    if watch_owned "$pid"; then
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+    fi
+    unset 'WATCH_STARTS[$pid]'
+  done
+  WATCH_PIDS=()
+}
+
+require_flea_enumeration() {
+  local shells status=0
+  shells=$(qs list --all 2>/dev/null) || status=$?
+  [ "$status" -eq 0 ] \
+    || { printf 'REFUSED: qs list --all failed with status %s\n' "$status" >&2; return 1; }
+  case "$shells" in
+    *"Shell ID: flea"*) printf 'REFUSED: a Flea instance already owns the display\n' >&2; return 1 ;;
+  esac
+}
+
+cap_terminate() {
+  local status=$1
+  trap - EXIT INT TERM
+  cap_cleanup
+  exit "$status"
+}
+
+# The operator's real cache, parked for the duration. A private XDG_CACHE_HOME was the first shape
+# of this and it was WRONG: thunar thumbnails through tumblerd, which is D-Bus activated and runs
+# with the session's own environment, so it wrote to the real cache and this tool reported thunar as
+# capable of nothing. An entrant's own thumbnailer is not always its own process.
+THUMBS="$HOME/.cache/thumbnails"
+sandbox_cache_require "$THUMBS"
+THUMBS_PARKED_PREFIX="$HOME/.cache/thumbnails-parked-"
+THUMBS_PARKED="$THUMBS_PARKED_PREFIX$$"
+sandbox_cache_require "$THUMBS_PARKED"
+THUMBS_PARKED_OK=no
+
+# The same three functions the field bench uses, because their safety properties are proven there.
+park_thumbs() {
+  local orphan
+  for orphan in "$THUMBS_PARKED_PREFIX"*; do
+    [ -e "$orphan" ] || continue
+    fail "$orphan was parked by an invocation that was killed before its restore ran, the operator's own cache may be inside it, so this run will not park on top of it"
+  done
+  if [ -d "$THUMBS" ]; then
+    mv "$THUMBS" "$THUMBS_PARKED" || fail "could not park $THUMBS"
+  fi
+  THUMBS_PARKED_OK=yes
+}
+drop_thumbs() {
+  [ "$THUMBS_PARKED_OK" = yes ] || fail "drop_thumbs ran before park_thumbs"
+  rm -rf "$THUMBS"
+  mkdir -p "$THUMBS/large" "$THUMBS/fail"
+  local d
+  for d in "$THUMBS"/*/; do
+    [ "$(ls -A "$d" | wc -l)" = 0 ] || fail "the scratch thumbnail cache is not empty at the start: $d"
+  done
+}
+restore_thumbs() {
+  [ "$THUMBS_PARKED_OK" = yes ] || return 0
+  rm -rf "$THUMBS"
+  [ -e "$THUMBS" ] && fail "$THUMBS was recreated under the restore, refusing to bury $THUMBS_PARKED"
+  if [ -d "$THUMBS_PARKED" ]; then
+    mv -T "$THUMBS_PARKED" "$THUMBS" || fail "could not restore $THUMBS_PARKED to $THUMBS, so the operator's cache is still parked there"
+  fi
+  THUMBS_PARKED_OK=no
+}
+
+[ -d "$MEDIA" ] || fail "no media fixture at $MEDIA to take sample files from"
+[ -x "$FLEA_BIN" ] || fail "$FLEA_BIN is missing, so run cargo build --release first"
+select_process_targets
+if [ -z "$CAP_ONLY" ] || [ "$CAP_ONLY" = flea ]; then
+  require_flea_enumeration || fail "Flea display ownership could not be established"
+fi
+kill_entrants || fail "a capability entrant already runs or appeared outside this run, so its evidence is not attributable"
+
+# The operator's cache comes back first and the sandbox goes second: the cache is theirs and the
+# sandbox is ours.
+cap_cleanup() {
+  stop_watches
+  stop_owned_entrants
+  restore_thumbs
+  sandbox_remove "$SB"
+}
+sandbox_make "$SB"
+trap 'cap_cleanup' EXIT
+trap 'cap_terminate 130' INT
+trap 'cap_terminate 143' TERM
+# A transient entrant is measured by live watch and never writes this cache, so a run for it alone
+# has no reason to move the operator's real one out from under whatever else is on screen.
+if [ "$CAP_ONLY" != "$TRANSIENT_ID" ]; then
+  park_thumbs
+fi
+
+FIXTURE="$SB/files"
+mkdir -p "$FIXTURE" || fail "could not make $FIXTURE"
+# Flea's state is a sandbox copy of the operator's, as tools/flea-field-bench makes one: name sort forced, nothing written back.
+FLEA_STATE="$SB/flea-state"
+mkdir -p "$FLEA_STATE/flea" || fail "could not make $FLEA_STATE/flea"
+operator_ui="${XDG_STATE_HOME:-$HOME/.local/state}/flea/ui.json"
+if [ -f "$operator_ui" ]; then
+  cp "$operator_ui" "$FLEA_STATE/flea/ui.json" || fail "could not copy $operator_ui"
+fi
+XDG_STATE_HOME="$FLEA_STATE" "$FLEA_BIN" --ui-state '{"sort":{"key":"name","reverse":false}}' >/dev/null \
+  || fail "flea --ui-state refused to set name sort in the capability pass's copy of $operator_ui"
+
+# One file per format the media fixture holds, taken from the fixture itself so the samples are the
+# same bytes the field bench uses rather than something generated here.
+formats=""
+for ext in jpg png webp heic mp4 webm mkv txt; do
+  src=$(ls -U "$MEDIA" | grep "\.$ext\$" | head -1)
+  if [ -z "$src" ]; then
+    printf 'SKIP: the media fixture holds no .%s, so that format is not tested\n' "$ext" >&2
+    continue
+  fi
+  cp "$MEDIA/$src" "$FIXTURE/sample.$ext" || fail "could not copy $src"
+  formats="${formats:+$formats }$ext"
+done
+[ -n "$formats" ] || fail "no sample files were copied, so there is nothing to test"
+
+MAP="$SB/fixture.map"
+"$FLEA_REPO/tools/flea-bench-keys" map "$FIXTURE" "$MAP" || fail "the key map did not build"
+
+# Every key in the cache, minus the failure markers, which are their own answer.
+cap_keys() {
+  local out=$1
+  find "$THUMBS" -type f -name '*.png' -not -path "$THUMBS/fail/*" -printf '%f\n' 2>/dev/null \
+    | sed 's/\.png$//' | LC_ALL=C sort -u > "$out"
+}
+cap_fail_keys() {
+  local out=$1
+  find "$THUMBS/fail" -type f -name '*.png' -printf '%f\n' 2>/dev/null \
+    | sed 's/\.png$//' | LC_ALL=C sort -u > "$out"
+}
+
+# One directory per format holding exactly one file, so a render can only be that format's, and one
+# short run each. Counting a single mixed directory would say how many renders happened and never
+# which format earned them, because the scratch directory is named by a counter and not by the file.
+cap_transient() {
+  local id=$1 cmd=$2 ext dir n can="" cannot="" raw="" watch_pid log pids
+  log="$SB/$id.transient"
+  for ext in $formats; do
+    dir="$SB/fmt-$ext"
+    mkdir -p "$dir" || fail "could not make $dir"
+    cp "$FIXTURE/sample.$ext" "$dir/sample.$ext" || fail "could not copy the $ext sample"
+
+    : > "$log"
+    inotifywait -m -q -r -e close_write --format '%w%f' /tmp > "$log" 2>/dev/null &
+    watch_pid=$!
+    remember_watch "$watch_pid" || fail "the $id $ext render watch exited before this run recorded it"
+    sleep 2
+    watch_owned "$watch_pid" || fail "the $id $ext render watch died before the entrant launched"
+    # The entrant's own launch line, pointed at this format's directory rather than the mixed one.
+    start_owned_entrant "${cmd//$FIXTURE/$dir}"
+    sleep "$CAP_TIMEOUT_S"
+    capture_owned_boundary \
+      || fail "the $id $ext capability unit changed identity, so no result from it is attributable"
+    watch_owned "$watch_pid" || fail "the $id $ext render watch died during the capability window"
+    require_no_foreign_processes \
+      || fail "an unowned process appeared during the $id $ext capability window, so no result from it is attributable"
+
+    n=$(grep -c "^${TRANSIENT_PREFIX}[0-9]*-[0-9]*/result\.png\$" "$log")
+    # Two entrant processes in one window would let one format's renders be counted for another.
+    pids=$(grep -o "^${TRANSIENT_PREFIX}[0-9]*" "$log" | LC_ALL=C sort -u | wc -l)
+    [ "$pids" -le 1 ] || fail "$pids $id processes wrote renders during the $ext window, so no count from it is attributable"
+    stop_watches
+    kill_entrants \
+      || fail "an unowned process appeared during the $id $ext cleanup, so no result from it is attributable"
+    sleep 2
+
+    raw="${raw:+$raw;}$ext=$n"
+    if [ "$n" -gt 0 ]; then can="${can:+$can, }$ext"; else cannot="${cannot:+$cannot, }$ext"; fi
+  done
+  {
+    printf -- '- **%s** thumbnails %s\n' "$id" "${can:-nothing}"
+    printf -- '  - cannot produce: %s\n' "${cannot:-nothing, it did all of them}"
+    printf -- '  - raw: rendered `%s`; counted live, one format at a time, %ss each\n' "$raw" "$CAP_TIMEOUT_S"
+    printf -- '  - **measured by live watch, not by cache count.** This entrant writes each thumbnail\n'
+    printf -- '    to a scratch directory it deletes immediately, so it persists nothing a cache count\n'
+    printf -- '    can see and a cache count reports it as capable of nothing.\n'
+  } >> "$OUT"
+  printf '%-10s can %s | cannot %s (live watch)\n' "$id" "${can:-nothing}" "${cannot:-nothing}"
+}
+
+repo_sha=$(git -C "$FLEA_REPO" rev-parse --short HEAD 2>/dev/null || printf unknown)
+repo_state=clean
+[ -z "$(git -C "$FLEA_REPO" status --porcelain -- src ui tests tools packaging Cargo.toml Cargo.lock PKGBUILD 2>/dev/null)" ] || repo_state=DIRTY
+binary_size=$(stat -c %s "$FLEA_BIN")
+binary_sha=$(sha256sum "$FLEA_BIN" | cut -d' ' -f1)
+instrument_sha=$(sha256sum "$FLEA_REPO/tools/flea-bench-capability" | cut -d' ' -f1)
+
+mkdir -p "$(dirname "$OUT")"
+{
+  echo "# What each GUI entrant can actually thumbnail"
+  echo
+  echo "Written by tools/flea-bench-capability on $(date -Is). Eight files, one per format, a"
+  echo "private cache per entrant, and $CAP_TIMEOUT_S seconds each. **Nothing here is ranked and no"
+  echo "timing is taken.** The field bench's format column answers a different question, how far an"
+  echo "entrant got through a 2000-file directory whose names sort by format, and it was being read"
+  echo "as this one."
+  echo
+  printf 'Source: `%s` (%s); release binary: `%s` bytes, SHA-256 `%s`.\n' \
+    "$repo_sha" "$repo_state" "$binary_size" "$binary_sha"
+  printf 'Capability instrument SHA-256: `%s`.\n' "$instrument_sha"
+  echo
+  echo "Formats offered: $formats"
+  echo
+} > "$OUT"
+
+# Sample input, one row of the field bench's ENTRANTS table: "strata|gui|io.github.lgse.Strata|strata||||setsid nohup $STRATA_BIN $FIXTURE"
+# corner: one multi-statement sed expands the five variables the bench's command field uses, rather than five processes.
+mapfile -t CAP_ROWS < <(sed -n '/^  declare -ga ENTRANTS=(/,/^  )/p' "$FLEA_REPO/tools/flea-field-bench" \
+  | grep '^    "' | tr -d '"' \
+  | sed "s|\$FIXTURE|$FIXTURE|g; s|\$FLEA_UI|$FLEA_UI|g; s|\$FLEA_BIN|$FLEA_BIN|g; s|\$STRATA_BIN|$STRATA_BIN|g; s|\$FLEA_STATE|$FLEA_STATE|g")
+[ ${#CAP_ROWS[@]} -gt 0 ] || fail "no entrant rows were read out of tools/flea-field-bench"
+
+# The rows were read whole above, because an entrant reading stdin would eat the next row.
+for cap_row in "${CAP_ROWS[@]}"; do
+  IFS='|' read -r id kind class comm token helper_comm helper_token cmd <<< "$cap_row"
+  id=${id//[[:space:]]/}
+  [ "$kind" = gui ] || continue
+  # A variable the bench table gained and this pass does not expand would run empty, so it stops the pass instead.
+  case $cmd in *'$'*) fail "entrant $id's command still names an unexpanded variable: $cmd" ;; esac
+  [ -z "$CAP_ONLY" ] || [ "$id" = "$CAP_ONLY" ] || continue
+  if [ "$id" = strata ]; then
+    [ -x "$STRATA_BIN" ] || { printf 'SKIP: strata is not built at %s\n' "$STRATA_BIN" >&2; continue; }
+  else
+    command -v "$comm" >/dev/null 2>&1 || { printf 'SKIP: %s is not installed\n' "$id" >&2; continue; }
+  fi
+
+  if [ "$id" = "$TRANSIENT_ID" ]; then
+    cap_transient "$id" "$cmd"
+    continue
+  fi
+
+  # Cold for every entrant, and the parked cache means none of this is the operator's.
+  drop_thumbs
+  start_owned_entrant "$cmd"
+
+  # Every entrant gets the whole timeout, with no early stop. Stopping once the count went quiet
+  # for a few seconds was the first shape and it is the wrong bound for a capability question:
+  # pcmanfm and nemo were cut off at 8 and 7 seconds and reported as unable to produce formats they
+  # were never given time to reach. A capability pass is patient by definition.
+  produced="$SB/$id.keys"
+  : > "$produced"
+  last_n=0
+  last_change=0
+  waited=0
+  while [ "$waited" -lt "$CAP_TIMEOUT_S" ]; do
+    sleep 1
+    waited=$(( waited + 1 ))
+    capture_owned_boundary \
+      || fail "the $id capability unit changed identity, so no result from it is attributable"
+    require_no_foreign_processes \
+      || fail "an unowned process appeared during the $id capability window, so no result from it is attributable"
+    cap_keys "$produced"
+    n=$(wc -l < "$produced")
+    if [ "$n" != "$last_n" ]; then
+      last_n=$n
+      last_change=$waited
+    fi
+  done
+  cap_fail_keys "$SB/$id.fail.keys"
+
+  made=$("$FLEA_REPO/tools/flea-bench-keys" classify "$MAP" "$produced")
+  refused=$("$FLEA_REPO/tools/flea-bench-keys" classify "$MAP" "$SB/$id.fail.keys")
+  can=""
+  cannot=""
+  for ext in $formats; do
+    got=$(printf '%s\n' "$made" | tr ';' '\n' | grep "^$ext=" | cut -d= -f2)
+    if [ "${got:-0}" -gt 0 ]; then
+      can="${can:+$can, }$ext"
+    else
+      cannot="${cannot:+$cannot, }$ext"
+    fi
+  done
+  # An entrant that left neither a thumbnail nor a refusal marker never touched this cache at all,
+  # and "thumbnails nothing" is then a claim about the instrument rather than about the entrant.
+  # strata drew all six formats it supports while reporting exactly this, for a whole release.
+  if [ ! -s "$produced" ] && [ ! -s "$SB/$id.fail.keys" ]; then
+    {
+      printf -- '- **%s** left this cache untouched, so it is **not measured** here\n' "$id"
+      printf -- '  - neither a thumbnail nor a refusal marker was written in %ss, which is what an\n' "$CAP_TIMEOUT_S"
+      printf -- '    entrant that keeps its thumbnails in memory looks like to a cache count.\n'
+      printf -- '    Add it to TRANSIENT_ID to measure it by live watch instead.\n'
+    } >> "$OUT"
+    printf '%-10s NOT MEASURED, it left the cache untouched\n' "$id"
+    kill_entrants \
+      || fail "an unowned process appeared during the $id cleanup, so no result from it is attributable"
+    sleep 2
+    continue
+  fi
+  {
+    printf -- '- **%s** thumbnails %s\n' "$id" "${can:-nothing}"
+    printf -- '  - cannot produce: %s\n' "${cannot:-nothing, it did all eight}"
+    printf -- '  - raw: produced `%s`, refused `%s`; last new thumbnail at %ss of %ss\n' \
+      "$made" "$refused" "$last_change" "$CAP_TIMEOUT_S"
+  } >> "$OUT"
+  printf '%-10s can %s | cannot %s\n' "$id" "${can:-nothing}" "${cannot:-nothing}"
+
+  kill_entrants \
+    || fail "an unowned process appeared during the $id cleanup, so no result from it is attributable"
+  sleep 2
+done
+
+kill_entrants \
+  || fail "an unowned process appeared before the capability report closed, so its evidence is not attributable"
+restore_thumbs
+
+{
+  echo
+  echo "**txt is the control.** No thumbnailer draws a text file, so an entrant that claims one here"
+  echo "is a broken measurement rather than a capable entrant."
+} >> "$OUT"
+
+echo "capability report: $OUT"

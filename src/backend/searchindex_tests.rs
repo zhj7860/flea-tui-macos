@@ -1,0 +1,186 @@
+use super::*;
+use crate::backend::searchwalk::{walk, WalkProbes};
+use crate::backend::testdir::TestDir;
+
+// Hard rule 9: every path below is inside a sandbox TestDir made and removes itself.
+fn root(d: &TestDir) -> &std::path::Path {
+    d.path()
+}
+
+#[test]
+fn a_local_walk_indexes_every_row_with_one_mountinfo_read() {
+    crate::backend::mountinfo::test_reset();
+    let d = TestDir::new("sessionwalk");
+    d.dir("tools/benches");
+    d.file("tools/benches/bench-run.sh", "");
+    d.file("unrelated.txt", "");
+    let body = crate::backend::mountinfo::read_body();
+    let probes = WalkProbes::new();
+    let (index, dirs) = walk(root(&d), false, false, &body, &probes);
+    assert_eq!(dirs, 3, "the scope, tools and tools/benches over 3 directories walked");
+    assert_eq!(index.len(), 4, "4 rows indexed over 3 directories walked");
+    assert_eq!(crate::backend::mountinfo::test_reads(), 1, "1 mountinfo read over 3 directories walked");
+}
+
+#[test]
+fn a_local_walk_takes_no_bound_call() {
+    crate::backend::iomount::test_reset();
+    let d = TestDir::new("sessionbound");
+    d.dir("sub");
+    d.file("sub/bench.txt", "");
+    let body = crate::backend::mountinfo::read_body();
+    let probes = WalkProbes::new();
+    let (index, _) = walk(root(&d), false, false, &body, &probes);
+    assert_eq!(index.len(), 2, "2 rows indexed over 1 directory walked");
+    assert_eq!(crate::backend::iomount::test_calls(), 0, "0 bound calls over 1 directory walked");
+}
+
+// A name that changed kind between two patches is a new entry: a folder now a file keeps no rows below it, a file now a folder is walked.
+#[test]
+fn a_patch_follows_a_name_that_changed_kind() {
+    let d = TestDir::new("sessionkind");
+    d.file("was-dir", "");
+    d.dir("was-file");
+    d.file("was-file/new.txt", "");
+    d.dir("same");
+    d.file("same/in.txt", "");
+    let mut index = Index::new();
+    for (path, is_dir) in [("was-dir", true), ("was-dir/inner.txt", false), ("was-file", false), ("same", true), ("same/in.txt", false)] {
+        index.push(path, is_dir);
+    }
+    assert!(index.patch_dir(root(&d), std::path::Path::new(""), false, &crate::backend::mountinfo::read_body()), "a local scope answers its patch");
+    let mut rows: Vec<(&str, bool)> = (0..index.len()).map(|row| (index.path(row), index.is_dir(row))).collect();
+    rows.sort();
+    assert_eq!(rows, [("same", true), ("same/in.txt", false), ("was-dir", false), ("was-file", true), ("was-file/new.txt", false)]);
+}
+
+// A patch that drops two children ahead of a deeper row keeps every surviving row and drops only the gone ones.
+#[test]
+fn a_patch_dropping_two_children_keeps_the_rows_after_them() {
+    let d = TestDir::new("sessionpatch");
+    d.file("c.txt", "");
+    d.dir("sub");
+    d.file("sub/x.txt", "");
+    let mut index = Index::new();
+    for (path, is_dir) in [("a.txt", false), ("b.txt", false), ("c.txt", false), ("sub", true), ("sub/x.txt", false)] {
+        index.push(path, is_dir);
+    }
+    assert!(index.patch_dir(root(&d), std::path::Path::new(""), false, &crate::backend::mountinfo::read_body()), "a local scope answers its patch");
+    let mut paths: Vec<&str> = (0..index.len()).map(|row| index.path(row)).collect();
+    paths.sort();
+    assert_eq!(paths, ["c.txt", "sub", "sub/x.txt"], "a.txt and b.txt gone, sub/x.txt kept");
+}
+
+#[cfg(test)]
+mod cap_tests {
+use super::*;
+
+// Past the cap the walk stops adding and the count stands.
+#[test]
+fn an_index_past_the_cap_stops_adding() {
+    let mut index = Index::new();
+    for i in 0..SESSION_MAX_ENTRIES + 1 {
+        index.push(format!("f{}", i), false);
+    }
+    assert_eq!(index.len(), SESSION_MAX_ENTRIES, "the index holds {} rows", index.len());
+    assert!(index.capped, "the cap marks the index it stopped");
+}
+}
+
+// Diagnostic only, never a gate: one full-index score over 100k synthetic realistic paths prints its ms.
+#[test]
+fn full_index_score_prints_its_ms() {
+    let mut index = Index::new();
+    for i in 0..100_000 {
+        index.push(
+            format!("some_directory_name_{:03}/nested_subdir/report_final_draft_v{:05}_reviewed.txt", i % 200, i),
+            false,
+        );
+    }
+    assert_eq!(index.len(), 100_000, "100000 synthetic rows indexed");
+    let fuzzy = crate::backend::fuzzy::Fuzzy::new("report");
+    let rows: Vec<usize> = (0..index.len()).collect();
+    let started = std::time::Instant::now();
+    let hits = super::score_all(&fuzzy, &rows, &index);
+    let ms = started.elapsed().as_secs_f64() * 1000.0;
+    let bytes = super::index_bytes(&index);
+    eprintln!("TIMING full-index score: {} rows scored, {} hits, {:.1} ms", rows.len(), hits.len(), ms);
+    eprintln!("TIMING index: {} bytes over {} rows, {} bytes per entry", bytes, index.len(), bytes / index.len());
+}
+
+// Every row path in the arena, in arena order.
+fn paths_of(s: &crate::backend::searchsession::Session) -> Vec<String> {
+    let index = s.index.lock().unwrap();
+    (0..index.len()).map(|row| index.path(row).to_string()).collect()
+}
+
+#[test]
+fn a_patch_that_drops_two_rows_keeps_the_survivor_and_repacks_once() {
+    let d = TestDir::new("patchdrop");
+    let a = d.file("a.txt", "");
+    d.file("b.txt", "");
+    let c = d.file("c.txt", "");
+    let scope = d.path().to_str().expect("utf-8").to_string();
+    let mut s = crate::backend::searchsession::Session::open_sync(&scope, &scope, false);
+    assert_eq!(s.indexed(), 3, "3 rows indexed over 1 directory walked");
+    d.assert_contains(&a);
+    std::fs::remove_file(&a).expect("test sandbox remove");
+    d.assert_contains(&c);
+    std::fs::remove_file(&c).expect("test sandbox remove");
+    s.index.lock().unwrap().compactions = 0;
+    assert!(s.patch_open_dir(d.path()), "the scope itself is under the scope");
+    assert_eq!(paths_of(&s), vec!["b.txt".to_string()], "the survivor stays after 2 of 3 rows drop");
+    assert_eq!(s.index.lock().unwrap().compactions, 1, "1 arena repack for 2 rows dropped");
+}
+
+#[test]
+fn a_patch_reads_each_row_a_bounded_number_of_times() {
+    let d = TestDir::new("patchscan");
+    d.dir("other");
+    d.dir("inbox");
+    for i in 0..2000 {
+        d.file(&format!("other/f{:04}.txt", i), "");
+    }
+    let scope = d.path().to_str().expect("utf-8").to_string();
+    let mut s = crate::backend::searchsession::Session::open_sync(&scope, &scope, false);
+    let before = s.indexed();
+    assert_eq!(before, 2002, "2 directories and 2000 files indexed");
+    d.dir("inbox/moved");
+    for i in 0..200 {
+        d.file(&format!("inbox/moved/m{:03}.txt", i), "");
+    }
+    s.index.lock().unwrap().scanned.store(0, std::sync::atomic::Ordering::Relaxed);
+    assert!(s.patch_after_write(&d.join("inbox/moved")), "the moved tree is under the scope");
+    let after = s.indexed();
+    assert_eq!(after, before + 201, "the moved directory and its 200 files land whole");
+    let scanned = s.index.lock().unwrap().scanned.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(scanned <= 3 * after, "{} row reads for a {} row index, at most {}", scanned, after, 3 * after);
+}
+
+#[test]
+fn a_patch_on_a_stuck_mount_reads_nothing_and_leaves_the_index() {
+    let d = TestDir::new("patchstuck");
+    d.file("bench.txt", "");
+    let scope = d.path().to_str().expect("utf-8").to_string();
+    let mut s = crate::backend::searchsession::Session::open_sync(&scope, &scope, false);
+    let mount = crate::backend::iomount::mount_key(d.path(), &crate::backend::mountinfo::read_body());
+    let _stuck = crate::backend::iomount::test_hold_stuck(mount);
+    crate::backend::iomount::test_reset();
+    let added = d.file("bench-stuck.txt", "");
+    assert!(!s.patch_open_dir(d.path()), "a stuck mount patches nothing from the watch");
+    assert!(!s.patch_after_write(&added), "a stuck mount patches nothing after a write");
+    assert_eq!(paths_of(&s), vec!["bench.txt".to_string()], "the index stands while the mount is stuck");
+    assert!(crate::backend::iomount::test_calls() >= 2, "each patch goes through the bound");
+}
+
+#[test]
+fn a_panic_in_a_scoring_thread_reaches_the_caller() {
+    let mut index = Index::new();
+    for i in 0..PARALLEL_SCORE_AT + 50 {
+        index.push(format!("report_{:05}.txt", i), false);
+    }
+    let fuzzy = crate::backend::fuzzy::Fuzzy::new("report");
+    let rows: Vec<usize> = (0..index.len()).chain([index.len() + 5]).collect();
+    let scored = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| super::score_all(&fuzzy, &rows, &index)));
+    assert!(scored.is_err(), "a row past the arena panics the caller, never a short answer");
+}

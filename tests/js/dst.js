@@ -1,0 +1,60 @@
+.import "../../ui/js/Format.js" as Format
+
+// Sample input: at(2026, 3, 8, 12, 0, 0) is noon on the spring-forward day in the zone the harness sets.
+function at(y, mo, d, h, mi, s) {
+    return new Date(y, mo - 1, d, h || 0, mi || 0, s || 0).getTime()
+}
+
+function run(check, suite) {
+    if (suite === "edmonton") {
+        runEdmonton(check)
+        return
+    }
+    // America/New_York skips from 01:59 EST to 03:00 EDT on 8 March 2026.
+    check("the hour before spring forward keeps its own wall clock",
+          Format.date(1772951400), "2026-03-08 01:30")
+    check("the first hour after the spring gap keeps its own wall clock",
+          Format.date(1772955000), "2026-03-08 03:30")
+    check("the evening before spring forward keeps the earlier day",
+          Format.date(1772944200), "2026-03-07 23:30")
+
+    // America/New_York repeats 01:00 through 01:59 on 1 November 2026.
+    check("the hour before fall back keeps its own wall clock",
+          Format.date(1793507400), "2026-11-01 00:30")
+    check("the first pass through the repeated hour reads 01:30",
+          Format.date(1793511000), "2026-11-01 01:30")
+    // Two instants an hour apart share one wall clock, which is why every sort is on mtime.
+    check("the second pass through the repeated hour reads 01:30 as well",
+          Format.date(1793514600), "2026-11-01 01:30")
+    check("the evening before fall back keeps the earlier day",
+          Format.date(1793503800), "2026-10-31 23:30")
+
+    // The picker's compact form reads the same local day, because both are the local wall clock.
+    check("the compact form keeps the repeated hour on its own day",
+          Format.compactDate(1793514600), "2026-11-01")
+    check("and puts the evening before on the day before",
+          Format.compactDate(1793503800), "2026-10-31")
+
+    // Format builds midnights from components, so a daylight-saving night arms 23 or 25 hours and still lands on midnight.
+    check("spring forward makes a 23 h day",
+          Format.dayStart(at(2026, 3, 9, 12, 0, 0)) - Format.dayStart(at(2026, 3, 8, 12, 0, 0)), 23 * 60 * 60 * 1000)
+    check("fall back makes a 25 h day",
+          Format.dayStart(at(2026, 11, 2, 12, 0, 0)) - Format.dayStart(at(2026, 11, 1, 12, 0, 0)), 25 * 60 * 60 * 1000)
+    check("midnight before spring forward arms 23 hours",
+          Format.msUntilMidnight(at(2026, 3, 8, 0, 0, 0)), 23 * 60 * 60 * 1000)
+    check("midnight before fall back arms 25 hours",
+          Format.msUntilMidnight(at(2026, 11, 1, 0, 0, 0)), 25 * 60 * 60 * 1000)
+}
+
+function runEdmonton(check) {
+    // Issue #40 was observed at 23:21 MDT on 3 September 2026: a late-evening file must not advance
+    // into the next day, which is what reading the instant in UTC would have done.
+    check("the reporter's first late-evening file stays on its own day",
+          Format.date(1788499140), "2026-09-03 23:19")
+    check("the reporter's second late-evening file stays on its own day",
+          Format.date(1788498720), "2026-09-03 23:12")
+    check("the reporter's August date does not advance into September",
+          Format.date(1788237660), "2026-08-31 22:41")
+    check("the reporter's older date keeps its local day",
+          Format.date(1787631840), "2026-08-24 22:24")
+}

@@ -1,0 +1,1650 @@
+#!/usr/bin/env python3
+"""Print one README performance table from a field bench run, versions included.
+
+    tools/flea-bench-readme docs/bench/scale-0.3.3-20260923.csv
+    tools/flea-bench-readme docs/bench/single-run-dir
+    tools/flea-bench-readme selftest
+
+Run-dir mode prints the whole Performance section body for a run directory:
+
+    tools/flea-bench-readme section DIR [--search JSONL --search-manifest MANIFEST]
+        [--flea-label LABEL] [--allow-dirty] [--with-anchor] [--docs-stem STEM]
+
+Apply mode copies the run tables beside the stem and swaps the body in:
+
+    tools/flea-bench-readme apply DIR --stem STEM [section options]
+        [--readme PATH] [--docs PATH] [--dry]
+
+Reads the run CSV beside its manifest, medians each GUI entrant over its runs, and prints
+a markdown table with a Version column taken from the manifest, never typed by hand.
+A directory argument holds exactly one CSV; pass a single CSV file when several exist.
+An entrant the manifest does not version prints as unknown and exits 1 at the end.
+"""
+import contextlib
+import csv
+import difflib
+import io
+import json
+import os
+import re
+import shutil
+import sys
+import tempfile
+
+# Markers the harness writes instead of a measurement; dropped before any median.
+MARKERS = ("-", "-1", "n/a", "", "unmeasurable")
+# Raw CSV marker for a run that never settled; ranks later than every real time.
+TIMEOUT = "-1"
+KIB_PER_MIB = 1024
+CENTISECONDS_PER_SECOND = 100
+COLS = ("id", "mapped_ms", "settled_ms", "pss_kb", "cpu_tree_s", "thumbs_n")
+
+
+def die(message, code=1):
+    sys.stderr.write("flea-bench-readme: %s\n" % message)
+    sys.exit(code)
+
+
+def median(vals):
+    vals = sorted(vals)
+    n = len(vals)
+    return vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) // 2
+
+
+# A timeout ranks later than every real reading; other markers drop out as no reading.
+def median_time(entries):
+    numbers = sorted(int(v) for v in entries if v not in MARKERS)
+    timeouts = sum(1 for v in entries if v == TIMEOUT)
+    total = len(numbers) + timeouts
+    if total == 0:
+        return None
+    if total % 2:
+        index = total // 2
+        return numbers[index] if index < len(numbers) else float("inf")
+    upper = total // 2
+    if upper >= len(numbers):
+        return float("inf")
+    return (numbers[upper - 1] + numbers[upper]) // 2
+
+
+def group(n):
+    return "%s" % format(n, ",")
+
+
+# Seconds match the README's existing cells, which format float milliseconds this way.
+def format_seconds(ms):
+    return "%s s" % format(ms / 1000, ".2f")
+
+
+# Nearest tenth of a MiB, the same rounding tools/flea-bench-report uses.
+def format_mib(kb):
+    tenths = (kb * 10 + KIB_PER_MIB // 2) // KIB_PER_MIB
+    return "%d.%d MiB" % (tenths // 10, tenths % 10)
+
+
+# Sample input, a cpu_tree_s cell from matched-0.3.3-20260923.csv: 6.56
+def centiseconds(s):
+    whole, _, frac = s.partition(".")
+    return int(whole) * CENTISECONDS_PER_SECOND + int((frac + "00")[:2])
+
+
+def format_cpu(c):
+    return "%d.%02d s" % (c // CENTISECONDS_PER_SECOND, c % CENTISECONDS_PER_SECOND)
+
+
+def manifest_versions(path):
+    text = open(path, encoding="utf-8").read()
+    start = text.find("## Entrants")
+    block = re.search(r"```\n(.*?)```", text[start:], re.S)
+    if start < 0 or not block:
+        die("no entrant block in %s" % path)
+    kinds, versions = {}, {}
+    for line in block.group(1).splitlines():
+        # Sample manifest entrant line: nautilus   gui  nautilus 50.3.1-1
+        fields = line.split()
+        if len(fields) < 4:
+            continue
+        kinds[fields[0]], versions[fields[0]] = fields[1], fields[3]
+    # Sample manifest denominator line: - thumbnailable denominator: 0, from 100000 visible entries less the 100000 above
+    m = re.search(r"^- thumbnailable denominator: (\d+)", text, re.M)
+    if not m:
+        die("no thumbnailable denominator in %s" % path)
+    return kinds, versions, int(m.group(1)) != 0
+
+
+def display(entry):
+    return "**Flea**" if entry == "flea" else {"pcmanfm": "PCManFM"}.get(entry, entry[:1].upper() + entry[1:])
+
+
+def table(csv_path):
+    if os.path.isdir(csv_path):
+        found = sorted(f for f in os.listdir(csv_path) if f.endswith(".csv"))
+        if len(found) != 1:
+            die("%s holds %d CSV files (%s), pass one of them" % (csv_path, len(found), ", ".join(found)))
+        csv_path = os.path.join(csv_path, found[0])
+    manifest = os.path.splitext(csv_path)[0] + ".manifest.md"
+    if not os.path.isfile(csv_path):
+        die("no results at %s" % csv_path)
+    if not os.path.isfile(manifest):
+        die("no manifest beside the results at %s" % manifest)
+    kinds, versions, thumbs = manifest_versions(manifest)
+    rows = list(csv.DictReader(open(csv_path, encoding="utf-8")))
+    if not rows:
+        die("%s holds no rows" % csv_path)
+    for col in COLS:
+        if col not in rows[0]:
+            die("the CSV header has no '%s' column" % col)
+    rows = counted_only(rows, csv_path)
+    # An entrant the manifest never names still prints, versioned unknown, never dropped silently.
+    ids = sorted({r["id"] for r in rows if kinds.get(r["id"], "gui") == "gui"})
+    if "flea" in ids:
+        ids = ["flea"] + [i for i in ids if i != "flea"]
+    out, unknown = [], []
+    head = "| File manager | Version | First window | Settled | Window PSS | CPU |"
+    align = "|---|---|---:|---:|---:|---:|"
+    if thumbs:
+        head += " Thumbnails |"
+        align += "---:|"
+    out += [head, align]
+    for entry in ids:
+        group_rows = [r for r in rows if r["id"] == entry]
+        ints = lambda c: [int(r[c]) for r in group_rows if r[c] not in MARKERS]
+        mapped_median = median_time([r["mapped_ms"] for r in group_rows])
+        settled_median = median_time([r["settled_ms"] for r in group_rows])
+        pss = ints("pss_kb")
+        cpu = [centiseconds(r["cpu_tree_s"]) for r in group_rows if r["cpu_tree_s"] not in MARKERS]
+        work = ints("thumbs_n")
+        version = versions.get(entry, "unknown")
+        if version == "unknown":
+            unknown.append(entry)
+        if mapped_median is None:
+            mapped_cell = "-"
+        elif mapped_median == float("inf"):
+            mapped_cell = "Timed out"
+        else:
+            mapped_cell = group(mapped_median) + " ms"
+        if settled_median is None:
+            settled_cell = "-"
+        elif settled_median == float("inf"):
+            settled_cell = "Timed out"
+        else:
+            settled_cell = format_seconds(settled_median)
+        cells = [display(entry), version, mapped_cell, settled_cell,
+                 format_mib(median(pss)) if pss else "-", format_cpu(median(cpu)) if cpu else "-"]
+        if thumbs:
+            cells.append("%d" % median(work) if work else "not measured")
+        out.append("| " + " | ".join(cells) + " |")
+    return "\n".join(out) + "\n", unknown
+
+
+# Words the public repo never prints about another app, checked case-insensitively.
+NEUTRAL_RE = re.compile(
+    r"\b(beat|beats|win|wins|won|lose|loses|lost|lead|leads|led|rival|rivals|bracket|"
+    r"fastest|runner-up|behind|ahead)\b|first place|"
+    r"\b(first|second|third|fourth|fifth|sixth|seventh) of\b", re.I)
+
+
+def check_neutral(text):
+    hit = NEUTRAL_RE.search(text)
+    if hit:
+        line = next((l for l in text.splitlines() if hit.group(0).lower() in l.lower()), text[:160])
+        die("output wording check failed: matched '%s' in: %s" % (hit.group(0), line.strip()[:160]))
+
+
+def median_float(vals):
+    vals = sorted(vals)
+    n = len(vals)
+    return vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2
+
+
+def format_search_ms(value):
+    return "%g ms" % value
+
+
+# Fixture facts from the manifest beside each CSV; sample entrant line: flea gui source abc1234 v0.3.9 (clean).
+def manifest_section(path):
+    text = open(path, encoding="utf-8").read()
+    start = text.find("## Entrants")
+    block = re.search(r"```\n(.*?)```", text[start:], re.S)
+    if start < 0 or not block:
+        die("no entrant block in %s" % path)
+    entries = {}
+    for line in block.group(1).splitlines():
+        fields = line.split()
+        if len(fields) < 4:
+            continue
+        entries[fields[0]] = {"kind": fields[1], "fields": fields, "raw": line}
+    m = re.search(r"^- thumbnailable denominator: (\d+)", text, re.M)
+    kind = re.search(r"^- fixture kind: (.+)$", text, re.M)
+    payload = re.search(r"^- fixture payload: (.+)$", text, re.M)
+    date = re.search(r"^- date: (\d{4}-\d{2}-\d{2})", text, re.M)
+    if not m:
+        die("no thumbnailable denominator in %s" % path)
+    if not kind or not payload or not date:
+        die("no fixture kind, payload or date in %s" % path)
+    return {"entries": entries, "thumbs": int(m.group(1)) != 0,
+            "kind": kind.group(1).strip(), "payload": payload.group(1).strip(),
+            "date": date.group(1)}
+
+
+# A DIRTY source tree is not a release number, so the section stops unless allowed.
+def check_dirty(entries, manifest, allow_dirty):
+    if allow_dirty:
+        return
+    for entry in sorted(entries):
+        ent = entries[entry]
+        fields = ent["fields"]
+        if len(fields) > 3 and fields[2] == "source" and "(DIRTY)" in ent["raw"]:
+            die("refusing DIRTY source %s %s in %s, pass --allow-dirty" % (entry, fields[3], manifest))
+
+
+# The anchor tag from its manifest line, e.g. v0.3.8; anything else names the line.
+def anchor_tag(ent):
+    fields = ent["fields"]
+    if len(fields) > 4 and fields[2] == "source":
+        short = fields[4][1:] if fields[4].startswith("v") else fields[4]
+        if re.match(r"^\d+\.\d+", short):
+            return short
+    die("no anchor version in manifest line: %s" % ent["raw"])
+
+
+# The tree version beside the tool, used when the manifest tag is untagged.
+def cargo_path():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(root, "Cargo.toml")
+
+
+# Flea label: explicit flag, else the flea manifest tag, else the tree Cargo.toml with a tree-build suffix.
+def resolve_flea_label(explicit, blocks, cargo_toml):
+    if explicit:
+        return explicit
+    line = "no flea entrant"
+    for tag in sorted(blocks):
+        for side in sorted(blocks[tag]):
+            ent = blocks[tag][side]["info"]["entries"].get("flea")
+            if ent is None:
+                continue
+            line = ent["raw"]
+            fields = ent["fields"]
+            if len(fields) > 4 and fields[2] == "source":
+                short = fields[4][1:] if fields[4].startswith("v") else fields[4]
+                if re.match(r"^\d+\.\d+", short):
+                    return short
+    try:
+        text = open(cargo_toml, encoding="utf-8").read()
+    except OSError:
+        text = ""
+    # Sample input, the Cargo.toml line: version = "0.3.9" answers "0.3.9-tree-build".
+    m = re.search(r"^version\s*=\s*\"([^\"]+)\"", text, re.M)
+    if m:
+        return "%s-tree-build" % m.group(1)
+    die("no Flea version in the manifest line: %s" % line)
+
+
+# The full version token from the manifest, never retyped; Flea names label and sha.
+def section_version(entry, ent, flea_label):
+    fields = ent["fields"]
+    if entry == "flea" and len(fields) > 3 and fields[2] == "source":
+        return "%s, source %s" % (flea_label, fields[3])
+    if entry == "flea-anchor" and len(fields) > 3 and fields[2] == "source":
+        return "%s, source %s" % (anchor_tag(ent), fields[3])
+    return fields[3]
+
+
+def section_display(entry):
+    if entry == "flea-tui":
+        return "Flea TUI"
+    if entry == "yazi-z":
+        return "Yazi"
+    return display(entry)
+
+
+# Display names; the anchor carries its manifest version, never a retyped one.
+def display_for(entry, version):
+    if entry == "flea-anchor":
+        return "**Flea %s**" % version.split(",", 1)[0].strip()
+    return section_display(entry)
+
+
+def link_title(stem):
+    if stem.startswith("gui-"):
+        return "GUI " + stem[4:]
+    if stem.startswith("tui-"):
+        return "TUI " + stem[4:]
+    return stem[:1].upper() + stem[1:]
+
+
+MONTHS = ("January", "February", "March", "April", "May", "June", "July",
+          "August", "September", "October", "November", "December")
+
+
+def format_date(iso):
+    year, month, day = iso.split("-")
+    return "%d %s %s" % (int(day), MONTHS[int(month) - 1], year)
+
+
+def write_run(tmp, name, csv_text, manifest_text):
+    d = os.path.join(tmp, name)
+    os.mkdir(d)
+    open(os.path.join(d, "run.csv"), "w", encoding="utf-8").write(csv_text)
+    open(os.path.join(d, "run.manifest.md"), "w", encoding="utf-8").write(manifest_text)
+    return d
+
+
+CORE_COLS = ("id", "run", "mapped_ms", "settled_ms", "pss_kb", "cpu_tree_s", "thumbs_n")
+
+
+# Counted rows carry write_clean 1 where the column exists; sample: flea,1,424,915,73628,0.41,6936,0,1,1,1,-,0.64,-,yes,-,0.59,1.
+def counted_only(rows, csv_path):
+    if "write_clean" in rows[0]:
+        rows = [r for r in rows if r.get("write_clean") == "1"]
+    if not rows:
+        die("%s holds no counted rows" % csv_path)
+    return rows
+
+
+def counted_rows(csv_path):
+    rows = list(csv.DictReader(open(csv_path, encoding="utf-8")))
+    if not rows:
+        die("%s holds no rows" % csv_path)
+    for col in CORE_COLS:
+        if col not in rows[0]:
+            die("the CSV header has no '%s' column" % col)
+    return counted_only(rows, csv_path)
+
+
+def section_order(ids):
+    def key(entry):
+        if entry == "flea":
+            return (0, "")
+        if entry == "flea-anchor":
+            return (1, "")
+        return (2, section_display(entry).lower())
+    return sorted(ids, key=key)
+
+
+# One speed row, same cells as the single-CSV table, split here for reuse.
+def speed_row(entry, group_rows, version, thumbs):
+    mapped_median = median_time([r["mapped_ms"] for r in group_rows])
+    settled_median = median_time([r["settled_ms"] for r in group_rows])
+    if mapped_median is None:
+        mapped_cell = "-"
+    elif mapped_median == float("inf"):
+        mapped_cell = "Timed out"
+    else:
+        mapped_cell = group(mapped_median) + " ms"
+    if settled_median is None:
+        settled_cell = "-"
+    elif settled_median == float("inf"):
+        settled_cell = "Timed out"
+    else:
+        settled_cell = format_seconds(settled_median)
+    cells = [display_for(entry, version), version, mapped_cell, settled_cell]
+    if thumbs:
+        work = [int(r["thumbs_n"]) for r in group_rows if r["thumbs_n"] not in MARKERS]
+        cells.append("%d" % median(work) if work else "not measured")
+    return "| " + " | ".join(cells) + " |"
+
+
+def mem_row(entry, group_rows, version):
+    pss = [int(r["pss_kb"]) for r in group_rows if r["pss_kb"] not in MARKERS]
+    cpu = [centiseconds(r["cpu_tree_s"]) for r in group_rows if r["cpu_tree_s"] not in MARKERS]
+    cells = [display_for(entry, version), version,
+             format_mib(median(pss)) if pss else "-",
+             format_cpu(median(cpu)) if cpu else "-"]
+    return "| " + " | ".join(cells) + " |"
+
+
+# Ids, row groups and versions for one GUI or TUI table; unknown ids print unknown.
+def table_inputs(rows, entries, default_kind, want_kind, tag, flea_label, with_anchor, unknowns):
+    by_id = {}
+    for r in rows:
+        by_id.setdefault(r["id"], []).append(r)
+    ids = [i for i in by_id if entries.get(i, {}).get("kind", default_kind) == want_kind]
+    if not with_anchor:
+        ids = [i for i in ids if i != "flea-anchor"]
+    versions = {}
+    for i in ids:
+        ent = entries.get(i)
+        if ent is None:
+            versions[i] = "unknown"
+            unknowns.append("%s:%s" % (tag, i))
+        else:
+            versions[i] = section_version(i, ent, flea_label)
+    return section_order(ids), by_id, versions
+
+
+# One speed table; a verdict other than yes stays counted and earns one quoted note.
+def speed_block(ids, by_id, versions, thumbs, first_head, seen_notes):
+    head = "| %s | Version | First window | Settled |" % first_head
+    align = "|---|---|---:|---:|"
+    if thumbs:
+        head += " Thumbnails |"
+        align += "---:|"
+    lines = [head, align]
+    for entry in ids:
+        lines.append(speed_row(entry, by_id[entry], versions[entry], thumbs))
+    verdict_ids = {}
+    for entry in ids:
+        for r in by_id[entry]:
+            verdict = r.get("ranked", "yes")
+            if verdict != "yes":
+                verdict_ids.setdefault(verdict, [])
+                if entry not in verdict_ids[verdict]:
+                    verdict_ids[verdict].append(entry)
+    pending = [(v, e) for v, e in verdict_ids.items() if v not in seen_notes]
+    if pending:
+        lines.append("")
+    for verdict, ents in pending:
+        seen_notes.append(verdict)
+        names = ", ".join(display_for(e, versions[e]) for e in ents)
+        lines.append('Note: %s: "%s".' % (names, verdict))
+    return lines
+
+
+def mem_block(ids, by_id, versions, first_head):
+    lines = ["| %s | Version | Window PSS | CPU |" % first_head,
+             "|---|---|---:|---:|"]
+    for entry in ids:
+        lines.append(mem_row(entry, by_id[entry], versions[entry]))
+    return lines
+
+
+# Sample input, the search JSONL's manifest line: {"manifest": {"date": "2026-10-06T18:50:14-04:00", "plan": {"lengths": [1, 6]}}} answers "2026-10-06".
+def search_manifest_date(jsonl_path):
+    for line in open(jsonl_path, encoding="utf-8"):
+        line = line.strip()
+        if not line:
+            continue
+        record = json.loads(line)
+        if "manifest" in record:
+            date = (record["manifest"] or {}).get("date") or ""
+            m = re.match(r"(\d{4}-\d{2}-\d{2})", date)
+            return m.group(1) if m else None
+    return None
+
+
+# Search arms at the plan longest length, a/b self-pairs merged; sample row: {"arm": "flea-038-a", "length": 6, "query": "scroll", "first_ms": 6.3}.
+def search_tables(jsonl_path, field_entries, flea_label, unknowns, with_anchor=False):
+    manifest = None
+    rows = []
+    for line in open(jsonl_path, encoding="utf-8"):
+        line = line.strip()
+        if not line:
+            continue
+        record = json.loads(line)
+        if "manifest" in record:
+            manifest = record["manifest"]
+        else:
+            rows.append(record)
+    if manifest is None:
+        die("no manifest line in %s" % jsonl_path)
+    plan = manifest.get("plan") or {}
+    lengths = plan.get("lengths") or []
+    if not lengths:
+        die("no plan lengths in %s" % jsonl_path)
+    longest = max(lengths)
+    arms = {a["id"]: a for a in plan.get("arms", [])}
+    entrants = manifest.get("entrants") or {}
+    fixtures = manifest.get("fixtures") or {}
+    # A type-ahead popup closes on its own, so its settled cell is withheld here.
+    popup = {a for a, e in entrants.items()
+             if e.get("filter_kind", "").startswith("type-ahead")}
+    groups = {}
+    for r in rows:
+        if r.get("length") != longest or "arm" not in r:
+            continue
+        groups.setdefault((r.get("fixture", "?"), r.get("mode", "search"), r["arm"]), []).append(r)
+    per_table = {}
+    for (fix, mode, arm), rs in groups.items():
+        per_table.setdefault((fix, mode), {})[arm] = rs
+    lines = []
+    first_table = True
+    for (fix, mode) in sorted(per_table):
+        merged, members_of = {}, {}
+        for arm in sorted(per_table[(fix, mode)]):
+            if arm.endswith("-a") and arm[:-2] + "-b" in per_table[(fix, mode)]:
+                continue
+            if arm.endswith("-b") and arm[:-2] + "-a" in per_table[(fix, mode)]:
+                a = arm[:-2] + "-a"
+                merged[arm[:-2]] = per_table[(fix, mode)][a] + per_table[(fix, mode)][arm]
+                members_of[arm[:-2]] = [a, arm]
+            else:
+                merged[arm] = per_table[(fix, mode)][arm]
+                members_of[arm] = [arm]
+        fix_info = fixtures.get(fix) or {}
+        if fix_info.get("entries") is None:
+            die("no fixture entries for %s in %s" % (fix, jsonl_path))
+        heading = "#### Search, %s, %s entries" % (fix, group(fix_info["entries"]))
+        if mode != "search":
+            heading += ", %s" % mode
+        if first_table:
+            first_table = False
+        else:
+            lines.append("")
+        lines += [heading, "",
+                  "| File manager | Version | Query | First results | Results settled |",
+                  "|---|---|---|---:|---:|"]
+        for key in search_order(merged, members_of, entrants, arms):
+            members = members_of[key]
+            rs = merged[key]
+            query = rs[0].get("query")
+            if query is None:
+                die("no query in a %s row of %s" % (key, jsonl_path))
+            ent_name = (entrants.get(members[0]) or {}).get("entrant")
+            if ent_name is None:
+                ent_name = arms.get(members[0], {}).get("entrant")
+            if ent_name is None:
+                die("no entrant for search arm %s in %s" % (members[0], jsonl_path))
+            if ent_name == "flea-anchor" and not with_anchor:
+                continue
+            first_vals = [r.get("first_ms") for r in rs]
+            settled_vals = [r.get("settled_ms") for r in rs]
+            if any(v is None for v in first_vals):
+                first_cell = "n/a"
+            else:
+                first_cell = format_search_ms(median_float(first_vals)) if first_vals else "n/a"
+            if any(m in popup for m in members):
+                settled_cell = "n/a (find popup)"
+            elif any(v is None for v in settled_vals):
+                settled_cell = "n/a"
+            else:
+                settled_cell = format_search_ms(median_float(settled_vals)) if settled_vals else "n/a"
+            ver = search_version(members, ent_name, arms, field_entries, flea_label,
+                                 jsonl_path, unknowns)
+            lines.append("| %s | %s | %s | %s | %s |" % (
+                display_for(ent_name, ver), ver, query, first_cell, settled_cell))
+    return lines
+
+
+def search_order(merged, members_of, entrants, arms):
+    def entrant_of(key):
+        members = members_of[key]
+        ent = (entrants.get(members[0]) or {}).get("entrant")
+        if ent is None:
+            ent = arms.get(members[0], {}).get("entrant", members[0])
+        return ent
+
+    def key(key):
+        ent = entrant_of(key)
+        if ent == "flea":
+            return (0, key)
+        return (1, section_display(ent).lower())
+    return sorted(merged, key=key)
+
+
+# A Flea search arm takes its sha from its flea_dir basename, others from the field.
+def search_version(members, ent_name, arms, field_entries, flea_label, jsonl_path, unknowns):
+    if ent_name == "flea":
+        for m in members:
+            flea_dir = (arms.get(m) or {}).get("flea_dir", "").rstrip("/")
+            if flea_dir:
+                return "%s, source %s" % (flea_label, flea_dir.split("/")[-1])
+        die("no flea_dir for search arm %s in %s" % (members[0], jsonl_path))
+    ent = field_entries.get(ent_name)
+    if ent is None and "-" in ent_name and ent_name != "flea-anchor":
+        ent = field_entries.get(ent_name.split("-")[0])
+    if ent is None:
+        unknowns.append(ent_name)
+        return "unknown"
+    if ent_name == "flea-anchor" and len(ent["fields"]) > 3 and ent["fields"][2] == "source":
+        return "%s, source %s" % (anchor_tag(ent), ent["fields"][3])
+    return ent["fields"][3]
+
+
+def plural(count, noun):
+    return "%d %s%s" % (count, noun, "" if count == 1 else "s")
+
+
+# The app count under the Speed heading; the terminal clause drops out when no terminal app ran.
+def apps_sentence(gui, tui):
+    text = plural(gui, "GUI app")
+    if tui:
+        text += " and " + plural(tui, "terminal app")
+    return text + " on the same machine."
+
+
+# The whole Performance section body for a run directory of field CSVs.
+def section_text(dir_path, search_path=None, search_manifest_path=None, flea_label=None,
+                 allow_dirty=False, with_anchor=False, docs_stem=None, cargo_toml=None):
+    names = sorted(f for f in os.listdir(dir_path) if f.endswith(".csv"))
+    if not names:
+        die("%s holds no CSV files" % dir_path)
+    missing = [os.path.join(dir_path, n[:-4] + ".manifest.md") for n in names
+               if not os.path.isfile(os.path.join(dir_path, n[:-4] + ".manifest.md"))]
+    if missing:
+        die("no manifest beside: %s" % ", ".join(missing))
+    if search_path is not None and not os.path.isfile(search_path):
+        die("no search run at %s" % search_path)
+    if search_manifest_path is not None and not os.path.isfile(search_manifest_path):
+        die("no search manifest at %s" % search_manifest_path)
+    slots = {}
+    for n in names:
+        stem = n[:-4]
+        if stem.startswith("gui-"):
+            tag, side = stem[4:], "gui"
+        elif stem.startswith("tui-"):
+            tag, side = stem[4:], "tui"
+        else:
+            tag, side = stem, "both"
+        slot = slots.setdefault(tag, {})
+        if side in slot or "both" in slot or (side == "both" and slot):
+            die("%s has two sources for one table" % os.path.join(dir_path, n))
+        slot[side] = {"csv": os.path.join(dir_path, n),
+                      "manifest": os.path.join(dir_path, stem + ".manifest.md")}
+    blocks = {}
+    for tag in sorted(slots):
+        sides = {}
+        for side in ("gui", "tui", "both"):
+            if side not in slots[tag]:
+                continue
+            rows = counted_rows(slots[tag][side]["csv"])
+            info = manifest_section(slots[tag][side]["manifest"])
+            check_dirty(info["entries"], slots[tag][side]["manifest"], allow_dirty)
+            sides[side] = {"rows": rows, "info": info}
+        blocks[tag] = sides
+    if cargo_toml is None:
+        cargo_toml = cargo_path()
+    flea_label = resolve_flea_label(flea_label, blocks, cargo_toml)
+    if docs_stem is None:
+        docs_stem = flea_label
+    unknowns = []
+    gui_ids, tui_ids, counts = set(), set(), []
+    for tag in sorted(blocks):
+        for side, want, store in (("both", "gui", gui_ids), ("gui", "gui", gui_ids),
+                ("both", "tui", tui_ids), ("tui", "tui", tui_ids)):
+            ids, _, _ = fixture_tables(blocks[tag], side, want, tag, flea_label, with_anchor, [])
+            store.update(ids)
+        for side, sides in blocks[tag].items():
+            by_id = {}
+            for r in sides["rows"]:
+                by_id.setdefault(r["id"], set()).add(r["run"])
+            # Run counts cover displayed ids only; a hidden entrant never lowers N.
+            shown = set()
+            for want in (("gui", "tui") if side == "both" else (side,)):
+                shown.update(fixture_tables(blocks[tag], side, want, tag, flea_label, with_anchor, [])[0])
+            hits = [len(by_id[i]) for i in shown if i in by_id]
+            counts.append(min(hits or [len(v) for v in by_id.values()]))
+    dates = sorted({sides["info"]["date"] for tag in sorted(blocks) for sides in blocks[tag].values()})
+    if search_path is not None:
+        search_date = search_manifest_date(search_path)
+        if search_date is not None and search_date not in dates:
+            dates = sorted(dates + [search_date])
+    out = ["Measured on **%s**, using the **%s** source tree."
+           % (", ".join(format_date(d) for d in dates), flea_label),
+           "Cold caches, %d runs per app, medians below. %s"
+           % (min(counts), apps_sentence(len(gui_ids), len(tui_ids))),
+           "", "### Speed", ""]
+    for tag in sorted(blocks):
+        out += fixture_heading(blocks[tag])
+        seen_notes = []
+        for side, want, head in (("both", "gui", "File manager"), ("gui", "gui", "File manager")):
+            ids, by_id, versions = fixture_tables(blocks[tag], side, want, tag,
+                                                  flea_label, with_anchor, unknowns)
+            if ids:
+                out += speed_block(ids, by_id, versions, heading_thumbs(blocks[tag]),
+                                   head, seen_notes)
+                out.append("")
+        for side in ("both", "tui"):
+            ids, by_id, versions = fixture_tables(blocks[tag], side, "tui", tag,
+                                                  flea_label, with_anchor, unknowns)
+            if ids:
+                out += speed_block(ids, by_id, versions, heading_thumbs(blocks[tag]),
+                                   "Terminal app", seen_notes)
+                out.append("")
+    if search_path is not None:
+        search_info = manifest_section(search_manifest_path)
+        check_dirty(search_info["entries"], search_manifest_path, allow_dirty)
+        field_entries = search_info["entries"]
+        out += search_tables(search_path, field_entries, flea_label, unknowns, with_anchor)
+        out.append("")
+    out += ["### Memory and CPU", ""]
+    for tag in sorted(blocks):
+        out += fixture_heading(blocks[tag])
+        for side, want, head in (("both", "gui", "File manager"), ("gui", "gui", "File manager")):
+            ids, by_id, versions = fixture_tables(blocks[tag], side, want, tag,
+                                                  flea_label, with_anchor, unknowns)
+            if ids:
+                out += mem_block(ids, by_id, versions, head)
+                out.append("")
+        for side in ("both", "tui"):
+            ids, by_id, versions = fixture_tables(blocks[tag], side, "tui", tag,
+                                                  flea_label, with_anchor, unknowns)
+            if ids:
+                out += mem_block(ids, by_id, versions, "Terminal app")
+                out.append("")
+    out.append("\"First window\" records compositor registration. \"Settled\" means 500 ms "
+               "without process-tree CPU activity; neither measures input readiness.")
+    out.append("PSS covers the window process, excluding helpers and GPU memory. CPU is everything "
+               "the app started, counted from a control group of its own, so sandboxed thumbnailers "
+               "are in it. Shared libraries affect PSS. Results describe this machine and workload.")
+    if search_path is not None:
+        out.append("\"First results\" records the first visible change larger than one text line; "
+                   "\"Results settled\" records the last such change.")
+    links = ["[Method](docs/benchmarks.md)"]
+    for n in names:
+        stem = n[:-4]
+        links.append("[%s CSV](docs/bench/%s-%s.csv)" % (link_title(stem), stem, docs_stem))
+        links.append("[%s manifest](docs/bench/%s-%s.manifest.md)" % (link_title(stem), stem, docs_stem))
+    out += ["", " · ".join(links)]
+    text = "\n".join(out) + "\n"
+    check_neutral(text)
+    return text, unknowns
+
+
+# Rows and versions for one side of a fixture; a missing side reads as no table.
+def fixture_tables(sides, side, want_kind, tag, flea_label, with_anchor, unknowns):
+    if side not in sides:
+        return [], {}, {}
+    default = "tui" if side == "tui" else "gui"
+    return table_inputs(sides[side]["rows"], sides[side]["info"]["entries"], default,
+                        want_kind, tag, flea_label, with_anchor, unknowns)
+
+
+def fixture_heading(sides):
+    info = sides.get("both", sides.get("gui", sides.get("tui")))["info"]
+    return ["#### %s, %s" % (info["kind"], info["payload"]), ""]
+
+
+def heading_thumbs(sides):
+    info = sides.get("both", sides.get("gui", sides.get("tui")))["info"]
+    return info["thumbs"]
+
+
+# Defaults beside the tool's repo root: <root>/README.md, <root>/docs/bench.
+def apply_defaults():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(root, "README.md"), os.path.join(root, "docs", "bench")
+
+
+# One command: copy each table CSV and manifest beside the stem, then swap the Performance body; refusals write nothing.
+def apply_run(directory, stem, readme_path, docs_path, dry,
+              search=None, search_manifest=None, flea_label=None,
+              allow_dirty=False, with_anchor=False, docs_stem=None):
+    if docs_stem is None:
+        docs_stem = stem
+    if not os.path.isdir(directory):
+        die("no run dir at %s" % directory)
+    text, unknown = section_text(directory, search, search_manifest, flea_label,
+                                 allow_dirty, with_anchor, docs_stem)
+    if unknown:
+        die("no version in the manifest for: %s" % ", ".join(unknown))
+    check_neutral(text)
+    names = sorted(f for f in os.listdir(directory) if f.endswith(".csv"))
+    copies = []
+    for name in names:
+        table = name[:-4]
+        for suffix in (".csv", ".manifest.md"):
+            copies.append((os.path.join(directory, table + suffix),
+                           os.path.join(docs_path, "%s-%s%s" % (table, stem, suffix))))
+    for src, dest in copies:
+        if os.path.isfile(dest):
+            if open(dest, "rb").read() != open(src, "rb").read():
+                die("refusing to overwrite differing %s" % dest)
+    wanted = {"%s-%s%s" % (n[:-4], stem, s) for n in names for s in (".csv", ".manifest.md")}
+    for link in re.findall(r"docs/bench/([^\s)\]]+)", text):
+        if link not in wanted and not os.path.isfile(os.path.join(docs_path, link)):
+            die("apply: link docs/bench/%s names no copied or existing file" % link)
+    if not os.path.isfile(readme_path):
+        die("no readme at %s" % readme_path)
+    old = open(readme_path, encoding="utf-8").read()
+    lines = old.splitlines(keepends=True)
+    perf = [k for k, line in enumerate(lines) if line.strip() == "## Performance"]
+    if not perf:
+        die("no ## Performance heading in %s" % readme_path)
+    if len(perf) > 1:
+        die("two ## Performance headings in %s" % readme_path)
+    following = [k for k in range(perf[0] + 1, len(lines)) if lines[k].startswith("## ")]
+    if not following:
+        die("no heading follows ## Performance in %s" % readme_path)
+    new = "".join(lines[:perf[0] + 1]) + "\n" + text + "\n" + "".join(lines[following[0]:])
+    report = ["copy %s -> %s" % (src, dest) for src, dest in copies]
+    if dry:
+        sys.stdout.write("\n".join(report) + "\n")
+        sys.stdout.write("".join(difflib.unified_diff(
+            old.splitlines(keepends=True), new.splitlines(keepends=True),
+            fromfile=readme_path, tofile=readme_path)))
+        return
+    if not os.path.isdir(docs_path):
+        os.makedirs(docs_path)
+    for src, dest in copies:
+        if os.path.isfile(dest):
+            continue
+        shutil.copyfile(src, dest)
+    if new != old:
+        handle, tmppath = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(readme_path)),
+                                           prefix=".README-", suffix=".tmp")
+        try:
+            with os.fdopen(handle, "w", encoding="utf-8") as out:
+                out.write(new)
+            shutil.copymode(readme_path, tmppath)
+            os.replace(tmppath, readme_path)
+        except BaseException:
+            try:
+                os.unlink(tmppath)
+            except OSError:
+                pass
+            raise
+    sys.stdout.write("\n".join(report) + "\n")
+
+
+def selftest():
+    failures = []
+    # Every table header carries a delimiter row with the same cell count.
+    def check_delims(name, text):
+        lines = text.splitlines()
+        for k, line in enumerate(lines[:-1]):
+            if line.startswith("| ") and lines[k + 1].startswith("|---"):
+                if line.count("|") != lines[k + 1].count("|"):
+                    failures.append("table-delimiters:" + name)
+                    return
+                j = k + 2
+                while j < len(lines) and lines[j].startswith("| "):
+                    if lines[j].count("|") != line.count("|"):
+                        failures.append("table-delimiters:" + name)
+                        return
+                    j += 1
+    head = ("id,run,mapped_ms,settled_ms,pss_kb,cpu_s,child_pss_kb,thumbs_n,pss_anon_kb,uss_kb,drm_kb,"
+            "thumbs_by_dir,cpu_tree_s,thumbs_by_format,ranked,preview_ms,cpu_reaped_s\n")
+    manifest = ("# Field bench manifest\n\n## Entrants\n\n```\n%s\n```\n\n"
+           "- thumbnailable denominator: %s, from 2 visible entries less the 0 above\n")
+    tmp = tempfile.mkdtemp(prefix="bench-readme-")
+    marker = ".bench-readme-selftest"
+    open(os.path.join(tmp, marker), "w", encoding="utf-8").write("selftest")
+    try:
+        entrant_a = "flea gui source abc1234 (clean), release binary built 2026-09-23, 100 bytes\ndolphin gui dolphin 1.2.3-4\nyazi tui yazi 1.0-1"
+        csv_a = (head + "flea,1,424,915,73628,0.41,6936,0,1,1,1,-,0.64,-,yes,-,0.59\n"
+                 + "flea,2,409,924,74000,0.40,6900,0,1,1,1,-,0.65,-,yes,-,0.60\n"
+                 + "flea,3,400,894,73000,0.39,6800,0,1,1,1,-,0.66,-,yes,-,0.61\n"
+                 + "dolphin,1,1735,5394,207868,9.25,0,500,1,1,1,-,9.26,-,yes,-,9.25\n"
+                 + "dolphin,2,1740,5400,208000,9.30,0,502,1,1,1,-,9.30,-,yes,-,9.30\n"
+                 + "yazi,1,100,500,10000,0.10,0,0,1,1,1,-,0.10,-,yes,-,0.10\n")
+        want_a = ("| File manager | Version | First window | Settled | Window PSS | CPU |\n"
+                  "|---|---|---:|---:|---:|---:|\n"
+                  "| **Flea** | abc1234 | 409 ms | 0.92 s | 71.9 MiB | 0.65 s |\n"
+                  "| Dolphin | 1.2.3-4 | 1,737 ms | 5.40 s | 203.1 MiB | 9.28 s |\n")
+        got_a, unknown_a = table(write_run(tmp, "a", csv_a, manifest % (entrant_a, "0")))
+        failures += ["known table" for x in [(got_a, want_a), (unknown_a, [])] if x[0] != x[1]]
+        check_delims("known", got_a)
+        entrant_b = "stall gui stall 2.0-1"
+        csv_b = (head + "ghost,1,100,2000,50000,1.00,0,unmeasurable,1,1,1,-,1.60,unmeasurable,yes,-,1.00\n"
+                 + "stall,1,500,-1,10000,0.40,0,5,1,1,1,-,0.50,-,yes,-,0.40\n")
+        want_b = ("| File manager | Version | First window | Settled | Window PSS | CPU | Thumbnails |\n"
+                  "|---|---|---:|---:|---:|---:|---:|\n"
+                  "| Ghost | unknown | 100 ms | 2.00 s | 48.8 MiB | 1.60 s | not measured |\n"
+                  "| Stall | 2.0-1 | 500 ms | Timed out | 9.8 MiB | 0.50 s | 5 |\n")
+        got_b, unknown_b = table(os.path.join(write_run(tmp, "b", csv_b, manifest % (entrant_b, "7")), "run.csv"))
+        failures += ["unknown table" for x in [(got_b, want_b), (unknown_b, ["ghost"])] if x[0] != x[1]]
+        check_delims("unknown", got_b)
+        entrant_c = "slowall gui slowall 1.0-1\nslowmed gui slowmed 1.0-1"
+        csv_c = (head + "slowall,1,400,-1,10000,0.40,0,0,1,1,1,-,0.50,-,yes,-,0.40\n"
+                 + "slowall,2,410,-1,10000,0.40,0,0,1,1,1,-,0.50,-,yes,-,0.40\n"
+                 + "slowall,3,420,115060,10000,0.40,0,0,1,1,1,-,0.50,-,yes,-,0.40\n"
+                 + "slowmed,1,400,-1,10000,0.40,0,0,1,1,1,-,0.50,-,yes,-,0.40\n"
+                 + "slowmed,2,410,90000,10000,0.40,0,0,1,1,1,-,0.50,-,yes,-,0.40\n"
+                 + "slowmed,3,420,115060,10000,0.40,0,0,1,1,1,-,0.50,-,yes,-,0.40\n")
+        want_c = ("| File manager | Version | First window | Settled | Window PSS | CPU |\n"
+                  "|---|---|---:|---:|---:|---:|\n"
+                  "| Slowall | 1.0-1 | 410 ms | Timed out | 9.8 MiB | 0.50 s |\n"
+                  "| Slowmed | 1.0-1 | 410 ms | 115.06 s | 9.8 MiB | 0.50 s |\n")
+        got_c, unknown_c = table(write_run(tmp, "c", csv_c, manifest % (entrant_c, "0")))
+        failures += ["timeout-all" for x in [(got_c, want_c), (unknown_c, [])] if x[0] != x[1]]
+        check_delims("timeout-all", got_c)
+        entrant_d = "cpumark gui cpumark 1.0-1"
+        csv_d = (head + "cpumark,1,400,900,10000,0.40,0,0,1,1,1,-,0.50,-,yes,-,0.40\n"
+                 + "cpumark,2,410,910,10000,0.40,0,0,1,1,1,-,unmeasurable,-,yes,-,0.40\n"
+                 + "cpumark,3,420,920,10000,0.40,0,0,1,1,1,-,-1,-,yes,-,0.40\n")
+        want_d = ("| File manager | Version | First window | Settled | Window PSS | CPU |\n"
+                  "|---|---|---:|---:|---:|---:|\n"
+                  "| Cpumark | 1.0-1 | 410 ms | 0.91 s | 9.8 MiB | 0.50 s |\n")
+        got_d, unknown_d = table(write_run(tmp, "d", csv_d, manifest % (entrant_d, "0")))
+        failures += ["cpu-markers" for x in [(got_d, want_d), (unknown_d, [])] if x[0] != x[1]]
+        check_delims("cpu-markers", got_d)
+        entrant_g = "nowin gui nowin 1.0-1"
+        csv_g = (head + "nowin,1,-1,unmeasurable,10000,0.40,0,0,1,1,1,-,0.50,-,yes,-,0.40\n"
+                 + "nowin,2,-1,-,10000,0.40,0,0,1,1,1,-,0.50,-,yes,-,0.40\n")
+        want_g = ("| File manager | Version | First window | Settled | Window PSS | CPU |\n"
+                  "|---|---|---:|---:|---:|---:|\n"
+                  "| Nowin | 1.0-1 | Timed out | - | 9.8 MiB | 0.50 s |\n")
+        got_g, unknown_g = table(write_run(tmp, "g", csv_g, manifest % (entrant_g, "0")))
+        failures += ["mapped-timeout-settled-markers" for x in [(got_g, want_g), (unknown_g, [])] if x[0] != x[1]]
+        check_delims("mapped-timeout", got_g)
+        empty_dir = write_run(tmp, "e", head, manifest % (entrant_a, "0"))
+        empty_csv = os.path.join(empty_dir, "run.csv")
+        open(empty_csv, "w", encoding="utf-8").write(head)
+        buffer = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(buffer):
+                table(empty_csv)
+            failures.append("empty-csv")
+        except SystemExit as exc:
+            message_text = buffer.getvalue()
+            if exc.code == 0 or empty_csv not in message_text or "holds no rows" not in message_text:
+                failures.append("empty-csv")
+        multi_dir = write_run(tmp, "f", csv_a, manifest % (entrant_a, "0"))
+        open(os.path.join(multi_dir, "run2.csv"), "w", encoding="utf-8").write(csv_a)
+        buffer = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(buffer):
+                table(multi_dir)
+            failures.append("multi-csv-dir")
+        except SystemExit as exc:
+            message_text = buffer.getvalue()
+            if exc.code == 0 or "run.csv" not in message_text or "run2.csv" not in message_text or "pass one" not in message_text:
+                failures.append("multi-csv-dir")
+        section_manifest = ("# Field bench manifest\n\n## Run\n\n- date: 2026-09-30T18:50:14-04:00\n"
+            "- fixture kind: btrfs\n- fixture payload: 100000 visible entries, filesystem btrfs\n\n"
+            "## Entrants\n\n```\n%s\n```\n\n- thumbnailable denominator: %s, from 2 visible entries less the 0 above\n")
+        entrant_s = ("flea gui source abc1234 untagged (clean), release binary built 2026-09-30, 100 bytes\n"
+            "dolphin gui dolphin 26.08.0-5\nyazi tui yazi 26.9.1-2")
+        csv_s = (head + "flea,1,424,915,73628,0.41,6936,0,1,1,1,-,0.64,-,yes,-,0.59\n"
+            + "flea,2,409,924,74000,0.40,6900,0,1,1,1,-,0.65,-,yes,-,0.60\n"
+            + "dolphin,1,1735,5394,207868,9.25,0,500,1,1,1,-,9.26,-,yes,-,9.25\n"
+            + "yazi,1,300,2048,118885,2.89,0,n/a,1,1,1,-,3.40,-,yes,-,2.89\n"
+            + "yazi,2,305,2125,120786,3.11,0,n/a,1,1,1,-,3.61,-,yes,-,3.11\n")
+        sec_dir = os.path.join(tmp, "sec")
+        os.mkdir(sec_dir)
+        open(os.path.join(sec_dir, "local.csv"), "w", encoding="utf-8").write(csv_s)
+        open(os.path.join(sec_dir, "local.manifest.md"), "w", encoding="utf-8").write(section_manifest % (entrant_s, "0"))
+        text_s, unknown_s = section_text(sec_dir, flea_label="0.3.9", docs_stem="demo")
+        if unknown_s != []:
+            failures.append("rundir-unknown")
+        for label, needle in (("rundir-speed", "### Speed"), ("rundir-mem", "### Memory and CPU"),
+                ("rundir-heading", "#### btrfs, 100000 visible entries, filesystem btrfs"),
+                ("rundir-flea", "| **Flea** | 0.3.9, source abc1234 | 416 ms |"),
+                ("rundir-mem-row", "| **Flea** | 0.3.9, source abc1234 | 72.1 MiB | 0.64 s |"),
+                ("rundir-tui", "| Terminal app | Version | First window | Settled |"),
+                ("rundir-yazi", "| Yazi | 26.9.1-2 |"),
+                ("rundir-date", "Measured on **30 September 2026**"),
+                ("rundir-link", "[Local CSV](docs/bench/local-demo.csv)")):
+            if needle not in text_s:
+                failures.append(label)
+        check_delims("rundir", text_s)
+        dirty_dir = os.path.join(tmp, "dirty")
+        os.mkdir(dirty_dir)
+        entrant_dirty = entrant_s.replace("abc1234 untagged (clean)", "abc1234 (DIRTY)")
+        open(os.path.join(dirty_dir, "local.csv"), "w", encoding="utf-8").write(csv_s)
+        open(os.path.join(dirty_dir, "local.manifest.md"), "w", encoding="utf-8").write(section_manifest % (entrant_dirty, "0"))
+        buffer = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(buffer):
+                section_text(dirty_dir, flea_label="0.3.9")
+            failures.append("dirty-allowed")
+        except SystemExit as exc:
+            message_text = buffer.getvalue()
+            if exc.code == 0 or "DIRTY" not in message_text or "local.manifest.md" not in message_text:
+                failures.append("dirty-refusal")
+        text_d, _ = section_text(dirty_dir, flea_label="0.3.9", allow_dirty=True)
+        if "0.3.9, source abc1234" not in text_d:
+            failures.append("dirty-allowed-version")
+        check_delims("dirty-allowed", text_d)
+        tui_dirty_dir = os.path.join(tmp, "tuidirty")
+        os.mkdir(tui_dirty_dir)
+        entrant_td = entrant_s + "\nflea-tui tui source def5678 untagged (DIRTY), release binary built 2026-09-30, 100 bytes"
+        csv_td = csv_s + "flea-tui,1,300,2048,118885,2.89,0,n/a,1,1,1,-,3.40,-,yes,-,2.89\n"
+        open(os.path.join(tui_dirty_dir, "local.csv"), "w", encoding="utf-8").write(csv_td)
+        open(os.path.join(tui_dirty_dir, "local.manifest.md"), "w", encoding="utf-8").write(section_manifest % (entrant_td, "0"))
+        buffer = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(buffer):
+                section_text(tui_dirty_dir, flea_label="0.3.9")
+            failures.append("dirty-tui-allowed")
+        except SystemExit as exc:
+            message_text = buffer.getvalue()
+            if exc.code == 0 or "DIRTY" not in message_text or "flea-tui" not in message_text:
+                failures.append("dirty-tui-refusal")
+        text_td, _ = section_text(tui_dirty_dir, flea_label="0.3.9", allow_dirty=True)
+        if "Flea TUI" not in text_td:
+            failures.append("dirty-tui-allowed-version")
+        check_delims("dirty-tui", text_td)
+        # A DIRTY strata line is refused under its own name, never Flea's.
+        strata_dirty_dir = os.path.join(tmp, "stratadirty")
+        os.mkdir(strata_dirty_dir)
+        entrant_sd = entrant_s + "\nstrata gui source v0.19.0 (DIRTY), built locally from this checkout"
+        open(os.path.join(strata_dirty_dir, "local.csv"), "w", encoding="utf-8").write(csv_s)
+        open(os.path.join(strata_dirty_dir, "local.manifest.md"), "w", encoding="utf-8").write(
+            section_manifest % (entrant_sd, "0"))
+        buffer = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(buffer):
+                section_text(strata_dirty_dir, flea_label="0.3.9")
+            failures.append("dirty-strata-allowed")
+        except SystemExit as exc:
+            message_text = buffer.getvalue()
+            if exc.code == 0 or "DIRTY source strata v0.19.0" not in message_text or "Flea source strata" in message_text:
+                failures.append("dirty-strata-refusal")
+        two_dir = os.path.join(tmp, "two")
+        os.mkdir(two_dir)
+        entrant_two = ("flea gui source abc1234 untagged (clean), release binary built 2026-09-30, 100 bytes\n"
+            "dolphin gui dolphin 26.08.0-5")
+        csv_two_local = (head + "flea,1,424,915,73628,0.41,6936,0,1,1,1,-,0.64,-,yes,-,0.59\n"
+            + "flea,2,409,924,74000,0.40,6900,0,1,1,1,-,0.65,-,yes,-,0.60\n"
+            + "dolphin,1,1735,5394,207868,9.25,0,500,1,1,1,-,9.26,-,yes,-,9.25\n")
+        csv_two_nas = (head + "flea,1,424,915,73628,0.41,6936,0,1,1,1,-,0.64,-,yes,-,0.59\n"
+            + "flea,2,409,924,74000,0.40,6900,0,1,1,1,-,0.65,-,yes,-,0.60\n"
+            + "flea,3,400,894,73000,0.39,6800,0,1,1,1,-,0.66,-,yes,-,0.61\n"
+            + "dolphin,1,1735,5394,207868,9.25,0,500,1,1,1,-,9.26,-,yes,-,9.25\n"
+            + "dolphin,2,1740,5400,208000,9.30,0,502,1,1,1,-,9.30,-,yes,-,9.30\n"
+            + "dolphin,3,1745,5410,209000,9.35,0,504,1,1,1,-,9.35,-,yes,-,9.35\n"
+            + "thunar,1,2500,6000,180000,8.00,0,100,1,1,1,-,8.10,-,yes,-,8.00\n"
+            + "thunar,2,2510,6010,181000,8.10,0,102,1,1,1,-,8.20,-,yes,-,8.10\n"
+            + "thunar,3,2520,6020,182000,8.20,0,104,1,1,1,-,8.30,-,yes,-,8.20\n")
+        entrant_two_nas = entrant_two + "\nthunar gui thunar 4.20.9-1"
+        open(os.path.join(two_dir, "local.csv"), "w", encoding="utf-8").write(csv_two_local)
+        open(os.path.join(two_dir, "local.manifest.md"), "w", encoding="utf-8").write(section_manifest % (entrant_two, "0"))
+        open(os.path.join(two_dir, "nas.csv"), "w", encoding="utf-8").write(csv_two_nas)
+        open(os.path.join(two_dir, "nas.manifest.md"), "w", encoding="utf-8").write(
+            (section_manifest % (entrant_two_nas, "0")).replace("2026-09-30", "2026-10-02"))
+        text_two, _ = section_text(two_dir, flea_label="0.3.9", docs_stem="demo")
+        for label, needle in (("two-dates", "Measured on **30 September 2026, 2 October 2026**"),
+                ("two-runs", "Cold caches, 1 runs per app"),
+                ("two-count", "3 GUI apps on the same machine.")):
+            if needle not in text_two:
+                failures.append(label)
+        check_delims("two-fixtures", text_two)
+        norun_dir = os.path.join(tmp, "norun")
+        os.mkdir(norun_dir)
+        keep = [i for i, name in enumerate(head.rstrip("\n").split(",")) if name != "run"]
+        norun_head = ",".join(head.rstrip("\n").split(",")[i] for i in keep)
+        norun_rows = [",".join(l.split(",")[i] for i in keep) for l in csv_s.splitlines()[1:]]
+        open(os.path.join(norun_dir, "local.csv"), "w", encoding="utf-8").write(norun_head + "\n" + "\n".join(norun_rows) + "\n")
+        open(os.path.join(norun_dir, "local.manifest.md"), "w", encoding="utf-8").write(section_manifest % (entrant_s, "0"))
+        buffer = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(buffer):
+                section_text(norun_dir, flea_label="0.3.9")
+            failures.append("run-allowed")
+        except SystemExit as exc:
+            if exc.code == 0 or "'run'" not in buffer.getvalue():
+                failures.append("run-column")
+        miss_dir = os.path.join(tmp, "miss")
+        os.mkdir(miss_dir)
+        open(os.path.join(miss_dir, "orphan.csv"), "w", encoding="utf-8").write(csv_s)
+        buffer = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(buffer):
+                section_text(miss_dir)
+            failures.append("missing-allowed")
+        except SystemExit as exc:
+            if exc.code == 0 or "orphan.manifest.md" not in buffer.getvalue():
+                failures.append("missing-manifest")
+        head_wc = head[:-1] + ",write_clean\n"
+        csv_w = (head_wc + "flea,1,424,915,73628,0.41,6936,0,1,1,1,-,0.64,-,yes,-,0.59,1\n"
+            + "flea,2,409,924,74000,0.40,6900,0,1,1,1,-,0.65,-,yes,-,0.60,1\n"
+            + "flea,3,99999,99999,99999,9.99,0,0,1,1,1,-,9.99,-,yes,-,9.99,0\n"
+            + "dolphin,1,1735,5394,207868,9.25,0,500,1,1,1,-,9.26,-,yes,-,9.25,1\n")
+        wc_dir = os.path.join(tmp, "wc")
+        os.mkdir(wc_dir)
+        open(os.path.join(wc_dir, "local.csv"), "w", encoding="utf-8").write(csv_w)
+        open(os.path.join(wc_dir, "local.manifest.md"), "w", encoding="utf-8").write(section_manifest % (entrant_s, "0"))
+        text_w, _ = section_text(wc_dir, flea_label="0.3.9")
+        if "| **Flea** | 0.3.9, source abc1234 | 416 ms |" not in text_w:
+            failures.append("write-clean")
+        check_delims("write-clean", text_w)
+        got_wc, _ = table(wc_dir)
+        if "| **Flea** | abc1234 | 416 ms |" not in got_wc:
+            failures.append("table-write-clean")
+        verdict = "unranked: nothing reached the thumbnail cache so its work was not measured"
+        csv_u = (head + "flea,1,424,915,73628,0.41,6936,0,1,1,1,-,0.64,-,yes,-,0.59\n"
+            + "strata,1,588,3260,110000,3.10,0,unmeasurable,1,1,1,-,3.13,-," + verdict + ",-,3.10\n")
+        entrant_u = entrant_s + "\nstrata gui source v0.19.0 committed 2026-09-18, built locally from this checkout"
+        un_dir = os.path.join(tmp, "un")
+        os.mkdir(un_dir)
+        open(os.path.join(un_dir, "local.csv"), "w", encoding="utf-8").write(csv_u)
+        open(os.path.join(un_dir, "local.manifest.md"), "w", encoding="utf-8").write(section_manifest % (entrant_u, "0"))
+        text_u, _ = section_text(un_dir, flea_label="0.3.9")
+        if "| Strata | v0.19.0 |" not in text_u:
+            failures.append("unranked-kept")
+        if 'Note: Strata: "%s".' % verdict not in text_u:
+            failures.append("unranked-note")
+        check_delims("unranked", text_u)
+        split_dir = os.path.join(tmp, "split")
+        os.mkdir(split_dir)
+        csv_g = head + "".join(l for l in csv_s.splitlines(True)[1:] if l.split(",")[0] in ("flea", "dolphin"))
+        csv_t = head + "".join(l for l in csv_s.splitlines(True)[1:] if l.split(",")[0] == "yazi")
+        entrant_g = ("flea gui source abc1234 untagged (clean), release binary built 2026-09-30, 100 bytes\n"
+            "dolphin gui dolphin 26.08.0-5")
+        open(os.path.join(split_dir, "gui-local.csv"), "w", encoding="utf-8").write(csv_g)
+        open(os.path.join(split_dir, "gui-local.manifest.md"), "w", encoding="utf-8").write(section_manifest % (entrant_g, "0"))
+        open(os.path.join(split_dir, "tui-local.csv"), "w", encoding="utf-8").write(csv_t)
+        open(os.path.join(split_dir, "tui-local.manifest.md"), "w", encoding="utf-8").write(
+            section_manifest % ("yazi tui yazi 26.9.1-2", "0"))
+        text_p, _ = section_text(split_dir, flea_label="0.3.9", docs_stem="demo")
+        for label, needle in (("split-flea", "| **Flea** | 0.3.9, source abc1234 |"),
+                ("split-count", "2 GUI apps and 1 terminal app on the same machine."),
+                ("split-link", "[GUI local CSV](docs/bench/gui-local-demo.csv)")):
+            if needle not in text_p:
+                failures.append(label)
+        check_delims("split", text_p)
+        csv_n = csv_s + "flea-anchor,1,447,914,87872,0.45,7743,0,1,1,1,-,0.73,-,yes,-,0.65\n"
+        entrant_n = entrant_s + "\nflea-anchor gui source def5678 v0.3.8 (clean), release binary built 2026-09-30, 100 bytes"
+        an_dir = os.path.join(tmp, "anchor")
+        os.mkdir(an_dir)
+        open(os.path.join(an_dir, "local.csv"), "w", encoding="utf-8").write(csv_n)
+        open(os.path.join(an_dir, "local.manifest.md"), "w", encoding="utf-8").write(section_manifest % (entrant_n, "0"))
+        text_a, _ = section_text(an_dir, flea_label="0.3.9")
+        if "Flea 0.3.8" in text_a:
+            failures.append("anchor-excluded")
+        text_b, _ = section_text(an_dir, flea_label="0.3.9", with_anchor=True)
+        if "| **Flea 0.3.8** | 0.3.8, source def5678 |" not in text_b:
+            failures.append("anchor-included")
+        check_delims("anchor-excluded", text_a)
+        check_delims("anchor-included", text_b)
+        csv_n2 = csv_s + "flea-anchor,1,447,914,87872,0.45,7743,0,1,1,1,-,0.73,-,yes,-,0.65\n"
+        entrant_n2 = entrant_s + "\nflea-anchor gui source def5678 v0.3.9 (clean), release binary built 2026-09-30, 100 bytes"
+        an2_dir = os.path.join(tmp, "anchor2")
+        os.mkdir(an2_dir)
+        open(os.path.join(an2_dir, "local.csv"), "w", encoding="utf-8").write(csv_n2)
+        open(os.path.join(an2_dir, "local.manifest.md"), "w", encoding="utf-8").write(section_manifest % (entrant_n2, "0"))
+        text_n2, _ = section_text(an2_dir, flea_label="0.3.9", with_anchor=True)
+        if "| **Flea 0.3.9** | 0.3.9, source def5678 |" not in text_n2:
+            failures.append("anchor-version")
+        check_delims("anchor-version", text_n2)
+        # A hidden anchor never lowers N; shown, it sets N to its own run.
+        hid_dir = os.path.join(tmp, "hidden")
+        os.mkdir(hid_dir)
+        csv_h = (head
+            + "flea,1,424,915,73628,0.41,6936,0,1,1,1,-,0.64,-,yes,-,0.59\n"
+            + "flea,2,409,924,74000,0.40,6900,0,1,1,1,-,0.65,-,yes,-,0.60\n"
+            + "flea,3,400,894,73000,0.39,6800,0,1,1,1,-,0.66,-,yes,-,0.61\n"
+            + "dolphin,1,1735,5394,207868,9.25,0,500,1,1,1,-,9.26,-,yes,-,9.25\n"
+            + "dolphin,2,1740,5400,208000,9.30,0,502,1,1,1,-,9.30,-,yes,-,9.30\n"
+            + "dolphin,3,1745,5410,209000,9.35,0,504,1,1,1,-,9.35,-,yes,-,9.35\n"
+            + "flea-anchor,1,447,914,87872,0.45,7743,0,1,1,1,-,0.73,-,yes,-,0.65\n")
+        open(os.path.join(hid_dir, "local.csv"), "w", encoding="utf-8").write(csv_h)
+        open(os.path.join(hid_dir, "local.manifest.md"), "w", encoding="utf-8").write(
+            section_manifest % (entrant_n, "0"))
+        text_h, _ = section_text(hid_dir, flea_label="0.3.9")
+        if "Cold caches, 3 runs per app" not in text_h or "Flea 0.3.8" in text_h:
+            failures.append("hidden-runs")
+        text_hb, _ = section_text(hid_dir, flea_label="0.3.9", with_anchor=True)
+        if "Cold caches, 1 runs per app" not in text_hb or "| **Flea 0.3.8** |" not in text_hb:
+            failures.append("hidden-runs-shown")
+        check_delims("hidden-runs", text_h)
+        check_delims("hidden-runs-shown", text_hb)
+        entrant_nv = entrant_s + "\nflea-anchor gui source def5678 (clean), release binary built 2026-09-30, 100 bytes"
+        nv_dir = os.path.join(tmp, "anchor-noversion")
+        os.mkdir(nv_dir)
+        open(os.path.join(nv_dir, "local.csv"), "w", encoding="utf-8").write(csv_n)
+        open(os.path.join(nv_dir, "local.manifest.md"), "w", encoding="utf-8").write(section_manifest % (entrant_nv, "0"))
+        buffer = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(buffer):
+                section_text(nv_dir, flea_label="0.3.9", with_anchor=True)
+            failures.append("anchor-version-allowed")
+        except SystemExit as exc:
+            if exc.code == 0 or "flea-anchor gui source def5678 (clean)" not in buffer.getvalue():
+                failures.append("anchor-version-refusal")
+        cargo_40 = os.path.join(tmp, "cargo-0.4.0.toml")
+        open(cargo_40, "w", encoding="utf-8").write('[package]\nname = "flea"\nversion = "0.4.0"\n')
+        tree_dir = os.path.join(tmp, "tree")
+        os.mkdir(tree_dir)
+        open(os.path.join(tree_dir, "local.csv"), "w", encoding="utf-8").write(csv_s)
+        open(os.path.join(tree_dir, "local.manifest.md"), "w", encoding="utf-8").write(section_manifest % (entrant_s, "0"))
+        text_tree, _ = section_text(tree_dir, cargo_toml=cargo_40)
+        if "| **Flea** | 0.4.0-tree-build, source abc1234 |" not in text_tree:
+            failures.append("tree-version")
+        if "using the **0.4.0-tree-build** source tree" not in text_tree or "local-0.4.0-tree-build.csv" not in text_tree:
+            failures.append("tree-version")
+        check_delims("tree-version", text_tree)
+        tag_dir = os.path.join(tmp, "tagged")
+        os.mkdir(tag_dir)
+        open(os.path.join(tag_dir, "local.csv"), "w", encoding="utf-8").write(csv_s)
+        open(os.path.join(tag_dir, "local.manifest.md"), "w", encoding="utf-8").write(
+            section_manifest % (entrant_s.replace("abc1234 untagged (clean)", "abc1234 v0.4.1 (clean)"), "0"))
+        text_tag, _ = section_text(tag_dir, cargo_toml=cargo_40)
+        if "| **Flea** | 0.4.1, source abc1234 |" not in text_tag:
+            failures.append("manifest-version")
+        check_delims("manifest-version", text_tag)
+        search_manifest_text = section_manifest % (
+            "strata gui source v0.19.0 committed 2026-09-18, built locally from this checkout\n"
+            "thunar gui thunar 4.20.9-1\nyazi tui yazi 26.9.1-2", "0")
+        search_man_path = os.path.join(tmp, "search-field.manifest.md")
+        open(search_man_path, "w", encoding="utf-8").write(search_manifest_text)
+        search_plan = {"out": "rerun.jsonl", "runs": 2, "query": "scroll", "queries": {},
+            "mode": "search", "lengths": [1, 6], "subjects": ["flea-stage"],
+            "fixtures": {"local": "/tmp/fixture"},
+            "arms": [{"id": "flea-038-a", "entrant": "flea", "flea_dir": "/tmp/arms/abb111"},
+                {"id": "flea-038-b", "entrant": "flea", "flea_dir": "/tmp/arms/abb111"},
+                {"id": "strata", "entrant": "strata"},
+                {"id": "thunar", "entrant": "thunar"},
+                {"id": "yazi-z", "entrant": "yazi-z"}]}
+        search_ents = {"flea-038-a": {"entrant": "flea", "kind": "k", "filter_kind": "in-folder filter (/), narrows the rows"},
+            "flea-038-b": {"entrant": "flea", "kind": "k", "filter_kind": "in-folder filter (/), narrows the rows"},
+            "strata": {"entrant": "strata", "kind": "k", "filter_kind": "pane filter (Ctrl+F), narrows the rows"},
+            "thunar": {"entrant": "thunar", "kind": "k", "filter_kind": "type-ahead find (GTK): selects a row, never narrows"},
+            "yazi-z": {"entrant": "yazi-z", "kind": "k", "filter_kind": "in-folder filter (f), narrows the rows"}}
+        search_rows = [
+            {"arm": "flea-038-a", "entrant": "flea", "fixture": "local", "mode": "search",
+             "length": 1, "query": "s", "first_ms": 30.0, "settled_ms": 30.0},
+            {"arm": "flea-038-a", "entrant": "flea", "fixture": "local", "mode": "search",
+             "length": 6, "query": "scroll", "first_ms": 6.3, "settled_ms": 6.3},
+            {"arm": "flea-038-a", "entrant": "flea", "fixture": "local", "mode": "search",
+             "length": 6, "query": "scroll", "first_ms": 6.7, "settled_ms": 6.7},
+            {"arm": "flea-038-b", "entrant": "flea", "fixture": "local", "mode": "search",
+             "length": 6, "query": "scroll", "first_ms": 6.4, "settled_ms": 6.4},
+            {"arm": "flea-038-b", "entrant": "flea", "fixture": "local", "mode": "search",
+             "length": 6, "query": "scroll", "first_ms": 6.6, "settled_ms": 6.6},
+            {"arm": "strata", "entrant": "strata", "fixture": "local", "mode": "search",
+             "length": 6, "query": "scroll", "first_ms": 8.0, "settled_ms": 28.0},
+            {"arm": "strata", "entrant": "strata", "fixture": "local", "mode": "search",
+             "length": 6, "query": "scroll", "first_ms": 53.0, "settled_ms": 1078.0},
+            {"arm": "thunar", "entrant": "thunar", "fixture": "local", "mode": "search",
+             "length": 6, "query": "scroll", "first_ms": 578.0, "settled_ms": 15000.0},
+            {"arm": "thunar", "entrant": "thunar", "fixture": "local", "mode": "search",
+             "length": 6, "query": "scroll", "first_ms": 603.0, "settled_ms": 15000.0},
+            {"arm": "yazi-z", "entrant": "yazi-z", "fixture": "local", "mode": "search",
+             "length": 6, "query": "scroll", "first_ms": 43.0, "settled_ms": 43.0},
+            {"arm": "yazi-z", "entrant": "yazi-z", "fixture": "local", "mode": "search",
+             "length": 6, "query": "scroll", "first_ms": 43.0, "settled_ms": 43.0}]
+        search_path = os.path.join(tmp, "search.jsonl")
+        with open(search_path, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"manifest": {"date": "2026-10-06", "plan": search_plan,
+                "fixtures": {"local": {"entries": 150001}}, "entrants": search_ents}}) + "\n")
+            for row in search_rows:
+                handle.write(json.dumps(row) + "\n")
+        field_entries = manifest_section(search_man_path)["entries"]
+        search_unknown = []
+        got_q = search_tables(search_path, field_entries, "0.3.9", search_unknown)
+        want_q = ["#### Search, local, 150,001 entries",
+                  "",
+                  "| File manager | Version | Query | First results | Results settled |",
+                  "|---|---|---|---:|---:|",
+                  "| **Flea** | 0.3.9, source abb111 | scroll | 6.5 ms | 6.5 ms |",
+                  "| Strata | v0.19.0 | scroll | 30.5 ms | 553 ms |",
+                  "| Thunar | 4.20.9-1 | scroll | 590.5 ms | n/a (find popup) |",
+                  "| Yazi | 26.9.1-2 | scroll | 43 ms | 43 ms |"]
+        if got_q != want_q or search_unknown != []:
+            failures.append("search-table")
+        check_delims("search", "\n".join(got_q))
+        # An anchor search arm prints its versioned name, never the generic one.
+        aplan = {"lengths": [6], "arms": [{"id": "anchor-arm", "entrant": "flea-anchor"}]}
+        aents = {"anchor-arm": {"entrant": "flea-anchor", "kind": "k", "filter_kind": "x"}}
+        apath = os.path.join(tmp, "anchor-search.jsonl")
+        with open(apath, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"manifest": {"date": "2026-10-06", "plan": aplan,
+                "fixtures": {"local": {"entries": 10}}, "entrants": aents}}) + "\n")
+            for first, settled in ((8.0, 28.0), (9.0, 30.0)):
+                handle.write(json.dumps({"arm": "anchor-arm", "fixture": "local", "mode": "search",
+                    "length": 6, "query": "scroll", "first_ms": first, "settled_ms": settled}) + "\n")
+        aman = os.path.join(tmp, "anchor-search-field.manifest.md")
+        open(aman, "w", encoding="utf-8").write(section_manifest % (
+            "flea-anchor gui source def5678 v0.3.8 (clean), release binary built 2026-09-30, 100 bytes", "0"))
+        got_aq = search_tables(apath, manifest_section(aman)["entries"], "0.3.9", [], True)
+        if not any("| **Flea 0.3.8** | 0.3.8, source def5678 | scroll |" in line for line in got_aq):
+            failures.append("search-anchor")
+        check_delims("search-anchor", "\n".join(got_aq))
+        got_hide = search_tables(apath, manifest_section(aman)["entries"], "0.3.9", [])
+        if any("Flea 0.3.8" in line for line in got_hide):
+            failures.append("search-anchor-flag")
+        check_delims("search-anchor-flag", "\n".join(got_hide) or "no rows")
+        # An anchor arm without its own manifest line prints unknown, never Flea's tag.
+        fplan = {"lengths": [6], "arms": [{"id": "only-anchor", "entrant": "flea-anchor"}]}
+        fents = {"only-anchor": {"entrant": "flea-anchor", "kind": "k", "filter_kind": "x"}}
+        fpath = os.path.join(tmp, "fallback-search.jsonl")
+        with open(fpath, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"manifest": {"date": "2026-10-06", "plan": fplan,
+                "fixtures": {"local": {"entries": 10}}, "entrants": fents}}) + "\n")
+            handle.write(json.dumps({"arm": "only-anchor", "fixture": "local", "mode": "search",
+                "length": 6, "query": "scroll", "first_ms": 8.0, "settled_ms": 28.0}) + "\n")
+        fman = os.path.join(tmp, "fallback-search-field.manifest.md")
+        open(fman, "w", encoding="utf-8").write(section_manifest % (
+            "flea gui source abc1234 v0.3.9 (clean), release binary built 2026-09-30, 100 bytes", "0"))
+        funk = []
+        got_fb = search_tables(fpath, manifest_section(fman)["entries"], "0.3.9", funk, True)
+        if not any("| unknown | scroll |" in line for line in got_fb):
+            failures.append("search-anchor-fallback")
+        if funk != ["flea-anchor"]:
+            failures.append("search-anchor-fallback")
+        check_delims("search-anchor-fallback", "\n".join(got_fb))
+        # A run with no result is not fast: any null timing in the group reads n/a.
+        nplan = {"lengths": [6], "arms": [{"id": "strata", "entrant": "strata"}]}
+        nents = {"strata": {"entrant": "strata", "kind": "k", "filter_kind": "x"}}
+        npath = os.path.join(tmp, "null-search.jsonl")
+        with open(npath, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"manifest": {"date": "2026-10-06", "plan": nplan,
+                "fixtures": {"local": {"entries": 10}}, "entrants": nents}}) + "\n")
+            for first in (8.0, None, None):
+                handle.write(json.dumps({"arm": "strata", "fixture": "local", "mode": "search",
+                    "length": 6, "query": "scroll", "first_ms": first, "settled_ms": 28.0}) + "\n")
+        got_null = search_tables(npath, manifest_section(search_man_path)["entries"], "0.3.9", [])
+        if not any("| Strata | v0.19.0 | scroll | n/a |" in line for line in got_null):
+            failures.append("search-null")
+        check_delims("search-null", "\n".join(got_null))
+        # A DIRTY search manifest stops the section unless allowed.
+        dman = os.path.join(tmp, "dirty-search-field.manifest.md")
+        open(dman, "w", encoding="utf-8").write(section_manifest % (
+            "strata gui source v0.19.0 (DIRTY), built locally from this checkout\n"
+            "thunar gui thunar 4.20.9-1\nyazi tui yazi 26.9.1-2", "0"))
+        sdir = os.path.join(tmp, "searchdirty")
+        os.mkdir(sdir)
+        open(os.path.join(sdir, "local.csv"), "w", encoding="utf-8").write(csv_s)
+        open(os.path.join(sdir, "local.manifest.md"), "w", encoding="utf-8").write(
+            section_manifest % (entrant_s, "0"))
+        buffer = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(buffer):
+                section_text(sdir, search_path, dman, "0.3.9")
+            failures.append("search-dirty-allowed")
+        except SystemExit as exc:
+            if exc.code == 0 or "DIRTY" not in buffer.getvalue():
+                failures.append("search-dirty-refusal")
+        text_sd, _ = section_text(sdir, search_path, dman, "0.3.9", allow_dirty=True)
+        if "#### Search, local, 150,001 entries" not in text_sd:
+            failures.append("search-dirty-allowed-version")
+        check_delims("search-dirty-allowed", text_sd)
+        # Search tables carry their own date in the Measured line.
+        text_dt, _ = section_text(sdir, search_path, search_man_path, "0.3.9", docs_stem="demo")
+        if "Measured on **30 September 2026, 6 October 2026**" not in text_dt:
+            failures.append("search-date")
+        check_delims("search-date", text_dt)
+        # A search run on the day of the speed run prints that day once, whatever time the manifest line holds.
+        same_day = os.path.join(tmp, "search-same-day.jsonl")
+        with open(search_path, encoding="utf-8") as src, open(same_day, "w", encoding="utf-8") as dst:
+            dst.write(src.read().replace('"date": "2026-10-06"', '"date": "2026-09-30T20:00:00-04:00"', 1))
+        text_same, _ = section_text(sdir, same_day, search_man_path, "0.3.9", docs_stem="demo")
+        if "Measured on **30 September 2026**, using" not in text_same:
+            failures.append("search-date-same-day")
+        # The verdict note stands outside the table with a blank line before it.
+        if "\n\nNote: Strata:" not in text_u:
+            failures.append("note-blank")
+        buffer = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(buffer):
+                check_neutral("the fastest app in the table")
+            failures.append("neutral-allowed")
+        except SystemExit as exc:
+            message_text = buffer.getvalue()
+            if exc.code == 0 or "fastest" not in message_text or "the fastest app" not in message_text:
+                failures.append("neutral-word")
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                check_neutral("plain medians with no judgment")
+        except SystemExit:
+            failures.append("neutral-clean")
+        # apply: one command copies the tables and swaps the Performance body.
+        apply_manifest = section_manifest % (entrant_s, "0")
+
+        def apply_fixture(parent, name):
+            d = os.path.join(parent, name)
+            os.mkdir(d)
+            open(os.path.join(d, "local.csv"), "w", encoding="utf-8").write(csv_s)
+            open(os.path.join(d, "local.manifest.md"), "w", encoding="utf-8").write(apply_manifest)
+            return d
+
+        def apply_readme(path, body="old body\n"):
+            open(path, "w", encoding="utf-8").write(
+                "# Title\n\n## Performance\n\n" + body + "\n## Keyboard\n\nkeys\n")
+
+        def apply_snapshot(readme, docs):
+            snap = {"readme": open(readme, "rb").read(), "docs": {}}
+            for name in sorted(os.listdir(docs)):
+                snap["docs"][name] = open(os.path.join(docs, name), "rb").read()
+            return snap
+
+        def apply_unchanged(before, readme, docs):
+            if open(readme, "rb").read() != before["readme"]:
+                return False
+            if sorted(os.listdir(docs)) != sorted(before["docs"]):
+                return False
+            return all(open(os.path.join(docs, n), "rb").read() == before["docs"][n]
+                       for n in before["docs"])
+
+        def apply_argv(d, readme, docs, stem="demo", extra=()):
+            return ["flea-bench-readme", "apply", d, "--stem", stem,
+                    "--readme", readme, "--docs", docs,
+                    "--flea-label", "0.3.9", "--docs-stem", stem] + list(extra)
+
+        def apply_refusal(name, d, readme, docs, needles, argv=None):
+            before = apply_snapshot(readme, docs)
+            buffer = io.StringIO()
+            try:
+                with contextlib.redirect_stderr(buffer), contextlib.redirect_stdout(io.StringIO()):
+                    main(argv if argv is not None else apply_argv(d, readme, docs))
+                failures.append(name)
+            except SystemExit as exc:
+                if exc.code == 0 or any(n not in buffer.getvalue() for n in needles):
+                    failures.append(name)
+            if not apply_unchanged(before, readme, docs):
+                if "apply-refusal-unchanged" not in failures:
+                    failures.append("apply-refusal-unchanged")
+
+        ok_d = apply_fixture(tmp, "apply-ok-run")
+        ok_readme = os.path.join(tmp, "apply-ok-README.md")
+        ok_docs = os.path.join(tmp, "apply-ok-docs")
+        os.mkdir(ok_docs)
+        apply_readme(ok_readme)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                main(apply_argv(ok_d, ok_readme, ok_docs))
+        except SystemExit:
+            failures.append("apply-ok")
+        else:
+            ok_text = open(ok_readme, encoding="utf-8").read()
+            if open(os.path.join(ok_docs, "local-demo.csv"), encoding="utf-8").read() != open(
+                    os.path.join(ok_d, "local.csv"), encoding="utf-8").read():
+                failures.append("apply-ok")
+            elif open(os.path.join(ok_docs, "local-demo.manifest.md"), encoding="utf-8").read() != open(
+                    os.path.join(ok_d, "local.manifest.md"), encoding="utf-8").read():
+                failures.append("apply-ok")
+            elif "old body" in ok_text or "Measured on **30 September 2026**" not in ok_text:
+                failures.append("apply-ok")
+            elif ok_text.count("## Performance") != 1 or "## Keyboard" not in ok_text:
+                failures.append("apply-ok")
+        mode_d = apply_fixture(tmp, "apply-mode-run")
+        mode_readme = os.path.join(tmp, "apply-mode-README.md")
+        mode_docs = os.path.join(tmp, "apply-mode-docs")
+        os.mkdir(mode_docs)
+        apply_readme(mode_readme)
+        os.chmod(mode_readme, 0o640)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                main(apply_argv(mode_d, mode_readme, mode_docs))
+        except SystemExit:
+            failures.append("readme-mode")
+        else:
+            if os.stat(mode_readme).st_mode & 0o777 != 0o640:
+                failures.append("readme-mode")
+        dry_d = apply_fixture(tmp, "apply-dry-run")
+        dry_readme = os.path.join(tmp, "apply-dry-README.md")
+        dry_docs = os.path.join(tmp, "apply-dry-docs")
+        os.mkdir(dry_docs)
+        apply_readme(dry_readme)
+        dry_before = apply_snapshot(dry_readme, dry_docs)
+        dry_out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(dry_out):
+                main(apply_argv(dry_d, dry_readme, dry_docs) + ["--dry"])
+        except SystemExit:
+            failures.append("apply-dry")
+        else:
+            if "local-demo.csv" not in dry_out.getvalue() or "@@" not in dry_out.getvalue():
+                failures.append("apply-dry")
+            elif not apply_unchanged(dry_before, dry_readme, dry_docs):
+                failures.append("apply-dry")
+        ok_before = apply_snapshot(ok_readme, ok_docs)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                main(apply_argv(ok_d, ok_readme, ok_docs))
+        except SystemExit:
+            failures.append("apply-idempotent")
+        else:
+            if not apply_unchanged(ok_before, ok_readme, ok_docs):
+                failures.append("apply-idempotent")
+        miss_d = apply_fixture(tmp, "apply-miss-run")
+        miss_readme = os.path.join(tmp, "apply-miss-README.md")
+        miss_docs = os.path.join(tmp, "apply-miss-docs")
+        os.mkdir(miss_docs)
+        open(miss_readme, "w", encoding="utf-8").write("# Title\n\n## Keyboard\n\nkeys\n")
+        apply_refusal("apply-missing-heading", miss_d, miss_readme, miss_docs, ("## Performance",))
+        dbl_readme = os.path.join(tmp, "apply-dbl-README.md")
+        dbl_docs = os.path.join(tmp, "apply-dbl-docs")
+        os.mkdir(dbl_docs)
+        open(dbl_readme, "w", encoding="utf-8").write(
+            "# Title\n\n## Performance\n\nold\n\n## Performance\n\nagain\n\n## Keyboard\n\nkeys\n")
+        apply_refusal("apply-double-heading", miss_d, dbl_readme, dbl_docs, ("two ## Performance",))
+        tail_readme = os.path.join(tmp, "apply-tail-README.md")
+        tail_docs = os.path.join(tmp, "apply-tail-docs")
+        os.mkdir(tail_docs)
+        open(tail_readme, "w", encoding="utf-8").write("# Title\n\n## Performance\n\nold body\n")
+        apply_refusal("apply-no-following-heading", miss_d, tail_readme, tail_docs, ("no heading follows",))
+        diff_docs = os.path.join(tmp, "apply-diff-docs")
+        os.mkdir(diff_docs)
+        diff_readme = os.path.join(tmp, "apply-diff-README.md")
+        apply_readme(diff_readme)
+        open(os.path.join(diff_docs, "local-demo.csv"), "w", encoding="utf-8").write("different\n")
+        apply_refusal("apply-different-bytes", miss_d, diff_readme, diff_docs, ("differing", "local-demo.csv"))
+        link_d = apply_fixture(tmp, "apply-link-run")
+        link_readme = os.path.join(tmp, "apply-link-README.md")
+        link_docs = os.path.join(tmp, "apply-link-docs")
+        os.mkdir(link_docs)
+        apply_readme(link_readme)
+        link_argv = ["flea-bench-readme", "apply", link_d, "--stem", "demo",
+                     "--readme", link_readme, "--docs", link_docs,
+                     "--flea-label", "0.3.9", "--docs-stem", "other"]
+        apply_refusal("apply-broken-link", link_d, link_readme, link_docs, ("docs/bench/",), argv=link_argv)
+        orph_d = os.path.join(tmp, "apply-orph")
+        os.mkdir(orph_d)
+        open(os.path.join(orph_d, "orphan.csv"), "w", encoding="utf-8").write(csv_s)
+        orph_readme = os.path.join(tmp, "apply-orph-README.md")
+        orph_docs = os.path.join(tmp, "apply-orph-docs")
+        os.mkdir(orph_docs)
+        apply_readme(orph_readme)
+        apply_refusal("apply-missing-manifest", orph_d, orph_readme, orph_docs, ("orphan.manifest.md",))
+        dirty_run = os.path.join(tmp, "apply-dirty-run")
+        os.mkdir(dirty_run)
+        open(os.path.join(dirty_run, "local.csv"), "w", encoding="utf-8").write(csv_s)
+        open(os.path.join(dirty_run, "local.manifest.md"), "w", encoding="utf-8").write(
+            section_manifest % (entrant_s.replace("abc1234 untagged (clean)", "abc1234 (DIRTY)"), "0"))
+        dirty_readme = os.path.join(tmp, "apply-dirty-README.md")
+        dirty_docs = os.path.join(tmp, "apply-dirty-docs")
+        os.mkdir(dirty_docs)
+        apply_readme(dirty_readme)
+        apply_refusal("apply-dirty", dirty_run, dirty_readme, dirty_docs, ("DIRTY",))
+        ghost_run = os.path.join(tmp, "apply-ghost-run")
+        os.mkdir(ghost_run)
+        open(os.path.join(ghost_run, "local.csv"), "w", encoding="utf-8").write(
+            csv_s + "ghost,1,100,2000,50000,1.00,0,0,1,1,1,-,1.60,-,yes,-,1.00\n")
+        open(os.path.join(ghost_run, "local.manifest.md"), "w", encoding="utf-8").write(apply_manifest)
+        ghost_readme = os.path.join(tmp, "apply-ghost-README.md")
+        ghost_docs = os.path.join(tmp, "apply-ghost-docs")
+        os.mkdir(ghost_docs)
+        apply_readme(ghost_readme)
+        apply_refusal("apply-unknown-version", ghost_run, ghost_readme, ghost_docs, ("no version",))
+        # The app count reads in the singular for one, and its terminal clause drops out when no terminal app ran.
+        for label, got, want in (
+                ("apps-one-gui", apps_sentence(1, 0), "1 GUI app on the same machine."),
+                ("apps-gui-only", apps_sentence(7, 0), "7 GUI apps on the same machine."),
+                ("apps-one-terminal", apps_sentence(2, 1), "2 GUI apps and 1 terminal app on the same machine."),
+                ("apps-terminals", apps_sentence(1, 2), "1 GUI app and 2 terminal apps on the same machine.")):
+            if got != want:
+                failures.append("%s: %r" % (label, got))
+        if failures:
+            sys.stderr.write("flea-bench-readme selftest FAILED: %s\n" % ", ".join(failures))
+            return 1
+        print("flea-bench-readme selftest: known, unknown, timeout-all, timeout-median, cpu-markers, mapped-timeout-settled-markers, empty-csv, multi-csv-dir, rundir, dirty-refusal, dirty-tui, two-fixtures, run-column, missing-manifest, write-clean, table-write-clean, unranked-note, note-blank, split-layout, anchor-flag, anchor-version, search-anchor-flag, search-anchor-fallback, search-null, search-dirty, search-date, search-date-same-day, tree-version, manifest-version, search-table, table-delimiters, neutral-word, apply-ok, readme-mode, apply-dry, apply-idempotent, apply-missing-heading, apply-double-heading, apply-no-following-heading, apply-different-bytes, apply-broken-link, apply-missing-manifest, apply-dirty, apply-unknown-version, apply-refusal-unchanged, all cells match")
+        return 0
+    finally:
+        if tmp and os.path.isabs(tmp) and tmp.startswith(tempfile.gettempdir() + os.sep) and os.path.isfile(os.path.join(tmp, marker)):
+            shutil.rmtree(tmp)
+
+
+def main(argv):
+    if len(argv) == 2 and argv[1] == "selftest":
+        sys.exit(selftest())
+    if len(argv) >= 3 and argv[1] == "section":
+        directory = argv[2]
+        if not os.path.isdir(directory):
+            die("no run dir at %s" % directory)
+        search, search_manifest, flea_label = None, None, None
+        allow_dirty, with_anchor, docs_stem = False, False, None
+        i = 3
+        while i < len(argv):
+            arg = argv[i]
+            if arg in ("--search", "--search-manifest", "--flea-label", "--docs-stem"):
+                if i + 1 >= len(argv):
+                    die("usage: flea-bench-readme section DIR [options]", code=2)
+                if arg == "--search":
+                    search = argv[i + 1]
+                elif arg == "--search-manifest":
+                    search_manifest = argv[i + 1]
+                elif arg == "--flea-label":
+                    flea_label = argv[i + 1]
+                else:
+                    docs_stem = argv[i + 1]
+                i += 2
+            elif arg == "--allow-dirty":
+                allow_dirty = True
+                i += 1
+            elif arg == "--with-anchor":
+                with_anchor = True
+                i += 1
+            else:
+                die("usage: flea-bench-readme section DIR [options]", code=2)
+        if bool(search) != bool(search_manifest):
+            die("pass --search and --search-manifest together", code=2)
+        text, unknown = section_text(directory, search, search_manifest, flea_label,
+                                     allow_dirty, with_anchor, docs_stem)
+        sys.stdout.write(text)
+        if unknown:
+            die("no version in the manifest for: %s" % ", ".join(unknown))
+        return
+    if len(argv) >= 3 and argv[1] == "apply":
+        directory = argv[2]
+        stem = None
+        readme_path, docs_path = apply_defaults()
+        dry = False
+        search, search_manifest, flea_label = None, None, None
+        allow_dirty, with_anchor, docs_stem = False, False, None
+        i = 3
+        while i < len(argv):
+            arg = argv[i]
+            if arg in ("--stem", "--readme", "--docs", "--search", "--search-manifest",
+                       "--flea-label", "--docs-stem"):
+                if i + 1 >= len(argv):
+                    die("usage: flea-bench-readme apply DIR --stem STEM [options]", code=2)
+                value = argv[i + 1]
+                if arg == "--stem":
+                    stem = value
+                elif arg == "--readme":
+                    readme_path = value
+                elif arg == "--docs":
+                    docs_path = value
+                elif arg == "--search":
+                    search = value
+                elif arg == "--search-manifest":
+                    search_manifest = value
+                elif arg == "--flea-label":
+                    flea_label = value
+                else:
+                    docs_stem = value
+                i += 2
+            elif arg == "--allow-dirty":
+                allow_dirty = True
+                i += 1
+            elif arg == "--with-anchor":
+                with_anchor = True
+                i += 1
+            elif arg == "--dry":
+                dry = True
+                i += 1
+            else:
+                die("usage: flea-bench-readme apply DIR --stem STEM [options]", code=2)
+        if stem is None:
+            die("usage: flea-bench-readme apply DIR --stem STEM [options]", code=2)
+        if bool(search) != bool(search_manifest):
+            die("pass --search and --search-manifest together", code=2)
+        apply_run(directory, stem, readme_path, docs_path, dry, search,
+                  search_manifest, flea_label, allow_dirty, with_anchor, docs_stem)
+        return
+    if len(argv) != 2:
+        die("usage: flea-bench-readme <run.csv|run-dir>|selftest|section DIR [options]|apply DIR --stem STEM [options]", code=2)
+    text, unknown = table(argv[1])
+    check_neutral(text)
+    sys.stdout.write(text)
+    if unknown:
+        die("no version in the manifest for: %s" % ", ".join(unknown))
+
+
+if __name__ == "__main__":
+    main(sys.argv)

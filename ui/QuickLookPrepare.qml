@@ -1,0 +1,355 @@
+import QtQuick
+import "js/Lists.js" as Lists
+import Quickshell.Io
+import "js/Markdown.js" as Markdown
+import "js/MarkdownMaths.js" as Maths
+import "js/MarkdownPrepared.js" as Prepared
+import "js/Search.js" as Search
+
+// A rested cursor on a small local Markdown file prepares Quick Look's entry and holds its small pictures decoded for the first frame.
+Item {
+    id: root
+
+    property var pane: null
+    // False while Quick Look is open: the entry is for the next Space.
+    property bool resting: true
+    // The rest the preview column's own settle waits, so a sweep reads nothing; the pane owns that settle.
+    property int restMs: root.pane ? root.pane.settleMs : 120
+    // What a suite reads: files read at rest, the bytes the last read returned, parses the worker answered, and the file the entry last took.
+    property int reads: 0
+    property int readBytes: 0
+    property int workerAnswers: 0
+    property string preparedPath: ""
+    // True once the cursor has rested on a listed row, false from its next move; Quick Look's own build waits on it.
+    property bool rested: false
+    // A cursor move bumps seq, so a read or a parse that answers after it is dropped.
+    property int seq: 0
+    // The one request waiting on the worker: its seq, path, text and the inputs the parse took.
+    property var asked: null
+    // The small local pictures the prepared document names, held decoded until the cursor moves, and whether each has finished loading.
+    property var pictures: []
+    property bool picturesSettled: true
+    // The formulas a rested document draws, typeset ahead so the open takes their drawings from the figure service's memory; empty once the cursor moves.
+    property var formulas: []
+    // A rested formula holds one decoded picture, so the process's first picture decode (about 20 ms of plugin set-up) is paid at rest.
+    property bool warmDecoder: false
+    readonly property bool decoderWarm: decoder.status === Image.Ready
+    // How many times a rest turned the warm on, which a suite reads to prove a held key never does.
+    property int decoderWarms: 0
+    onWarmDecoderChanged: if (root.warmDecoder) root.decoderWarms++
+    // A rested table builds one unseen table once, so the process's first table types, bold and code faces and rich import are paid at rest.
+    property bool tableWarmed: false
+    // How many warm tables a rest built and measured, which a suite reads to prove it runs once, never under a held key or after Space.
+    property int tableWarms: 0
+    // The warm table's Markdown and the width it lays out in: a bold cell, a code span and a link, so each face and the link markup are first used here.
+    readonly property string tableWarmText: "| A | B | C |\n|:--|:-:|--:|\n| **x** | `y` | [l](https://e.t) |\n"
+    readonly property int tableWarmWidth: 400
+    // The one stat child sizing them (null when none), and a suite's counts of those started and alive.
+    property var sizer: null
+    property int sizersStarted: 0
+    property int sizersAlive: 0
+
+    Timer {
+        id: rest
+        interval: root.restMs
+        onTriggered: root.prepare()
+    }
+
+    Connections {
+        target: root.pane
+        function onCursorIndexChanged() { root.moved() }
+        function onRowsChanged() { root.moved() }
+        function onListInFlightChanged() { root.moved() }
+        function onStorageKnownChanged() { root.moved() }
+    }
+
+    function moved() {
+        root.rested = false
+        root.seq++
+        root.releaseSizer()
+        // The move back waits on the new rest below, never on the entry from before it.
+        root.preparedPath = ""
+        if (root.pictures.length > 0)
+            root.pictures = []
+        root.picturesSettled = true
+        root.warmDecoder = false
+        if (root.formulas.length > 0)
+            root.formulas = []
+        rest.restart()
+    }
+
+    // head caps the bytes actually read, whatever the file grew to since its row was listed.
+    Component {
+        id: readerComponent
+        Process {
+            id: proc
+            property int seq: 0
+            property string path: ""
+            command: ["head", "-c", String(Prepared.MAX_BYTES + 1), "--", proc.path]
+            stdout: StdioCollector {
+                onStreamFinished: {
+                    root.landed(proc.seq, proc.path, this.text, this.data.byteLength)
+                    proc.destroy()
+                }
+            }
+        }
+    }
+
+    // stat sizes the pictures in one child, so none past PICTURE_MAX_BYTES is decoded ahead; the deadline drops a child a hung mount holds.
+    Timer {
+        id: sizerDeadline
+        interval: Prepared.PICTURE_SIZE_DEADLINE_MS
+        onTriggered: {
+            root.releaseSizer()
+            root.picturesSettled = true
+        }
+    }
+
+    Component {
+        id: sizerComponent
+        Process {
+            id: sizer
+            property int seq: 0
+            property var urls: []
+            command: ["stat", "-L", "--printf", "%s\\t%n\\n", "--"].concat(sizer.urls.map(Prepared.pathOfUrl))
+            Component.onCompleted: root.sizersAlive++
+            Component.onDestruction: root.sizersAlive--
+            stdout: StdioCollector {
+                onStreamFinished: {
+                    // The child is let go first: a recount settles nothing while it is out.
+                    var seq = sizer.seq
+                    var urls = sizer.urls
+                    var text = this.text
+                    if (root.sizer === sizer)
+                        root.releaseSizer()
+                    root.sized(seq, urls, text)
+                }
+            }
+        }
+    }
+
+    // One held Image per picture, built as a block builds its own: the pixmap cache key holds url, transform and fill, so Stretch never hits.
+    Repeater {
+        id: held
+        model: root.pictures
+        delegate: Image {
+            required property string modelData
+            visible: false
+            fillMode: Image.PreserveAspectFit
+            asynchronous: true
+            autoTransform: true
+            source: modelData
+            onStatusChanged: root.recount()
+        }
+    }
+
+    // One unseen figure per formula, built as the document builds its own, so the service holds the drawing under the key the open asks with.
+    Repeater {
+        id: typeset
+        model: root.formulas
+        delegate: MarkdownFigure {
+            required property var modelData
+            visible: false
+            kind: "math"
+            source: modelData.source
+            display: modelData.display
+            inline: true
+            bare: true
+            bgHex: Prepared.hexOf(Theme.color.background)
+            fgHex: Prepared.hexOf(Theme.color.foreground)
+            accentHex: Prepared.hexOf(Theme.color.accent)
+            mutedHex: Prepared.hexOf(Theme.color.muted)
+            surfaceHex: Prepared.hexOf(Theme.color.surface)
+            fontFamily: Theme.font.family
+            bodyPx: Theme.font.body
+            onSvgChanged: root.recount()
+            onErrorChanged: root.recount()
+        }
+    }
+
+    Image {
+        id: decoder
+        visible: false
+        asynchronous: true
+        source: root.warmDecoder ? Maths.CLEAR : ""
+        onStatusChanged: root.recount()
+    }
+
+    // MarkdownTable's preview at Quick Look's body size, holding the warm table: no card holds a Markdown pane at rest.
+    Component {
+        id: tableHost
+        Item {
+            id: host
+            visible: false
+            property var block: null
+            property real availableWidth: 0
+            readonly property alias table: tableLoader.item
+            readonly property int bodyPx: Theme.font.body
+            readonly property int blockGap: 0
+            readonly property real ruleOpacity: 0
+            // Loaded by file name and given its block before it completes, so the table builds once and only when a warm runs.
+            Loader {
+                id: tableLoader
+                Component.onCompleted: setSource("MarkdownTable.qml", { visible: false, preview: host, availableWidth: host.availableWidth, block: host.block })
+            }
+        }
+    }
+
+    Loader {
+        id: parser
+        active: false
+        sourceComponent: CountedWorker {
+            source: "MarkdownWorker.js"
+            onMessage: function (messageObject) { root.answered(messageObject) }
+        }
+    }
+
+    function prepare() {
+        var pane = root.pane
+        if (!root.resting || !pane || pane.listInFlight)
+            return
+        root.rested = true
+        var row = pane.rowFor(pane.cursorIndex)
+        if (!Prepared.readsInline(row, pane.storageClass, pane.storageKnown))
+            return
+        root.reads++
+        var request = readerComponent.createObject(root, { seq: root.seq, path: pane.join(Search.baseOf(pane), row.n) })
+        request.running = true
+    }
+
+    // The read landed: a stale or oversized answer is dropped, a held one is kept, and anything else goes to the worker.
+    function landed(seq, path, text, bytes) {
+        root.readBytes = bytes
+        if (seq !== root.seq || bytes > Prepared.MAX_BYTES || text.length === 0)
+            return
+        var dir = Markdown.dirOf(path)
+        var chrome = Prepared.hexOf(Theme.color.background)
+        var ink = Prepared.hexOf(Theme.color.foreground)
+        var entry = Prepared.take(path, text, dir, chrome, ink)
+        if (entry !== null) {
+            root.startPictures(entry, dir)
+            root.preparedPath = path
+            return
+        }
+        root.asked = { seq: seq, path: path, text: text, dir: dir, chrome: chrome, ink: ink }
+        parser.active = true
+        parser.item.sendMessage({ seq: seq, source: text, dir: dir, chrome: chrome, ink: ink })
+    }
+
+    // The worker answered: the entry is stored only for the request still waiting and a cursor that has not moved.
+    function answered(reply) {
+        var a = root.asked
+        if (a === null || a.seq !== reply.seq)
+            return
+        root.asked = null
+        Qt.callLater(root.retire)
+        // A parse that throws is Quick Look's to report on Space, so nothing is kept here.
+        if (reply.seq !== root.seq || reply.error !== "")
+            return
+        if (a.warm === true) {
+            root.buildWarmTable(reply.blocks[0])
+            return
+        }
+        Prepared.store(a.path, a.text, a.dir, a.chrome, a.ink, reply.blocks)
+        root.workerAnswers++
+        root.startPictures(reply.blocks, a.dir)
+        root.preparedPath = a.path
+    }
+
+    // The first rested document holding a table, a quote's or a list item's included, sends the warm table's Markdown to the worker.
+    function warmTable(blocks, dir) {
+        if (root.tableWarmed || !root.resting || root.asked !== null || !root.holdsTable(blocks))
+            return
+        // A warm never replaces a request still out; one the cursor overtakes is dropped with its seq, so the next rested table asks again.
+        parser.active = true
+        root.asked = { seq: root.seq, warm: true }
+        parser.item.sendMessage({ seq: root.seq, source: root.tableWarmText, dir: dir, chrome: Prepared.hexOf(Theme.color.background), ink: Prepared.hexOf(Theme.color.foreground) })
+    }
+
+    // The warm table's blocks came back at rest: build the table unseen and drop it at once.
+    function buildWarmTable(block) {
+        if (!root.resting || !block)
+            return
+        root.tableWarmed = true
+        var host = tableHost.createObject(root, { block: block, availableWidth: root.tableWarmWidth })
+        // Reading the measured width lays its cells out now; only a table that built and measured counts.
+        if (host.table !== null && host.table.tableWidth > 0)
+            root.tableWarms++
+        host.destroy()
+    }
+
+    function holdsTable(list) {
+        for (var i = 0; i < list.length; i++) {
+            var b = list[i]
+            // A list's parts hold one array of blocks per item.
+            if (b && (b.type === "table" || (Lists.isList(b) && root.holdsTable(b)) || (b.parts !== undefined && root.holdsTable(b.parts))))
+                return true
+        }
+        return false
+    }
+
+    function releaseSizer() {
+        sizerDeadline.stop()
+        if (root.sizer !== null)
+            root.sizer.destroy()
+        root.sizer = null
+    }
+
+    function startPictures(blocks, dir) {
+        root.releaseSizer()
+        root.formulas = Prepared.formulasIn(blocks, Prepared.FORMULA_LIMIT)
+        root.warmDecoder = root.formulas.length > 0
+        root.warmTable(blocks, dir)
+        var urls = Prepared.pictureUrls(blocks, Prepared.PICTURE_LIMIT, dir)
+        if (urls.length === 0) {
+            root.recount()
+            return
+        }
+        root.picturesSettled = false
+        root.sizersStarted++
+        root.sizer = sizerComponent.createObject(root, { seq: root.seq, urls: urls })
+        root.sizer.running = true
+        sizerDeadline.restart()
+    }
+
+    // The sizes landed: only a cursor that has not moved holds the pictures that fit.
+    function sized(seq, urls, statText) {
+        if (seq !== root.seq)
+            return
+        root.pictures = Prepared.smallPictures(urls, statText)
+        root.recount()
+    }
+
+    // Settled once no held picture is still loading, a failed one included, and the decoder's picture and every typeset formula with them.
+    function recount() {
+        if (root.sizer !== null) {
+            root.picturesSettled = false
+            return
+        }
+        for (var f = 0; f < typeset.count; f++) {
+            var figure = typeset.itemAt(f)
+            if (figure !== null && figure.svg === "" && figure.error === "") {
+                root.picturesSettled = false
+                return
+            }
+        }
+        if (decoder.status === Image.Loading) {
+            root.picturesSettled = false
+            return
+        }
+        for (var i = 0; i < held.count; i++) {
+            var one = held.itemAt(i)
+            if (one !== null && one.status === Image.Loading) {
+                root.picturesSettled = false
+                return
+            }
+        }
+        root.picturesSettled = true
+    }
+
+    // The worker thread lives only while a parse waits.
+    function retire() {
+        if (root.asked === null)
+            parser.active = false
+    }
+}

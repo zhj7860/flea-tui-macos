@@ -1,0 +1,2194 @@
+#!/usr/bin/env bash
+# The showcase drive: a stage-set home, the whole monitor as the stage, and the beats of
+# showcase-script.md (in .superpowers/sdd/2026-09-01-flea-1to1-buildout/) choreographed inside it.
+#   tools/flea-showcase fixture               build the stage-set home and list it, no window
+#   tools/flea-showcase stage                 fixture, then the window inside the stage; prints the region
+#   tools/flea-showcase record                record the whole monitor at native size, 60 fps, QP ultra
+#   tools/flea-showcase run [beat ...]        play the beats against the staged window
+#   tools/flea-showcase stop                  stop the recording; prints size, duration, resolution and codec
+#   tools/flea-showcase dry-run [beat ...]    stage, run with a shot per beat, theme-check, teardown
+#   tools/flea-showcase theme-check           stage, switch themes and shoot every surface under each, teardown
+#   tools/flea-showcase teardown              windows closed; bar, quiet and theme restored and verified; fixture deleted
+# Beats: open drag click transfer newfolder views scale quicklook errors extract compress convert search rename trash taildrop dropbox rail keys closer
+# The theme rotates about every 20 s under the beats, at named switch points only (see rotate_point).
+# The take is timed to the operator's voiceover: the closer holds on the empty-state mark for whatever
+# of target_s the beats before it left, so the run ends on the brand drawing itself, exactly on time.
+# Every key is followed by a read of its consequence over IPC: a clean exit from the drive tool is
+# not evidence that a key arrived, and one form of it has already passed while pressing nothing.
+# The operator ruled that the take runs as their own instance: their home, their rail, their
+# hostname. Their user directories are empty, so the take furnishes four of them with hard links
+# into the stage set, and every path it creates is written to a manifest and removed by that
+# manifest, one entry at a time, never by a recursive delete. A directory that is not empty at
+# stage time is refused, so nothing of theirs is ever mixed with the set.
+set -u
+set -o pipefail
+
+repo=$(cd "$(dirname "$0")/.." && pwd) || exit 1
+ui=$repo/ui
+bin=${FLEA_BIN:-$repo/target/release/flea}
+# The operator's own home is the instance; these four are furnished from the stage set for the take.
+fixture=$HOME
+furnished=("$HOME/Pictures" "$HOME/Documents" "$HOME/Music" "$HOME/Projects")
+# The stage set the folders are hard-linked from: tools/flea-showcase-content's studio, built from
+# nothing and safe for a public timeline. Re-pointed here and nowhere else.
+stage_src=${FLEA_SHOWCASE_SRC:-/home/flea-sandbox/flea-showcase-content/studio}
+# The camera roll on camera is this many frames, the last of the stage set's 8,000: the content lane
+# measured 300 items in 505 ms through the backend, so 2,400 is a four-second progress line in the
+# transfer beat, and at some 540 KB a frame it is 1.3 GB of copy that the undo removes again.
+roll_batch=2400
+# The stage is the whole monitor, recorded at its native size with the bar hidden for the take, so
+# stage_w and stage_h are read from the compositor and never assumed.
+stage_w=0
+stage_h=0
+# The main window at rest: wide enough to fill the frame without the name column running empty,
+# tall enough for the whole rail. Read against the boards at the dry run, not assumed right.
+width=1280
+height=860
+# The drag pair: both windows the same size, side by side with this gap, centred as a pair.
+pair_w=1180
+gap=24
+# The grid beat grows the window to this; nothing here ever goes below 1000 wide, because the
+# column collapse under about 659 px is deferred to v0.1.1 and stays off camera.
+grow_w=1720
+grow_h=1000
+# The recorder, called directly: the stock command reaches only its very_high preset and a picker.
+gsr_codec=${FLEA_SHOWCASE_CODEC:-h264}
+gsr_quality=ultra
+gsr_fps=60
+# Pinned like tests/ui.sh's evidence paths: a path the environment can move is a path nothing checks.
+work=/tmp/flea-showcase
+state=$work/state
+evidence=$work/evidence
+flea_log=$work/flea.log
+# Every path the furnishing creates, deepest last, so removal walks it backwards.
+manifest=$work/furnished.list
+# The window's PATH starts here: an opener shim that logs an open, so a mis-fired open never lands an application on the take.
+shim_dir=$work/bin
+# A typed query lands at a reading pace rather than all at once.
+type_ms=90
+# The pointer parks in the screen corner, outside the stage, so the recording shows it only when a beat brings it in.
+park_x=2559
+park_y=1439
+# The backend's own DRAIN_LIMIT is 25 s, the same wait tests/ui.sh gives it.
+drain_wait_s=30
+# The status bar clears a transient after 4000 ms, so a line meant to be read is dwelt on for less.
+read_s=3
+# The window coalescer is 16 ms and a refill is a round trip, the same settle tests/ui.sh uses.
+settle_s=0.4
+# The empty-state mark paints in over 0.2 + 1.8 s and the caption turns every 2.8 s (ui/FleaMark.qml,
+# ui/EmptyState.qml), so a dwell of one full turn shows the whole stroke and the finished mark.
+mark_turn_s=3.0
+# The home root holds about a hundred thousand numbered entries today, so the home itself is the
+# scale beat; its exact row count is read at run time and 7777 is the query that streams in.
+home_rows=0
+# The voiceover's length in seconds, measured off the operator's file (384.192 s); the run ends on it.
+target_s=${FLEA_SHOWCASE_TARGET_S:-384}
+# The empty-state caption turns through eight sentences at 2,800 ms, so a hold longer than one turn
+# shows a sentence twice; the closer splits a long hold across two empty folders at this length.
+caption_turn_s=22
+# The opener: the recording begins on the mark already painting, held under one caption turn.
+opener_s=12
+shots=${SHOTS:-0}
+flea_window_class=com.thisisgm.flea
+
+fail() {
+    printf 'flea-showcase: [%s] %s\n' "${FUNCNAME[1]:-main}" "$*" >&2
+    exit 1
+}
+
+# Sample input: let finished = Command::new("gio")
+# The shim below is named from the product's own exec target, the derivation tests/modes.sh and
+# tests/ui.sh both make: a shim named by hand goes stale the day the target is renamed, and the take
+# then hands the operator's real launcher a file in the middle of a recording.
+handoff_in() {
+    grep -ho 'Command::new("[a-z0-9-]\+")' "$1" | cut -d'"' -f2 | sort -u
+}
+open_handoff=$(handoff_in "$repo/src/open.rs")
+
+export PATH="$HOME/.local/bin:$PATH"
+command -v omarchy-drive >/dev/null || fail "omarchy-drive is not on PATH"
+# Fail closed rather than write a shim nothing calls, which is the fall-through this prevents.
+case "$open_handoff" in
+    ''|*[!a-z0-9-]*) fail "src/open.rs must name exactly one handoff; got '$open_handoff'" ;;
+esac
+eval "$(omarchy-drive env)"
+
+# omarchy-drive env omits the Qt platform theme, without which no row icon resolves; the same
+# three-step recovery tests/ui.sh uses, ending at a live client's own environment.
+platform_theme() {
+    systemctl --user show-environment | grep '^QT_QPA_PLATFORMTHEME=' | cut -d= -f2-
+}
+platform_theme_from_a_live_client() {
+    local pid
+    pid=$(pgrep -x quickshell | head -1)
+    [[ -n "$pid" ]] || return 0
+    tr '\0' '\n' < "/proc/$pid/environ" | grep '^QT_QPA_PLATFORMTHEME=' | cut -d= -f2-
+}
+[[ -n "${QT_QPA_PLATFORMTHEME:-}" ]] || export QT_QPA_PLATFORMTHEME="$(platform_theme)"
+[[ -n "$QT_QPA_PLATFORMTHEME" ]] || export QT_QPA_PLATFORMTHEME="$(platform_theme_from_a_live_client)"
+[[ -n "$QT_QPA_PLATFORMTHEME" ]] || fail "nothing published QT_QPA_PLATFORMTHEME, so no row would draw an icon"
+
+# The real home, read before anything below points HOME at the fixture.
+real_home=$HOME
+real_state=$real_home/.local/state/omarchy/current
+real_shell_toml=$real_home/.config/omarchy/shell.toml
+
+# ------------------------------------------------------------------ the stage geometry
+
+# Sample input, hyprctl monitors -j, one monitor: {"name":"DP-2","width":2560,"height":1440,"x":0,"y":0,"reserved":[0,30,0,0],...}
+# corner: one monitor at scale 1 on this box, so logical pixels are physical pixels and nothing divides.
+# With the bar hidden the strut is 0 and the stage is the whole monitor; if it stays, the windows
+# keep out from under it and the recording still covers the monitor.
+stage_x=0
+stage_y=0
+monitor=""
+read_stage() {
+    local mon_w mon_h mon_x mon_y top
+    read -r monitor mon_w mon_h mon_x mon_y top < <(hyprctl monitors -j | jq -r '.[0] | "\(.name) \(.width) \(.height) \(.x) \(.y) \(.reserved[1])"')
+    [[ -n "$top" ]] || fail "hyprctl monitors answered nothing, so there is no stage to place"
+    stage_x=$mon_x
+    stage_y=$(( mon_y + top ))
+    stage_w=$mon_w
+    stage_h=$(( mon_h - top ))
+}
+
+# Where the main window rests: centred in the stage.
+rest_x() { printf '%s' $(( stage_x + (stage_w - width) / 2 )); }
+rest_y() { printf '%s' $(( stage_y + (stage_h - height) / 2 )); }
+# The drag pair, centred as a pair: the main window shrinks to pair_w and slides left, the second sits right.
+pair_x() { printf '%s' $(( stage_x + (stage_w - 2 * pair_w - gap) / 2 )); }
+side_x() { printf '%s' $(( $(pair_x) + pair_w + gap )); }
+pair_y() { printf '%s' $(( stage_y + (stage_h - height) / 2 )); }
+grow_x() { printf '%s' $(( stage_x + (stage_w - grow_w) / 2 )); }
+grow_y() { printf '%s' $(( stage_y + (stage_h - grow_h) / 2 )); }
+
+# ------------------------------------------------------------------ the bar
+
+# omarchy toggle bar drives a flag called bar-off, so "on" hides the bar and "off" shows it; the
+# layer stays listed either way, so the read-back is the strut the bar reserves at the top of the
+# monitor: 30 here when shown, 0 when hidden, measured. The bar takes a few seconds to come back.
+bar_flag=$real_home/.local/state/omarchy/toggles/bar-off
+bar_strut() {
+    hyprctl monitors -j | jq -r '.[0].reserved[1]'
+}
+bar_shown() {
+    [[ ! -e "$bar_flag" ]] && (( $(bar_strut) > 0 ))
+}
+bar_hidden() {
+    [[ -e "$bar_flag" ]] && (( $(bar_strut) == 0 ))
+}
+bar_wait_s=10
+
+# Workspaces, clock, weather, tray and every presence widget live in the bar, and the take is
+# public, so it goes for the take through Omarchy's own toggle and comes back only if it was there.
+bar_hide() {
+    if bar_shown; then
+        printf 'bar=shown\n' >> "$state"
+        omarchy toggle bar on >/dev/null 2>&1
+        for _attempt in $(seq 1 $((bar_wait_s * 10))); do
+            bar_hidden && { printf 'BAR hidden, strut %s\n' "$(bar_strut)"; return 0; }
+            sleep 0.1
+        done
+        fail "the bar would not hide; the flag is $([[ -e "$bar_flag" ]] && echo set || echo unset) and the strut is $(bar_strut)"
+    else
+        printf 'bar=hidden\n' >> "$state"
+    fi
+}
+
+bar_restore() {
+    [[ -f "$state" ]] || return 0
+    grep -qx 'bar=shown' "$state" || return 0
+    [[ -e "$bar_flag" ]] && omarchy toggle bar off >/dev/null 2>&1
+    # Three times the hide's wait: after a theme set the shell is still reloading and the bar
+    # re-mapped 12 s late on one run; the stock script's own nudge is repeated at ten seconds.
+    for _attempt in $(seq 1 $((bar_wait_s * 90))); do
+        bar_shown && { printf 'BAR restored after %s s, verified: flag clear, strut %s\n' "$(( _attempt / 10 ))" "$(bar_strut)"; return 0; }
+        # Measured: the flag alone brought the bar back late or not at all, and a theme apply woke it at
+        # once, so after ten seconds the current theme is set again, which the shell treats as a full refresh.
+        (( _attempt == bar_wait_s * 10 )) && omarchy theme set "$(theme_slug "$(theme_current)")" >/dev/null 2>&1
+        sleep 0.1
+    done
+    printf 'flea-showcase: THE BAR DID NOT COME BACK in 90 s (flag %s, strut %s); run: omarchy toggle bar off\n' \
+        "$([[ -e "$bar_flag" ]] && echo set || echo clear)" "$(bar_strut)" >&2
+    return 1
+}
+
+# ------------------------------------------------------------------ notifications
+
+# The shell's own answer, measured on this box as the words "on" and "off" (not true/false); anything
+# else means the shell did not answer, and a toggle issued on a guess is the one way to invert the
+# operator's setting, so an unreadable state is a refusal.
+dnd_state() {
+    local seen
+    seen=$(omarchy-shell notifications isDnd 2>/dev/null)
+    case "$seen" in
+        on|off) printf '%s' "$seen" ;;
+        *) fail "the shell answered '$seen' for do-not-disturb, not on or off, so nothing is toggled" ;;
+    esac
+}
+
+# A toast mid-take is a wasted take and somebody's name in the frame, so do-not-disturb goes on
+# through the stock toggle, recorded, verified, and undone only if this drive turned it on.
+dnd_on() {
+    if [[ "$(dnd_state)" == "on" ]]; then
+        printf 'dnd=was_on\n' >> "$state"
+        printf 'DND was already on, left alone\n'
+        return 0
+    fi
+    printf 'dnd=turned_on\n' >> "$state"
+    printf 'DND turned on for the take\n'
+    omarchy toggle notification silencing >/dev/null 2>&1
+    for _attempt in $(seq 1 60); do
+        [[ "$(dnd_state)" == "on" ]] && return 0
+        sleep 0.05
+    done
+    fail "do-not-disturb did not turn on; the shell answers '$(dnd_state)'"
+}
+
+# The shell may be mid-reload when this runs, so an unreadable answer is polled through, never fatal.
+dnd_restore() {
+    local seen
+    [[ -f "$state" ]] || return 0
+    grep -qx 'dnd=turned_on' "$state" || { printf 'DND was not changed by this run\n'; return 0; }
+    seen=$(omarchy-shell notifications isDnd 2>/dev/null)
+    [[ "$seen" == "on" ]] && omarchy toggle notification silencing >/dev/null 2>&1
+    for _attempt in $(seq 1 300); do
+        seen=$(omarchy-shell notifications isDnd 2>/dev/null)
+        [[ "$seen" == "off" ]] && { printf 'DND restored, verified off\n'; return 0; }
+        sleep 0.1
+    done
+    printf 'flea-showcase: DO-NOT-DISTURB IS STILL ON; run: omarchy toggle notification silencing\n' >&2
+    return 1
+}
+
+# ------------------------------------------------------------------ the furnishing
+
+# Records one created path; removal reads this file backwards and touches nothing else.
+made() {
+    printf '%s\n' "$1" >> "$manifest"
+}
+
+# Hard-links one stage-set entry under a furnished directory, every created path recorded.
+furnish_tree() {
+    local src="$1" dst="$2" entry name
+    if [[ -L "$src" ]]; then
+        cp -P "$src" "$dst" || fail "could not copy the link $src"
+        made "$dst"
+        return
+    fi
+    if [[ -d "$src" ]]; then
+        if [[ ! -r "$src" ]]; then
+            # The closed folder cannot be read to link its contents, and it has none: it is remade closed.
+            mkdir "$dst" || fail "could not make $dst"
+            made "$dst"
+            touch -r "$src" "$dst" 2>/dev/null || true
+            chmod 0000 "$dst"
+            return
+        fi
+        mkdir "$dst" || fail "could not make $dst"
+        made "$dst"
+        touch -r "$src" "$dst"
+        for entry in "$src"/* "$src"/.[!.]*; do
+            [[ -e "$entry" || -L "$entry" ]] || continue
+            name=${entry##*/}
+            [[ "$name" == ".flea-test-sandbox" ]] && continue
+            furnish_tree "$entry" "$dst/$name"
+        done
+        touch -r "$src" "$dst"
+        return
+    fi
+    ln "$src" "$dst" || fail "could not link $src"
+    made "$dst"
+}
+
+fixture_build() {
+    local dir name
+    [[ -d "$stage_src" ]] || fail "the stage set is missing at $stage_src; run tools/flea-showcase-content build"
+    [[ -f "$manifest" ]] && fail "a furnishing is already recorded at $manifest; run teardown first"
+    for dir in "${furnished[@]}"; do
+        [[ -d "$dir" ]] || fail "$dir does not exist, so nothing is furnished"
+        [[ -z "$(ls -A "$dir")" ]] || fail "$dir is not empty, so nothing of it is touched and nothing is furnished"
+    done
+    mkdir -p "$work" "$shim_dir"
+    : > "$manifest"
+    # Pictures: the two albums and the camera roll, the last roll_batch frames under their own names.
+    furnish_tree "$stage_src/Photos/Iceland, March" "$HOME/Pictures/Iceland, March"
+    furnish_tree "$stage_src/Photos/Studio sessions" "$HOME/Pictures/Studio sessions"
+    mkdir "$HOME/Pictures/Camera roll" || fail "could not make the camera roll"
+    made "$HOME/Pictures/Camera roll"
+    ls "$stage_src/Photos/Camera roll" | sort | tail -n "$roll_batch" | while IFS= read -r name; do
+        ln "$stage_src/Photos/Camera roll/$name" "$HOME/Pictures/Camera roll/$name" || exit 1
+        printf '%s\n' "$HOME/Pictures/Camera roll/$name" >> "$manifest"
+    done || fail "could not link the camera roll"
+    touch -d '2026-09-01 18:40' "$HOME/Pictures/Camera roll"
+    # Documents: the stage set's documents, its archives, its log over the preview cap, and the two error states.
+    for name in "Consulting agreement, countersigned.pdf" "invoice-0142.pdf" notes; do
+        furnish_tree "$stage_src/Documents/$name" "$HOME/Documents/$name"
+    done
+    furnish_tree "$stage_src/Archives" "$HOME/Documents/Archives"
+    furnish_tree "$stage_src/Downloads/server.log" "$HOME/Documents/server.log"
+    furnish_tree "$stage_src/Archive drive" "$HOME/Documents/Archive drive"
+    furnish_tree "$stage_src/Client vault" "$HOME/Documents/Client vault"
+    # Quick Look walks one listing, so the clip, a recording, a source file and an archive sit here too.
+    furnish_tree "$stage_src/Recordings/interview with the harbour master.m4a" "$HOME/Documents/interview with the harbour master.m4a"
+    furnish_tree "$stage_src/Recordings/walk to the lighthouse.mp4" "$HOME/Documents/walk to the lighthouse.mp4"
+    furnish_tree "$stage_src/Projects/Lantern/src/main.rs" "$HOME/Documents/main.rs"
+    # The two files the share beats act on, made for the purpose and named as demo material.
+    printf 'Sent from Flea with Taildrop during the showcase recording. Safe to delete.\n' > "$HOME/Documents/notes/flea demo, sent with Taildrop.txt"
+    made "$HOME/Documents/notes/flea demo, sent with Taildrop.txt"
+    printf 'Moved to Dropbox by Flea during the showcase recording. Safe to delete.\n' > "$HOME/Documents/notes/flea demo, shared from Dropbox.txt"
+    made "$HOME/Documents/notes/flea demo, shared from Dropbox.txt"
+    made "$HOME/Dropbox/flea demo, shared from Dropbox.txt"
+    touch -r "$stage_src/Documents" "$HOME/Documents"
+    # Music: the recordings. Projects: the Lantern tree.
+    for name in "$stage_src"/Recordings/*; do
+        furnish_tree "$name" "$HOME/Music/${name##*/}"
+    done
+    furnish_tree "$stage_src/Projects/Lantern" "$HOME/Projects/Lantern"
+    # The window's opener logs an open instead of opening; every other subcommand is the real gio, so
+    # the rail's own mount calls are untouched. Nothing in the beats opens a file on purpose.
+    {
+      printf '#!/bin/sh\n'
+      printf '[ "$1" = open ] || exec /usr/bin/gio "$@"\n'
+      printf 'printf %%s\\\\n "$2" >> "%s/opened.log"\n' "$work"
+    } > "$shim_dir/$open_handoff"
+    chmod +x "$shim_dir/$open_handoff"
+    printf 'FURNISHED %s paths under %s\n' "$(wc -l < "$manifest")" "${furnished[*]}"
+    ls -A "$HOME/Pictures" "$HOME/Documents" "$HOME/Music" "$HOME/Projects"
+}
+
+# Removal by the manifest, backwards: files unlinked, directories removed empty. A path outside
+# the four furnished directories, or one that is not in the manifest, is never touched. The
+# beats' own creations (the contact sheet folder, the culled folder and its link) are recorded
+# as they happen, so they leave with the rest.
+fixture_remove() {
+    local path dir ok kept=0
+    local removable=("${furnished[@]}" "$HOME/Dropbox")
+    [[ -f "$manifest" ]] || { printf 'nothing furnished\n'; return 0; }
+    tac "$manifest" | while IFS= read -r path; do
+        ok=0
+        for dir in "${removable[@]}"; do
+            [[ "$path" == "$dir"/* ]] && ok=1
+        done
+        [[ "$ok" == 1 ]] || { printf 'REFUSED to remove %s: outside the furnished directories\n' "$path" >&2; continue; }
+        if [[ -L "$path" || -f "$path" ]]; then
+            rm -- "$path" || printf 'could not remove %s\n' "$path" >&2
+        elif [[ -d "$path" ]]; then
+            chmod u+rwx "$path" 2>/dev/null
+            rmdir -- "$path" 2>/dev/null || printf 'left %s: not empty\n' "$path" >&2
+        fi
+    done
+    for dir in "${furnished[@]}"; do
+        [[ -z "$(ls -A "$dir")" ]] || { printf 'flea-showcase: %s IS NOT EMPTY after removal, left for a hand check: %s\n' "$dir" "$(ls -A "$dir" | head -3 | tr '\n' ' ')" >&2; kept=1; }
+    done
+    rm -f "$manifest"
+    (( kept == 0 )) && { printf 'UNFURNISHED, the four directories are empty again\n'; return 0; }
+    return 1
+}
+
+# ------------------------------------------------------------------ instances and windows
+
+# The main window and the drag beat's second one, each pinned by pid: two instances share one
+# config path, so a path is not an instance selector and a class is not a window selector.
+pid_a=0; id_a=""; addr_a=""
+pid_b=0; id_b=""; addr_b=""
+
+# Sample input, qs list --all --json, one entry: {"config_path":"/home/gm/Work/claude/flea/ui/boot/shell.qml","id":"c0o12e9frkt","pid":3437004,...}
+instance_id_of_pid() {
+    qs list --all --json 2>/dev/null | jq -r --argjson p "$1" '.[] | select(.pid == $p) | .id'
+}
+
+ipc() {
+    qs ipc -i "$id_a" call flea "$@" 2>/dev/null
+}
+
+ipc_b() {
+    qs ipc -i "$id_b" call flea "$@" 2>/dev/null
+}
+
+# Sample input, one hyprctl client: {"address":"0x5a1c","pid":3437004,"at":[780,385],"size":[1000,700],"floating":true,...}
+client_json() {
+    hyprctl clients -j | jq -c --arg a "$1" '.[] | select(.address == $a)'
+}
+
+client_geometry() {
+    client_json "$1" | jq -r '"\(.at[0]) \(.at[1]) \(.size[0]) \(.size[1])"'
+}
+
+# Keystrokes land on whatever holds focus, so a foreign window on the box is a reason to stop and
+# not to work around. The Omarchy bar is a layer surface and never appears here.
+# corner: the real state directory is the theme's; real_state already points at it.
+assert_box_clear() {
+    local others
+    others=$(hyprctl clients -j | jq -r '.[] | .class' | sort -u | tr '\n' ' ')
+    [[ -z "$others" ]] || fail "another lane holds the display, these windows are open: $others"
+}
+
+# The product's own launcher under the fixture home, with both seams on the launch line so a packaged
+# /usr/share/flea/ui can never outrank this tree. 3>&- 4>&- so a detached qs inherits no lock
+# descriptor from whatever called this drive. Prints "pid id address".
+spawn() {
+    local dir="$1" pid id="" addr=""
+    [[ -x "$bin" ]] || fail "no binary at $bin, build it first"
+    mkdir -p "$work" "$evidence"
+    PATH="$shim_dir:$PATH" FLEA_UI="$ui" FLEA_BIN="$bin" setsid nohup "$bin" --gui "$dir" >>"$flea_log" 2>&1 </dev/null 3>&- 4>&- &
+    pid=$!
+    for _attempt in $(seq 1 300); do
+        addr=$(hyprctl clients -j | jq -r --arg c "$flea_window_class" --argjson p "$pid" '.[] | select(.class == $c and .pid == $p) | .address')
+        [[ -n "$addr" ]] && break
+        sleep 0.05
+    done
+    [[ -n "$addr" ]] || fail "no Flea window for pid $pid appeared in 15 s"
+    for _attempt in $(seq 1 100); do
+        id=$(instance_id_of_pid "$pid")
+        [[ -n "$id" ]] && break
+        sleep 0.05
+    done
+    [[ -n "$id" ]] || fail "qs list never named an instance for pid $pid"
+    printf '%s %s %s\n' "$pid" "$id" "$addr"
+}
+
+dispatch() {
+    hyprctl dispatch "$1" >/dev/null
+}
+
+# Float, size and place one window, then read the compositor back: hyprctl exits 0 on error, so the
+# geometry is the only evidence anything took. The resize falls back to a delta and the move to a
+# relative one, because the exact and absolute forms are read back rather than trusted.
+place() {
+    local addr="$1" x="$2" y="$3" w="$4" h="$5" wx wy ww wh
+    if [[ "$(client_json "$addr" | jq -r '.floating')" != "true" ]]; then
+        dispatch "hl.dsp.window.float({ window = \"address:$addr\" })"
+        settle
+    fi
+    [[ "$(client_json "$addr" | jq -r '.floating')" == "true" ]] || fail "window $addr would not float"
+    dispatch "hl.dsp.window.resize({ x = $w, y = $h, exact = true, window = \"address:$addr\" })"
+    settle
+    read -r wx wy ww wh < <(client_geometry "$addr")
+    if (( ww != w || wh != h )); then
+        dispatch "hl.dsp.window.resize({ x = $((w - ww)), y = $((h - wh)), window = \"address:$addr\" })"
+        settle
+    fi
+    dispatch "hl.dsp.window.move({ x = $x, y = $y, window = \"address:$addr\" })"
+    settle
+    read -r wx wy ww wh < <(client_geometry "$addr")
+    if (( wx != x || wy != y )); then
+        dispatch "hl.dsp.window.move({ x = $((x - wx)), y = $((y - wy)), relative = true, window = \"address:$addr\" })"
+        settle
+    fi
+    read -r wx wy ww wh < <(client_geometry "$addr")
+    (( ww == w && wh == h && wx == x && wy == y )) \
+        || fail "window $addr is ${ww}x${wh} at $wx,$wy, not ${w}x${h} at $x,$y"
+    printf 'WINDOW %s %sx%s at %s,%s\n' "$addr" "$ww" "$wh" "$wx" "$wy"
+}
+
+close_window() {
+    local addr="$1"
+    dispatch "hl.dsp.window.close({ window = \"address:$addr\" })"
+    for _attempt in $(seq 1 100); do
+        [[ -z "$(client_json "$addr")" ]] && return
+        sleep 0.05
+    done
+    fail "window $addr did not close"
+}
+
+flea_pids() {
+    local pid
+    for pid in $(pgrep -x qs || true); do
+        [[ -r "/proc/$pid/cmdline" ]] || continue
+        if tr '\0' ' ' 2>/dev/null < "/proc/$pid/cmdline" | grep -Fq "$ui"; then
+            printf '%s\n' "$pid"
+        fi
+    done
+}
+
+backend_pids() {
+    local pid
+    for pid in $(pgrep -x flea || true); do
+        [[ -r "/proc/$pid/cmdline" ]] || continue
+        if tr '\0' ' ' 2>/dev/null < "/proc/$pid/cmdline" | grep -Fq -- "$bin --backend"; then
+            printf '%s\n' "$pid"
+        fi
+    done
+}
+
+# Every qs whose PATH starts with this drive's shim directory, which is exactly the set this drive
+# launched and nothing another lane did: the environment is read, not the command line.
+fixture_instances() {
+    local pid
+    for pid in $(pgrep -x qs || true); do
+        [[ -r "/proc/$pid/environ" ]] || continue
+        if tr '\0' '\n' 2>/dev/null < "/proc/$pid/environ" | grep -q "^PATH=$shim_dir:"; then
+            printf '%s\n' "$pid"
+        fi
+    done
+}
+
+# kill -0 0 would ask after this shell's own process group, so an unset pid is never signalled.
+alive() {
+    (( ${1:-0} > 0 )) && kill -0 "$1" 2>/dev/null
+}
+
+kill_flea() {
+    local pid waited
+    for pid in $(fixture_instances); do
+        kill "$pid" 2>/dev/null
+    done
+    for waited in $(seq 1 $((drain_wait_s * 20))); do
+        [[ -z "$(fixture_instances)$(backend_pids)" ]] && return
+        sleep 0.05
+    done
+    fail "a backend was still draining after $drain_wait_s s"
+}
+
+# ------------------------------------------------------------------ keys and their proof
+
+settle() {
+    sleep "$settle_s"
+}
+
+dwell() {
+    sleep "$1"
+}
+
+# Plain keys and text go through wtype, aimed at the main window by address, which focuses it first.
+# Never with a leading "--": omarchy-drive key --window flea -- z exits clean and presses nothing.
+key() {
+    [[ "$1" != -- ]] || fail "key: a -- argument is silently dropped, pass the text bare"
+    omarchy-drive key --window "$addr_a" "$@" >/dev/null
+}
+
+# A query typed at a reading pace; wtype's -d is the gap between characters.
+type_text() {
+    [[ "$1" != -* ]] || fail "type_text: '$1' would be read as a flag"
+    key -d "$type_ms" "$1"
+}
+
+# A modifier chord through wtype, the one route a lane has watched deliver a chord on this box:
+# send_shortcut's keysym lookup fails for letters and digits alike, and --global is a compositor
+# key press. Released in reverse order, the way a hand comes off a chord.
+# Sample call: chord ctrl+shift n  ->  omarchy-drive key --window <addr> -M ctrl -M shift n -m shift -m ctrl
+chord() {
+    local mods="$1" k="$2" parts pre=() post=() i
+    IFS='+' read -ra parts <<< "$mods"
+    for i in "${parts[@]}"; do pre+=(-M "$i"); done
+    for (( i=${#parts[@]} - 1; i >= 0; i-- )); do post+=(-m "${parts[i]}"); done
+    key "${pre[@]}" "$k" "${post[@]}"
+}
+
+# Polls one seam until it answers the wanted value: the proof a key landed, where an exit status is not.
+expect() {
+    local label="$1" want="$2" seen
+    shift 2
+    for _attempt in $(seq 1 100); do
+        seen=$("$@" 2>/dev/null)
+        [[ "$seen" == "$want" ]] && return 0
+        sleep 0.05
+    done
+    fail "$label: expected '$want', got '$seen'"
+}
+
+expect_ipc() {
+    local method="$1" want="$2"
+    shift 2
+    expect "ipc $method" "$want" ipc "$method" "$@"
+}
+
+# The status bar's line, matched on a substring because the counts and names in it belong to the fixture.
+expect_message_has() {
+    local want="$1" seen
+    for _attempt in $(seq 1 100); do
+        seen=$(ipc lastMessage 2>/dev/null)
+        [[ "$seen" == *"$want"* ]] && { printf 'BAR %s\n' "$seen"; return 0; }
+        sleep 0.05
+    done
+    fail "status bar: expected it to say '$want', it says '$seen'"
+}
+
+expect_message_has_b() {
+    local want="$1" seen
+    for _attempt in $(seq 1 100); do
+        seen=$(ipc_b lastMessage 2>/dev/null)
+        [[ "$seen" == *"$want"* ]] && { printf 'BAR(b) %s\n' "$seen"; return 0; }
+        sleep 0.05
+    done
+    fail "second window's status bar: expected '$want', it says '$seen'"
+}
+
+expect_selection_past() {
+    local floor="$1" seen
+    for _attempt in $(seq 1 100); do
+        seen=$(ipc selectionCount 2>/dev/null)
+        [[ "$seen" =~ ^[0-9]+$ ]] && (( seen > floor )) && return 0
+        sleep 0.05
+    done
+    fail "selection: expected more than $floor rows, it holds '$seen'"
+}
+
+expect_cursor_past() {
+    local floor="$1" seen
+    for _attempt in $(seq 1 100); do
+        seen=$(ipc cursor 2>/dev/null)
+        [[ "$seen" =~ ^[0-9]+$ ]] && (( seen > floor )) && return 0
+        sleep 0.05
+    done
+    fail "cursor: expected past $floor, it is '$seen'"
+}
+
+# The row under the cursor, by a name pattern, polled because a rename lands on a round trip.
+expect_cursor_row() {
+    local want="$1" seen
+    for _attempt in $(seq 1 100); do
+        seen=$(ipc rowAt "$(ipc cursor 2>/dev/null)" 2>/dev/null)
+        [[ "${seen%%|*}" == $want ]] && return 0
+        sleep 0.05
+    done
+    fail "cursor row: expected $want, got '$seen'"
+}
+
+expect_file() {
+    for _attempt in $(seq 1 300); do
+        [[ -e "$1" ]] && return 0
+        sleep 0.05
+    done
+    fail "no file appeared at $1"
+}
+
+expect_no_file() {
+    for _attempt in $(seq 1 300); do
+        [[ -e "$1" ]] || return 0
+        sleep 0.05
+    done
+    fail "$1 is still there"
+}
+
+# A transfer crosses a process boundary and lands on disk row by row, so its total gets a longer wait.
+transfer_wait_s=60
+wait_total() {
+    local want="$1" seen
+    for _attempt in $(seq 1 $((transfer_wait_s * 10))); do
+        seen=$(ipc total 2>/dev/null)
+        [[ "$seen" == "$want" ]] && return 0
+        sleep 0.1
+    done
+    fail "the listing never reached $want rows, it is at '$seen'"
+}
+
+# The preview column draws a thumbnail the sandboxed thumbnailer may still be making on first
+# sight, so it gets a long wait and the state it settled on is printed rather than demanded.
+wait_preview_column() {
+    local seen
+    for _attempt in $(seq 1 120); do
+        seen=$(ipc previewColumnState 2>/dev/null)
+        [[ -n "$seen" && "$seen" != "loading" ]] && { printf 'PREVIEW column settled on %s\n' "$seen"; return 0; }
+        sleep 0.1
+    done
+    # A take is not lost to a slow thumbnail: the shot shows what the column drew, and this line says so.
+    printf 'WARN the preview column was still loading after 12 s\n'
+    return 0
+}
+
+# The rename field opens on a round trip, so a key typed at once would land on the list instead.
+wait_renaming() {
+    local seen
+    for _attempt in $(seq 1 100); do
+        seen=$(ipc renamingIndex 2>/dev/null)
+        [[ "$seen" =~ ^[0-9]+$ ]] && return 0
+        sleep 0.05
+    done
+    fail "no rename field opened, renamingIndex is '$seen'"
+}
+
+wait_listing() {
+    local want="$1" total row
+    for _attempt in $(seq 1 600); do
+        total=$(ipc total 2>/dev/null || printf unavailable)
+        row=$(ipc rowAt 0 2>/dev/null || printf loading)
+        [[ "$total" == "$want" && "$row" != "loading" ]] && return
+        sleep 0.05
+    done
+    fail "the listing never reached $want rows, it is at total=$total row=$row"
+}
+
+# The pane's own state word: listed, empty or error all mean it has answered; only loading does not.
+# rowAt 0 answers "loading" on an empty listing forever, measured, so it is never the signal here.
+wait_listed() {
+    local state
+    for _attempt in $(seq 1 600); do
+        state=$(ipc state 2>/dev/null)
+        [[ -n "$state" && "$state" != "loading" ]] && return
+        sleep 0.05
+    done
+    fail "the listing never settled, state is '$state'"
+}
+
+wait_path() {
+    expect "pane path" "$1" ipc path
+    wait_listed
+}
+
+# The listing index of the first row whose name matches a glob, or -1: names belong to the stage
+# set and can change under this drive, so beats ask for "*.pdf" rather than a file they remember.
+row_index_matching() {
+    local want="$1" i total name
+    total=$(ipc total)
+    [[ "$total" =~ ^[0-9]+$ ]] || { printf -- -1; return; }
+    for (( i = 0; i < total && i < 200; i++ )); do
+        name=$(ipc rowAt "$i")
+        name=${name%%|*}
+        [[ "$name" == $want ]] && { printf '%s' "$i"; return; }
+    done
+    printf -- -1
+}
+
+# One j, proven by the cursor. A key the drive tool reports sent can still fail to land (measured once
+# in eleven runs on a 100,000-row listing), so a step that did not move is pressed once more and said so.
+step_down() {
+    local want="$1" seen
+    key j
+    for _attempt in $(seq 1 20); do
+        seen=$(ipc cursor 2>/dev/null)
+        [[ "$seen" == "$want" ]] && return 0
+        sleep 0.05
+    done
+    printf 'WARN j did not land (cursor %s, wanted %s), pressed again\n' "$seen" "$want"
+    key j
+    expect_ipc cursor "$want"
+}
+
+# Walks the cursor to the first row matching a glob, from the top, one visible step at a time.
+seek_row() {
+    local want="$1" target i seen round
+    target=$(row_index_matching "$want")
+    (( target >= 0 )) || fail "no row matches $want in $(ipc path)"
+    key g
+    expect_ipc cursor 0
+    # Pressed as a burst and read once: an IPC round trip costs more than a keypress here, and a
+    # per-step read turned a twelve-row walk into six seconds. A lost key is topped up, and said.
+    for round in 1 2 3; do
+        seen=$(ipc cursor)
+        [[ "$seen" =~ ^[0-9]+$ ]] || seen=0
+        (( seen == target )) && return 0
+        (( seen > target )) && { key g; expect_ipc cursor 0; seen=0; }
+        (( round > 1 )) && printf 'WARN seek to %s reached %s of %s, pressing the rest\n' "$want" "$seen" "$target"
+        for (( i = seen; i < target; i++ )); do
+            key j
+        done
+        sleep 0.3
+    done
+    expect_ipc cursor "$target"
+}
+
+# ------------------------------------------------------------------ the pointer
+
+# Motion goes through uinput and never through hl.dsp.cursor.move once a button is down: that warp
+# emits motion with no frame and Qt dispatches pointer events only on frame, so a drag driven by it
+# is never seen by the application. tests/drag.sh measured it: 24 motions, 0 frames.
+warp()     { dispatch "hl.dsp.cursor.move({ x = $1, y = $2 })"; }
+move_rel() { ydotool mousemove -x "$1" -y "$2" >/dev/null 2>&1; }
+press()    { ydotool click 0x40 >/dev/null 2>&1; }
+release()  { ydotool click 0x80 >/dev/null 2>&1; }
+# evdev KEY_LEFTCTRL, held through ydotool so the drag is a copy: a plain drag is a move (tests/drag.sh R2, R3).
+ctrl_down() { ydotool key 29:1 >/dev/null 2>&1; }
+ctrl_up()   { ydotool key 29:0 >/dev/null 2>&1; }
+
+cursor_pos() {
+    hyprctl cursorpos | tr -d ','
+}
+
+# Converges on an absolute target with real frame-carrying motion, which is also what a viewer
+# sees as the pointer travelling: libinput accelerates about 2x here, so each step is half the
+# remaining distance and re-read, never trusted, then single pixels until it is exact.
+glide_to() {
+    local tx="$1" ty="$2" i cx cy dx dy
+    for i in $(seq 1 24); do
+        read -r cx cy < <(cursor_pos)
+        dx=$(( tx - cx )); dy=$(( ty - cy ))
+        (( dx == 0 && dy == 0 )) && return 0
+        if (( dx > -5 && dx < 5 && dy > -5 && dy < 5 )); then
+            move_rel "$(( dx > 0 ? 1 : dx < 0 ? -1 : 0 ))" "$(( dy > 0 ? 1 : dy < 0 ? -1 : 0 ))"
+        else
+            move_rel $(( dx / 2 )) $(( dy / 2 ))
+        fi
+        sleep 0.05
+    done
+    read -r cx cy < <(cursor_pos)
+    (( cx == tx && cy == ty )) || fail "the pointer settled at $cx,$cy, not $tx,$ty"
+}
+
+park_pointer() {
+    warp "$park_x" "$park_y"
+}
+
+# The screen position of a row's centre in one window: the seam answers window coordinates.
+row_screen_centre() {
+    local ipcfn="$1" addr="$2" index="$3" cx cy wx wy
+    read -r cx cy <<< "$("$ipcfn" rowCentre "$index")"
+    [[ -n "$cy" ]] || fail "row $index has no on-screen centre"
+    read -r wx wy _ww _wh < <(client_geometry "$addr")
+    printf '%s %s\n' "$((cx + wx))" "$((cy + wy))"
+}
+
+# Empty list area below the last row of a window, for a drop that means "into this directory".
+# The row pitch is the gap between two consecutive row centres, read off the window itself.
+list_blank_spot() {
+    local ipcfn="$1" addr="$2" last cx cy px py pitch wx wy ww wh
+    last=$(( $("$ipcfn" total) - 1 ))
+    (( last >= 1 )) || fail "the window lists fewer than two rows, so no pitch can be read"
+    read -r cx cy < <(row_screen_centre "$ipcfn" "$addr" "$last")
+    read -r px py < <(row_screen_centre "$ipcfn" "$addr" $((last - 1)))
+    pitch=$(( cy - py ))
+    (( pitch > 10 && pitch < 100 )) || fail "row pitch read as $pitch px, which is not a row"
+    read -r wx wy ww wh < <(client_geometry "$addr")
+    cy=$(( cy + 2 * pitch ))
+    (( cy < wy + wh - pitch )) || fail "the blank spot $cx,$cy is below the window ($wy+$wh)"
+    printf '%s %s\n' "$cx" "$cy"
+}
+
+click_at() {
+    omarchy-drive click "$1" "$2" "${@:3}" >/dev/null
+}
+
+# A drag from one screen point to another through a held left button, at a pace a viewer can follow.
+drag() {
+    local sx="$1" sy="$2" tx="$3" ty="$4"
+    glide_to "$sx" "$sy"
+    sleep 0.4
+    press
+    sleep 0.3
+    glide_to "$tx" "$ty"
+    sleep 0.5
+    release
+}
+
+# ------------------------------------------------------------------ the theme
+
+theme_current() {
+    omarchy theme current
+}
+
+# omarchy theme list prints display names and omarchy theme dir echoes them back unresolved, so the
+# directory and the set both take the slug: "Tokyo Night" is the directory tokyo-night, measured.
+theme_slug() {
+    printf '%s' "$1" | tr 'A-Z ' 'a-z-'
+}
+
+background_current() {
+    readlink "$real_state/background"
+}
+
+# Two themes that are not the one the box is on, read at run time: the box has been switched under
+# a running lane before, and a switch to the current theme would show no re-skin at all.
+theme_targets() {
+    local current name picked=0
+    current=$(theme_current)
+    for name in "Tokyo Night" "Catppuccin Latte" "Rose Pine"; do
+        [[ "${name,,}" == "${current,,}" ]] && continue
+        printf '%s\n' "$name"
+        picked=$((picked + 1))
+        (( picked == 2 )) && return
+    done
+}
+
+# Sample input, one line of the live colors.toml:
+# background        = "#0e1112"   # window ground
+# The ground's luminance decides which way the beat switches: a dark box goes to a light theme and
+# a light box to a dark one, so the change is unmistakable on a timeline thumbnail.
+live_background_is_dark() {
+    local hex r g b
+    hex=$(grep -E '^background' "$real_state/theme/colors.toml" | grep -oE '#[0-9A-Fa-f]{6}' | head -1)
+    [[ -n "$hex" ]] || fail "no background in the live colors.toml"
+    r=$((16#${hex:1:2})); g=$((16#${hex:3:2})); b=$((16#${hex:5:2}))
+    # Rec. 601 luma, integer weights that sum to 1000; half of 255 is the line between dark and light.
+    (( (299 * r + 587 * g + 114 * b) / 1000 < 128 ))
+}
+
+theme_contrast_target() {
+    local current name candidates
+    current=$(theme_current)
+    if live_background_is_dark; then
+        candidates=("Catppuccin Latte" "Flexoki Light")
+    else
+        candidates=("Tokyo Night" "Vernier")
+    fi
+    for name in "${candidates[@]}"; do
+        [[ "${name,,}" == "${current,,}" ]] && continue
+        printf '%s\n' "$name"
+        return
+    done
+    fail "no contrasting theme differs from the current one, $current"
+}
+
+# ------------------------------------------------------------------ the rotation
+
+# The operator's instruction: rotate the theme about every 20 s through the take, so the whole
+# frame re-skins under the beats and the follows-your-system point is made continuously. Switches
+# happen only at named points where nothing is moving or being read, never on a timer, and never
+# during the opener or the closer, which the mark carries on the theme stage found.
+rotate_min_s=${FLEA_SHOWCASE_ROTATE_S:-18}
+rotate_on=0
+last_switch_ms=0
+switches=0
+theme_order=()
+theme_index=0
+
+# Sample input, two lines of a theme's colors.toml:
+# background = "#1a1b26"
+# accent     = "#7aa2f7"
+theme_colours() {
+    local dir bg accent
+    dir=$(omarchy theme dir "$(theme_slug "$1")" 2>/dev/null) || return 1
+    [[ -f "$dir/colors.toml" ]] || return 1
+    bg=$(grep -E '^background' "$dir/colors.toml" 2>/dev/null | grep -oE '#[0-9A-Fa-f]{6}' | head -1)
+    accent=$(grep -E '^accent' "$dir/colors.toml" 2>/dev/null | grep -oE '#[0-9A-Fa-f]{6}' | head -1)
+    [[ -n "$bg" ]] || return 1
+    printf '%s|%s|%s\n' "$1" "$bg" "${accent:-$bg}"
+}
+
+# The rotation set, per the operator: every stock theme plus their own vernier, and ordered for the
+# largest contrast between neighbours. The first entry is the one farthest from the theme the box is
+# on, each next is the unused one farthest from the last, and vernier goes last so the sequence
+# leads with stock and lands beside the restore. Distance is the background luma gap plus the
+# accent hue gap, computed in python because hue in integer shell is a page of arithmetic nobody
+# should have to read; the numbers are printed so the contrast is a measurement, not an impression.
+theme_pool() {
+    local current name line
+    current=$(theme_current)
+    theme_order=()
+    # Sample line from the python below: "251 213 Flexoki Light", background luma, accent hue, name.
+    while IFS= read -r line; do
+        theme_order+=("$(printf '%s' "$line" | cut -c9-)")
+        printf 'ROTATION luma %s hue %s %s\n' "${line:0:3}" "${line:4:3}" "${line:8}"
+    done < <(
+        {
+            theme_colours "$current" | sed 's/^/current|/'
+            while IFS= read -r name; do
+                theme_colours "$name" | sed 's/^/pool|/'
+            done < <(omarchy theme list)
+        } | python3 -c '
+import sys, colorsys
+def rgb(h): return tuple(int(h[i:i+2], 16) for i in (1, 3, 5))
+def luma(c): return (299*c[0] + 587*c[1] + 114*c[2]) // 1000
+def hue(c): return colorsys.rgb_to_hsv(*(x/255 for x in c))[0] * 360
+def sat(c): return colorsys.rgb_to_hsv(*(x/255 for x in c))[1]
+# Dark on dark: the accent is what a viewer sees change, so its hue leads, a grey accent against a
+# saturated one counts as a change too, and the background luma gap is the tiebreak.
+def dist(a, b):
+    dh = abs(hue(a["ac"]) - hue(b["ac"])); dh = min(dh, 360 - dh)
+    ds = abs(sat(a["ac"]) - sat(b["ac"]))
+    dl = abs(luma(a["bg"]) - luma(b["bg"]))
+    return dh * 255 / 180 + ds * 128 + dl * 0.5
+dark_below = 128
+current = None; pool = []; dropped = []
+for raw in sys.stdin:
+    kind, name, bg, ac = raw.rstrip("\n").split("|")
+    entry = {"name": name, "bg": rgb(bg), "ac": rgb(ac)}
+    if kind == "current": current = entry; continue
+    if luma(entry["bg"]) >= dark_below:
+        dropped.append(entry); continue
+    if name.lower() == "vernier" or name.lower() != (current["name"].lower() if current else ""): pool.append(entry)
+for e in dropped:
+    sys.stderr.write("DROPPED light theme luma %3d %s\n" % (luma(e["bg"]), e["name"]))
+tail = [e for e in pool if e["name"].lower() == "vernier"]
+pool = [e for e in pool if e["name"].lower() != "vernier"]
+order = []; last = current or pool[0]
+while pool:
+    nxt = max(pool, key=lambda e: dist(last, e)); pool.remove(nxt); order.append(nxt); last = nxt
+order += tail
+for e in order:
+    print("%3d %3d %s" % (luma(e["bg"]), hue(e["ac"]), e["name"]))
+sys.stderr.write("ROTATION %d dark themes, light ones dropped by luma >= %d\n" % (len(order), dark_below))
+'
+    )
+    (( ${#theme_order[@]} >= 8 )) || fail "only ${#theme_order[@]} themes came back for the rotation"
+    # The python's stderr carried the dropped list, which lands in the log beside the order.
+}
+
+# A switch point: fires only when the cadence is due, waits for the previous set's hooks first,
+# and measures the switch as the time until the window paints the new foreground, plus one IPC
+# round trip straight after, which is the one proxy this drive has for a window that stalled.
+rotate_point() {
+    local label="$1" name started ms probe_started probe_ms
+    (( rotate_on == 1 )) || return 0
+    (( ${#theme_order[@]} > 0 )) || return 0
+    (( $(now_ms) - last_switch_ms >= rotate_min_s * 1000 )) || return 0
+    theme_wait
+    name=${theme_order[theme_index]}
+    theme_index=$(( (theme_index + 1) % ${#theme_order[@]} ))
+    started=$(now_ms)
+    theme_switch "$name"
+    wait_theme_applied "$name"
+    wait_foreground >/dev/null
+    ms=$(( $(now_ms) - started ))
+    probe_started=$(now_ms)
+    ipc themeForeground >/dev/null
+    probe_ms=$(( $(now_ms) - probe_started ))
+    last_switch_ms=$(now_ms)
+    switches=$((switches + 1))
+    printf '%s %s %s\n' "$theme_index" "$switches" "$last_switch_ms" > "$work/rotation"
+    printf 'SWITCH %-2s %-18s at %-9s %5s ms to repaint, ipc after %4s ms\n' "$switches" "$name" "$label" "$ms" "$probe_ms"
+}
+
+rotation_load() {
+    [[ -f "$work/rotation" ]] || return 0
+    read -r theme_index switches last_switch_ms < "$work/rotation"
+}
+
+# Restores what stage found, name then background, because a theme set cycles the theme's backgrounds.
+theme_restore() {
+    local name bg
+    [[ -f "$state" ]] || return 0
+    name=$(grep '^theme=' "$state" | cut -d= -f2-)
+    bg=$(grep '^background=' "$state" | cut -d= -f2-)
+    [[ -n "$name" ]] || return 0
+    if [[ "$(theme_slug "$(theme_current)")" != "$(theme_slug "$name")" ]]; then
+        omarchy theme set "$(theme_slug "$name")" >/dev/null 2>&1
+        wait_theme_applied "$name"
+    fi
+    if [[ -n "$bg" && -f "$bg" && "$(background_current)" != "$bg" ]]; then
+        omarchy theme bg set "$bg" >/dev/null 2>&1
+    fi
+    printf 'THEME restored to %s\n' "$(theme_current)"
+}
+
+# The switch runs in the background so its terminal and browser hooks never stall the drive's clock.
+# Waited on by pid, never by a bare wait: the windows are jobs of this shell too.
+theme_pid=0
+theme_switch() {
+    omarchy theme set "$(theme_slug "$1")" >/dev/null 2>&1 &
+    theme_pid=$!
+}
+
+theme_wait() {
+    (( theme_pid > 0 )) && wait "$theme_pid"
+    theme_pid=0
+}
+
+# Sample input, one line of the live colors.toml:
+# foreground        = "#c8ccd0"   # content ink
+live_foreground() {
+    grep -E '^foreground' "$real_state/theme/colors.toml" | grep -oE '#[0-9A-Fa-f]{6}'
+}
+
+# omarchy theme set writes theme.name last, after swapping the theme directory, so the name file
+# reading the target is what says colors.toml is the new theme's. Read before the window is judged.
+theme_wait_s=20
+wait_theme_applied() {
+    local want seen
+    want=$(theme_slug "$1")
+    for _attempt in $(seq 1 $((theme_wait_s * 10))); do
+        seen=$(cat "$real_state/theme.name" 2>/dev/null)
+        [[ "$(theme_slug "$seen")" == "$want" ]] && return 0
+        sleep 0.1
+    done
+    fail "omarchy theme set $want never landed; theme.name still reads '$seen'"
+}
+
+# The window's own palette against the file the theme set just wrote, polled because the watch
+# fires on theme.name and the reload is a round trip behind it. Call wait_theme_applied first.
+wait_foreground() {
+    local want seen
+    want=$(live_foreground)
+    [[ -n "$want" ]] || fail "no foreground in the live colors.toml"
+    # Case-insensitive: a theme file may write #100F0F where the window reports #100f0f, measured.
+    for _attempt in $(seq 1 200); do
+        seen=$(ipc themeForeground 2>/dev/null)
+        [[ "${seen,,}" == "${want,,}" ]] && { printf 'FOREGROUND %s (window agrees with colors.toml)\n' "$seen"; return; }
+        sleep 0.05
+    done
+    fail "the window still paints foreground '$seen' while colors.toml says $want, so the live re-skin did not land"
+}
+
+# ------------------------------------------------------------------ the beats
+
+beat_started=0
+beat_name=""
+
+now_ms() {
+    date +%s%3N
+}
+
+# Opens a beat's clock; the runner closes it, because the beat body runs in a subshell.
+beat() {
+    beat_name="$1"
+    beat_started=$(now_ms)
+    printf '%s %s\n' "$beat_name" "$beat_started" > "$work/beat"
+    printf 'BEAT %-10s %s\n' "$1" "$2"
+}
+
+close_beat() {
+    [[ -f "$work/beat" ]] || return 0
+    read -r beat_name beat_started < "$work/beat"
+    printf 'TIME %-10s %5.1f s\n' "$beat_name" "$(( $(now_ms) - beat_started ))e-3"
+    rm -f "$work/beat"
+}
+
+# A shot of the stage at the beat's peak, only on a dry run: the evidence a visual claim needs.
+shot() {
+    [[ "$shots" == 1 ]] || return 0
+    grim -g "${stage_x},${stage_y} ${stage_w}x${stage_h}" "$evidence/$1.png" || fail "grim failed on $1"
+    printf 'SHOT %s\n' "$evidence/$1.png"
+}
+
+# Steps the open menu's cursor onto a row by its label, so a beat survives rows landing between the
+# ones it cares about. Sample entries: Open|Rename|Duplicate|Compress|Convert|Send with Taildrop|...
+menu_seek() {
+    local want="$1" entries target=-1 i=0 label cursor
+    entries=$(ipc contextMenuEntries)
+    IFS='|' read -ra labels <<< "$entries"
+    for label in "${labels[@]}"; do
+        [[ "$label" == "$want" ]] && { target=$i; break; }
+        i=$((i + 1))
+    done
+    (( target >= 0 )) || fail "menu_seek: no row labelled $want in $entries"
+    for _attempt in $(seq 1 16); do
+        cursor=$(ipc contextMenuCursor)
+        [[ "$cursor" == "$target" ]] && return 0
+        key j
+        sleep 0.3
+    done
+    fail "menu_seek: could not reach $want, the cursor stalled at $(ipc contextMenuCursor)"
+}
+
+# Ctrl+1/2/3 are the Finder view chords keys.toml binds (90cd964), so no view needs the pointer.
+view() {
+    case "$1" in
+        list) chord ctrl 1 ;;
+        columns) chord ctrl 2 ;;
+        grid) chord ctrl 3 ;;
+    esac
+    expect_ipc viewMode "$1"
+}
+
+photos="$HOME/Pictures"
+docs="$HOME/Documents"
+music="$HOME/Music"
+lantern="$HOME/Projects/Lantern"
+iceland="$photos/Iceland, March"
+roll="$photos/Camera roll"
+# Two real, empty directories of the operator's for the mark: the opener and the closer.
+empty_a="$HOME/Desktop"
+empty_b="$HOME/Public"
+
+# Climbs to the home from anywhere inside it, one h at a time, never above it.
+goto_home() {
+    local attempt
+    for attempt in $(seq 1 8); do
+        [[ "$(ipc path)" == "$fixture" ]] && return 0
+        [[ "$(ipc path)" == "$fixture"/* ]] || fail "the pane is at $(ipc path), outside the home"
+        key h
+        settle
+    done
+    fail "could not climb to the home, the pane is at $(ipc path)"
+}
+
+# Opens a path under the home by walking rows, so every step is on camera and nothing is typed.
+goto_path() {
+    local target="$1" rel part next
+    goto_home
+    rel=${target#"$fixture"/}
+    [[ "$rel" != "$target" ]] || fail "$target is not under the home"
+    while [[ -n "$rel" ]]; do
+        part=${rel%%/*}
+        [[ "$part" == "$rel" ]] && rel="" || rel=${rel#*/}
+        # The destination is computed before Enter: read after it, the pane has already moved.
+        next="$(ipc path)/$part"
+        seek_row "$part"
+        key -k Return
+        wait_path "$next"
+    done
+}
+
+# The opener: the mark painting itself into the empty folder, held under one caption turn, then up
+# into the home, nine entries somebody's working files have, and a slow walk down five rows.
+beat_open() {
+    beat open "the mark paints into the empty Desktop; up into the home, a walk down five rows and back"
+    wait_path "$empty_a"
+    expect_ipc emptyShown true
+    # Three shots 0.7 s apart inside the hold, so the dry run can tell a mark mid-stroke from one settled.
+    dwell 4
+    shot open-mark-a
+    dwell 0.7
+    shot open-mark-b
+    dwell 0.7
+    shot open-mark-c
+    dwell $(( opener_s - 6 ))
+    key h
+    wait_path "$fixture"
+    dwell 2.5
+    shot open
+    local i
+    for i in 1 2 3 4 5; do
+        step_down "$i"
+        dwell 0.5
+    done
+    dwell 1.5
+    key g
+    expect_ipc cursor 0
+    dwell 0.8
+}
+
+# Drag out to another application and back in: the second window is a second Flea process, so both
+# drops arrive over the compositor's data device as text/uri-list, the way any application's would.
+beat_drag() {
+    local sx sy tx ty from_b to_a
+    beat drag "into the Iceland photos; the window makes room, a second one opens; a photo out onto a folder, a PDF back in"
+    goto_path "$iceland"
+    dwell 1
+    place "$addr_a" "$(pair_x)" "$(pair_y)" "$pair_w" "$height"
+    dwell 0.5
+    read -r pid_b id_b addr_b < <(spawn "$docs")
+    place "$addr_b" "$(side_x)" "$(pair_y)" "$pair_w" "$height"
+    expect "second window path" "$docs" ipc_b path
+    omarchy-drive focus "$addr_a" >/dev/null
+    dwell 2
+    shot drag-two-windows
+
+    # A drop transfers only over a folder row (tests/drag.sh R1), so the photo lands on notes in the
+    # second window, with ctrl held so it is a copy and the album keeps its frame.
+    seek_row 'basalt columns.jpg'
+    read -r sx sy < <(row_screen_centre ipc "$addr_a" "$(ipc cursor)")
+    read -r tx ty < <(row_screen_centre ipc_b "$addr_b" "$(ipc_b_row_index notes)")
+    printf 'DRAG out from %s,%s to %s,%s (B at %s)\n' "$sx" "$sy" "$tx" "$ty" "$(client_geometry "$addr_b")"
+    ctrl_down
+    drag "$sx" "$sy" "$tx" "$ty"
+    ctrl_up
+    sleep 1
+    shot drag-out-released
+    printf 'DRAG out result: A says [%s] B says [%s] pointer %s\n' "$(ipc lastMessage)" "$(ipc_b lastMessage)" "$(cursor_pos)"
+    made "$docs/notes/basalt columns.jpg"
+    expect_file "$docs/notes/basalt columns.jpg"
+    expect_message_has_b "z undoes"
+    dwell 2.5
+    shot drag-out
+
+    # Back the other way: a document out of the second window onto an album folder in the first, then undone.
+    key h
+    wait_path "$photos"
+    dwell 0.5
+    from_b=$(ipc_b_row_index 'invoice-0142.pdf')
+    to_a=$(row_index_matching 'Studio sessions')
+    (( to_a >= 0 )) || fail "no Studio sessions folder to drop onto"
+    read -r sx sy < <(row_screen_centre ipc_b "$addr_b" "$from_b")
+    read -r tx ty < <(row_screen_centre ipc "$addr_a" "$to_a")
+    printf 'DRAG in from %s,%s to %s,%s (A at %s)\n' "$sx" "$sy" "$tx" "$ty" "$(client_geometry "$addr_a")"
+    ctrl_down
+    drag "$sx" "$sy" "$tx" "$ty"
+    ctrl_up
+    sleep 1
+    shot drag-in-released
+    printf 'DRAG in result: A says [%s] B says [%s] pointer %s\n' "$(ipc lastMessage)" "$(ipc_b lastMessage)" "$(cursor_pos)"
+    made "$photos/Studio sessions/invoice-0142.pdf"
+    expect_file "$photos/Studio sessions/invoice-0142.pdf"
+    expect_message_has "z undoes"
+    dwell 2.5
+    shot drag-in
+    park_pointer
+    key z
+    expect_message_has "Undid the"
+    expect_no_file "$photos/Studio sessions/invoice-0142.pdf"
+    dwell 1.5
+
+    close_window "$addr_b"
+    pid_b=0; id_b=""; addr_b=""
+    dwell 0.5
+    place "$addr_a" "$(rest_x)" "$(rest_y)" "$width" "$height"
+    rotate_point drag-end
+    dwell 1
+}
+
+# The second window's own row lookup, the same glob walk as row_index_matching over ipc_b.
+ipc_b_row_index() {
+    local want="$1" i total name
+    total=$(ipc_b total)
+    for (( i = 0; i < total && i < 200; i++ )); do
+        name=$(ipc_b rowAt "$i")
+        name=${name%%|*}
+        [[ "$name" == $want ]] && { printf '%s' "$i"; return; }
+    done
+    fail "the second window lists no $want"
+}
+
+# macOS's pointer rule over the three albums: one click selects, ctrl adds, shift extends, two open.
+beat_click() {
+    local i j x y
+    beat click "in Pictures: one click selects and opens nothing, a double click opens the camera roll"
+    goto_path "$photos"
+    dwell 1
+    i=$(row_index_matching 'Studio sessions')
+    (( i >= 0 )) || fail "no Studio sessions folder to click"
+    read -r x y < <(row_screen_centre ipc "$addr_a" "$i")
+    glide_to "$x" "$y"
+    click_at "$x" "$y"
+    expect_ipc cursor "$i"
+    expect_ipc path "$photos"
+    dwell 2
+    shot click-selection
+    j=$(row_index_matching 'Camera roll')
+    read -r x y < <(row_screen_centre ipc "$addr_a" "$j")
+    glide_to "$x" "$y"
+    click_at "$x" "$y" --double
+    wait_path "$roll"
+    wait_listing "$roll_batch"
+    dwell 2.5
+    shot click-opened
+    park_pointer
+}
+
+# Eight thousand frames: the end, the start, and pages, each a single key.
+beat_roll() {
+    beat roll "2,400 frames: G to the end, g back, Ctrl+d pages down"
+    wait_listing "$roll_batch"
+    dwell 2
+    key G
+    expect_ipc cursor $((roll_batch - 1))
+    dwell 3
+    key g
+    expect_ipc cursor 0
+    dwell 2
+    chord ctrl d
+    chord ctrl d
+    chord ctrl d
+    expect_cursor_past 0
+    dwell 3
+    shot roll
+    key g
+    expect_ipc cursor 0
+    dwell 1
+}
+
+# Select all of a batch, copy, make a folder, watch the mark paint into the empty folder, paste with
+# the progress line ticking, undo. One gesture chain, four features, nothing cut.
+beat_transfer() {
+    beat transfer "select the whole roll, copy; a new folder, empty, the mark paints in; paste with progress; undo"
+    wait_path "$roll"
+    dwell 0.5
+    chord ctrl a
+    expect_ipc selectionCount "$roll_batch"
+    dwell 2
+    key y
+    expect_message_has "p pastes"
+    dwell 2
+    key h
+    wait_path "$photos"
+    chord ctrl+shift n
+    wait_renaming
+    dwell 1.5
+    type_text 'Contact sheet'
+    dwell 0.8
+    key -k Return
+    expect_ipc renamingIndex -1
+    expect_file "$photos/Contact sheet"
+    made "$photos/Contact sheet"
+    dwell 1.5
+    seek_row 'Contact sheet'
+    key -k Return
+    wait_path "$photos/Contact sheet"
+    expect_ipc emptyShown true
+    dwell 5.6
+    shot transfer-empty-mark
+    key p
+    dwell 1.5
+    shot transfer-progress
+    wait_total "$roll_batch"
+    expect_message_has "z undoes"
+    dwell 3
+    shot transfer-done
+    key z
+    expect_message_has "Undid the"
+    wait_total 0
+    dwell 3
+    key h
+    wait_path "$photos"
+    rotate_point transfer-end
+    dwell 1
+}
+
+# The plain create and undo, then the one the journal refuses: a folder filled since it was made.
+beat_newfolder() {
+    beat newfolder "Ctrl+Shift+N makes a folder, z removes it; a folder filled since is refused"
+    key -k Escape
+    chord ctrl+shift n
+    wait_renaming
+    expect_message_has "Created New Folder"
+    dwell 3
+    shot newfolder-naming
+    key -k Escape
+    expect_ipc renamingIndex -1
+    dwell 1
+    key z
+    expect_message_has "Removed the new folder"
+    expect_no_file "$photos/New Folder"
+    dwell 3
+    chord ctrl+shift n
+    wait_renaming
+    type_text Culled
+    dwell 0.8
+    key -k Return
+    expect_ipc renamingIndex -1
+    expect_file "$photos/Culled"
+    # The first undo takes the name back to New Folder before the refusal, so both names are recorded
+    # and removal tolerates whichever is missing: one run left New Folder behind under the other name.
+    made "$photos/Culled"
+    made "$photos/New Folder"
+    dwell 2.5
+    # Something else writes into it, off camera: the case the refusal exists for.
+    ln "$iceland/moss field.jpg" "$photos/Culled/moss field.jpg"
+    made "$photos/Culled/moss field.jpg"
+    made "$photos/New Folder/moss field.jpg"
+    dwell 1
+    key z
+    # The name was a rename of its own, so the first undo may take the name back before the create is reached.
+    if [[ "$(ipc lastMessage)" == *"Undid the"* ]]; then
+        dwell 3
+        key z
+    fi
+    expect_message_has "filled since"
+    shot newfolder-refused
+    dwell 4.5
+}
+
+# The headline: the operator's home root holds about a hundred thousand entries today, and it
+# settles while the viewer watches, then a search streams in over the lot.
+beat_scale() {
+    local started settled
+    beat scale "h to the home: a hundred thousand entries settle; end, start, and a search streams in"
+    home_rows=$(ls "$HOME" | wc -l)
+    started=$(now_ms)
+    goto_home
+    wait_listing "$home_rows"
+    settled=$(( $(now_ms) - started ))
+    # A warm-cache reading with a window already open, printed for the run log and never carried into a doc.
+    printf 'SETTLED %s rows %s ms after h (warm cache, IPC polling included)\n' "$home_rows" "$settled"
+    shot scale-settled
+    dwell 4
+    key G
+    expect_ipc cursor $((home_rows - 1))
+    dwell 2.5
+    key g
+    expect_ipc cursor 0
+    dwell 1.5
+    key f
+    type_text 7777
+    dwell 0.6
+    key -k Return
+    expect_cursor_past -1
+    dwell 4.5
+    shot scale-search
+    key -k Escape
+    key -k Escape
+    wait_listing "$home_rows"
+    rotate_point scale-end
+    dwell 1
+}
+
+# Columns three levels into the project, then the grid over the Iceland album with the window grown.
+beat_views() {
+    beat views "Ctrl+3 the grid over the album; then Ctrl+2 columns three levels into a project; Ctrl+1"
+    goto_path "$iceland"
+    view grid
+    dwell 3.5
+    shot views-grid
+    view list
+    rotate_point views-after-grid
+    goto_path "$lantern"
+    view columns
+    dwell 1.5
+    seek_row 'brand'
+    dwell 1
+    key -k Return
+    wait_path "$lantern/brand"
+    # The cursor on icons peeks the third level in the last column; then a logo in brand fills it
+    # with a picture, because a 16 px icon is one the thumbnail cache never answers for.
+    seek_row 'icons'
+    dwell 2
+    seek_row 'lantern-logo-dark.png'
+    wait_preview_column
+    dwell 3
+    shot views-columns
+    view list
+    dwell 0.5
+}
+
+# The claim: Flea has no look of its own, it agrees with the desktop. One switch to the other side
+# of dark and light, the wallpaper and the window re-skinning together, then back; the window is not
+# touched from the first switch to the last frame, so nothing reads as a relaunch.
+beat_theme() {
+    local target
+    beat theme "one live theme switch, dark to light or light to dark, wallpaper and window together, then back"
+    target=$(theme_contrast_target)
+    dwell 1.5
+    theme_switch "$target"
+    wait_theme_applied "$target"
+    wait_foreground
+    dwell 7
+    shot "theme-$(printf '%s' "$target" | tr 'A-Z ' 'a-z-')"
+    theme_wait
+    theme_restore
+    wait_foreground
+    dwell 6
+    shot theme-restored
+}
+
+# Quick Look across everything the stage set has: audio at two sample rates, a clip, code with its
+# gutter, a contract that pages, an archive that lists with its "+ N more", and the file too large to preview.
+beat_quicklook() {
+    beat quicklook "in Documents, one Space and j walks it: a contract that pages, a recording, code with a gutter, a log too large, a clip"
+    goto_path "$docs"
+    seek_row 'Consulting*'
+    key -k space
+    expect_ipc previewOpen true
+    expect_ipc previewKind pdf
+    dwell 2.5
+    key l
+    dwell 2
+    key l
+    dwell 1.5
+    shot quicklook-pdf
+    key j
+    expect_ipc previewKind audio
+    expect_ipc previewState playing
+    dwell 3.5
+    shot quicklook-audio
+    key j
+    expect_ipc previewKind pdf
+    dwell 1
+    key j
+    expect_ipc previewKind text
+    dwell 3.5
+    shot quicklook-code
+    key j
+    expect_ipc previewKind text
+    dwell 3
+    shot quicklook-too-large
+    key j
+    expect_ipc previewKind video
+    expect_ipc previewState playing
+    dwell 4
+    shot quicklook-video
+    key -k Escape
+    expect_ipc previewOpen false
+    dwell 0.5
+}
+
+# The error state, twice: a link that points nowhere and a folder the operator may not read. Each
+# answers with a sentence in the pane and never a raw error; the pane comes back with h.
+beat_errors() {
+    local before
+    beat errors "Enter on a dead link, then on a closed folder: a sentence each time, never a dump"
+    goto_path "$docs"
+    seek_row 'Archive drive'
+    before=$(ipc lastMessage)
+    key -k Return
+    settle
+    # Whichever surface answers, it is read and printed: the pane's state line or the status bar.
+    printf 'DEAD LINK state=%s stateMessage=%s bar=%s\n' "$(ipc state)" "$(ipc stateMessage)" "$(ipc lastMessage)"
+    [[ "$(ipc state)" != "listed" || "$(ipc lastMessage)" != "$before" ]] \
+        || fail "Enter on the dead link changed nothing the seam can see"
+    dwell 3.5
+    shot errors-dead-link
+    [[ "$(ipc path)" == "$docs" ]] || { key h; wait_path "$docs"; }
+    key -k Escape
+    seek_row 'Client vault'
+    key -k Return
+    settle
+    printf 'CLOSED state=%s stateMessage=%s bar=%s\n' "$(ipc state)" "$(ipc stateMessage)" "$(ipc lastMessage)"
+    [[ "$(ipc state)" != "listed" ]] || fail "Enter on the closed folder listed something"
+    dwell 3.5
+    shot errors-closed
+    [[ "$(ipc path)" == "$docs" ]] || { key h; wait_path "$docs"; }
+    dwell 1
+}
+
+beat_sort() {
+    beat sort "in Documents: s steps name, size, date; S reverses; directories stay first"
+    goto_path "$docs"
+    dwell 1
+    key s
+    expect_ipc sortMark size:asc
+    dwell 2.5
+    key s
+    expect_ipc sortMark mtime:asc
+    dwell 2.5
+    key S
+    expect_ipc sortMark mtime:desc
+    shot sort-date-desc
+    dwell 2.5
+    key s
+    expect_ipc sortMark name:asc
+    dwell 1
+}
+
+# No seam reads the filter, so its proof is the cursor: j from the first kept row lands on the next
+# kept row, past every row the filter hid between them.
+beat_filter() {
+    local first
+    beat filter "in the Iceland album: / narrows to the DSC frames as the query is typed"
+    goto_path "$iceland"
+    dwell 1
+    # Read before the filter goes up: rowAt indexes the shown rows once it does, and cursor never does.
+    first=$(row_index_matching '*[Dd][Ss][Cc]*')
+    key /
+    type_text dsc
+    dwell 3
+    shot filter
+    key j
+    expect_cursor_past "$first"
+    dwell 1.5
+    key k
+    expect_ipc cursor "$first"
+    key -k Escape
+    dwell 1.5
+}
+
+# Fuzzy, ranked, and home-wide: four letters find the harbour in two folders.
+beat_search() {
+    beat search "f searches the whole home, fuzzily and ranked; o reveals the result where it lives"
+    key f
+    type_text hrbr
+    key -k Return
+    expect_cursor_past -1
+    dwell 4.5
+    shot search
+    key o
+    expect_cursor_row '*harbour*'
+    dwell 3.5
+}
+
+beat_rename() {
+    beat rename "r opens the row as its editor, stem selected, extension muted"
+    goto_path "$docs/notes"
+    key -k Escape
+    seek_row 'ideas.txt'
+    key r
+    wait_renaming
+    dwell 3
+    shot rename-editing
+    type_text 'lantern ideas'
+    dwell 0.8
+    key -k Return
+    expect_ipc renamingIndex -1
+    expect_file "$docs/notes/lantern ideas.txt"
+    made "$docs/notes/lantern ideas.txt"
+    expect_cursor_row 'lantern ideas.txt'
+    dwell 3
+}
+
+beat_trash() {
+    beat trash "d moves to Trash, z puts it back"
+    key -k Escape
+    seek_row 'reading list.md'
+    key d
+    expect_message_has "to Trash"
+    expect_no_file "$docs/notes/reading list.md"
+    dwell 1
+    shot trash
+    dwell 3.5
+    key z
+    expect_message_has "Put it back"
+    expect_file "$docs/notes/reading list.md"
+    dwell 3.5
+}
+
+beat_menu() {
+    beat menu "m raises the row menu from the keyboard over a PDF, j steps it, Esc closes"
+    goto_path "$docs"
+    seek_row '*.pdf'
+    key m
+    expect_ipc contextMenuVisible true
+    dwell 3.5
+    key j
+    key j
+    expect_ipc contextMenuCursor 2
+    dwell 2.5
+    shot menu
+    key -k Escape
+    expect_ipc contextMenuVisible false
+    dwell 1
+}
+
+# Records everything under a path the product just created, files first and directories after, so
+# the manifest's backward walk unlinks the files and then removes the emptied directories.
+made_tree() {
+    local p
+    while IFS= read -r p; do made "$p"; done < <(find "$1" -depth -mindepth 1 2>/dev/null | tac)
+    made "$1"
+}
+
+# The one new entry a directory gained, by name, so a product-named output is recorded without guessing it.
+new_entry_in() {
+    local dir="$1" before="$2" name
+    while IFS= read -r name; do
+        grep -qxF -- "$name" <<< "$before" || { printf '%s' "$name"; return 0; }
+    done < <(ls -A "$dir")
+    return 1
+}
+
+# Extract: the press kit's 43 entries land in a folder beside the archive.
+beat_extract() {
+    local before out
+    beat extract "in Archives: m on the press kit, Extract; a folder of 43 entries appears beside it"
+    goto_path "$docs/Archives"
+    seek_row 'press-kit.zip'
+    before=$(ls -A "$docs/Archives")
+    key m
+    expect_ipc contextMenuVisible true
+    dwell 1
+    menu_seek "Extract"
+    dwell 0.8
+    key -k Return
+    for _attempt in $(seq 1 200); do
+        out=$(new_entry_in "$docs/Archives" "$before") && [[ -d "$docs/Archives/$out" ]] && break
+        sleep 0.1
+    done
+    [[ -n "${out:-}" && -d "$docs/Archives/$out" ]] || fail "no folder appeared beside the archive; the bar says '$(ipc lastMessage)'"
+    made_tree "$docs/Archives/$out"
+    expect_message_has "Extracted"
+    printf 'EXTRACT %s -> %s (%s entries)\n' "press-kit.zip" "$out" "$(find "$docs/Archives/$out" -mindepth 1 | wc -l)"
+    dwell 3.5
+    shot extract-done
+}
+
+# Compress: the brand folder becomes an archive through the submenu's first format.
+beat_compress() {
+    local before out
+    beat compress "in the project: m on the brand folder, Compress, a format; the archive appears"
+    goto_path "$lantern"
+    seek_row 'brand'
+    before=$(ls -A "$lantern")
+    key m
+    expect_ipc contextMenuVisible true
+    dwell 1
+    menu_seek "Compress"
+    dwell 0.8
+    key -k Return
+    dwell 1.5
+    shot compress-formats
+    key -k Return
+    for _attempt in $(seq 1 300); do
+        out=$(new_entry_in "$lantern" "$before") && [[ -s "$lantern/$out" ]] && break
+        sleep 0.1
+    done
+    [[ -n "${out:-}" && -s "$lantern/$out" ]] || fail "no archive appeared; the bar says '$(ipc lastMessage)'"
+    made "$lantern/$out"
+    expect_message_has "Archive written"
+    printf 'COMPRESS brand -> %s (%s bytes)\n' "$out" "$(stat -c %s "$lantern/$out")"
+    dwell 3
+    shot compress-done
+}
+
+# Convert: the one dialog in the product, with a long name it elides in the middle; the result lands beside the source.
+beat_convert() {
+    local before out
+    beat convert "in the album: m on the long-named waterfall, Convert; the dialog, then the converted file"
+    goto_path "$iceland"
+    seek_row 'waterfall*'
+    before=$(ls -A "$iceland")
+    key m
+    expect_ipc contextMenuVisible true
+    dwell 1
+    menu_seek "Convert"
+    dwell 0.8
+    key -k Return
+    expect_ipc convertOpen true
+    dwell 3.5
+    shot convert-dialog
+    key -k Return
+    for _attempt in $(seq 1 300); do
+        out=$(new_entry_in "$iceland" "$before") && [[ -s "$iceland/$out" ]] && break
+        sleep 0.1
+    done
+    [[ -n "${out:-}" && -s "$iceland/$out" ]] || fail "no converted file appeared; the bar says '$(ipc lastMessage)'"
+    made "$iceland/$out"
+    printf 'CONVERT waterfall -> %s, bar: %s\n' "$out" "$(ipc lastMessage)"
+    dwell 3
+    shot convert-done
+}
+
+# Taildrop: the submenu is the shot, a live list of the tailnet's peers; the send is a status line.
+beat_taildrop() {
+    local peers
+    beat taildrop "m on a demo file, Send with Taildrop opens the peer list; Enter sends to the laptop"
+    goto_path "$docs/notes"
+    seek_row 'flea demo, sent with Taildrop.txt'
+    key m
+    expect_ipc contextMenuVisible true
+    dwell 1.5
+    menu_seek "Send with Taildrop"
+    dwell 1
+    key -k Return
+    settle
+    peers=$(ipc contextMenuSubmenuEntries)
+    printf 'TAILDROP peers: %s\n' "$peers"
+    [[ -n "$peers" ]] || fail "the Taildrop submenu listed no peers"
+    dwell 4
+    shot taildrop-peers
+    # Peers sort by label, so the flyout opens on the NAS and the laptop is the row below it.
+    key j
+    dwell 1
+    printf 'TAILDROP target: %s\n' "$(printf '%s' "$peers" | cut -d"|" -f2)"
+    key -k Return
+    expect_message_has "Sending"
+    printf 'TAILDROP sent: %s\n' "$(ipc lastMessage)"
+    dwell 3.5
+    shot taildrop-sent
+}
+
+# Dropbox: a move into the synced folder, then the share link from the row now sitting there.
+beat_dropbox() {
+    beat dropbox "Move to Dropbox from the menu; in Dropbox, Copy share link lands the link in the bar"
+    seek_row 'flea demo, shared from Dropbox.txt'
+    key m
+    expect_ipc contextMenuVisible true
+    dwell 1
+    menu_seek "Move to Dropbox"
+    dwell 1
+    key -k Return
+    expect_file "$HOME/Dropbox/flea demo, shared from Dropbox.txt"
+    expect_message_has "Dropbox"
+    printf 'DROPBOX moved: %s\n' "$(ipc lastMessage)"
+    dwell 3
+    shot dropbox-moved
+    goto_path "$HOME/Dropbox"
+    seek_row 'flea demo, shared from Dropbox.txt'
+    key m
+    expect_ipc contextMenuVisible true
+    dwell 1
+    menu_seek "Copy share link"
+    dwell 1
+    key -k Return
+    settle
+    for _attempt in $(seq 1 100); do
+        [[ "$(ipc lastMessage)" == *[Ll]ink* ]] && break
+        sleep 0.1
+    done
+    printf 'DROPBOX share link: %s\n' "$(ipc lastMessage)"
+    [[ "$(ipc lastMessage)" == *[Ll]ink* ]] || fail "no share link sentence landed in the bar, it says '$(ipc lastMessage)'"
+    dwell 4
+    shot dropbox-link
+}
+
+# The rail: home and the favourites, the network group, the add-network form.
+beat_rail() {
+    local i count last
+    beat rail "Tab into the rail and walk it; a opens the add-network form"
+    key -k Tab
+    expect_ipc focusView rail
+    dwell 1.5
+    count=$(ipc railCount)
+    last=$(( count - 1 ))
+    for i in $(seq 1 "$last"); do
+        key j
+        expect_ipc railCursor "$i"
+        dwell 0.3
+    done
+    dwell 1.5
+    shot rail
+    key a
+    expect_ipc dialogOpen true
+    dwell 3.5
+    shot rail-add-network
+    key -k Escape
+    expect_ipc dialogOpen false
+    dwell 0.8
+    key -k Escape
+    expect_ipc focusView list
+    dwell 0.5
+}
+
+beat_keys() {
+    beat keys "? shows the whole map on one sheet; the last frame is the home"
+    key '?'
+    expect_ipc keymapSheetOpen true
+    dwell 6
+    shot keys
+    key -k Escape
+    expect_ipc keymapSheetOpen false
+    dwell 1
+}
+
+# The closer absorbs the remainder of the target, so the run ends on the mark exactly when the
+# voiceover does. A hold longer than one caption turn is split between the two empty folders the
+# run has, Scans and the Contact sheet the transfer beat emptied again, so no sentence repeats in place.
+run_started_ms=0
+beat_closer() {
+    local remaining segments each i here
+    beat closer "back on the theme stage found; the mark on the empty Desktop, for whatever of the voiceover is left"
+    # The last switch of the take is the restore, verified, before the mark takes over.
+    theme_wait
+    theme_restore
+    wait_foreground
+    remaining=$(( target_s - ( $(now_ms) - run_started_ms ) / 1000 ))
+    if (( remaining < 8 )); then
+        printf 'CLOSER the beats ran %s s past the target; holding 8 s, trim before the take\n' "$(( 8 - remaining ))"
+        remaining=8
+    fi
+    segments=$(( (remaining + caption_turn_s - 1) / caption_turn_s ))
+    (( segments > 4 )) && segments=4
+    each=$(( remaining / segments ))
+    printf 'CLOSER %s s left, %s hold(s) of about %s s\n' "$remaining" "$segments" "$each"
+    for (( i = 0; i < segments; i++ )); do
+        if (( i % 2 == 0 )); then here="$empty_a"; else here="$empty_b"; fi
+        goto_path "$here"
+        expect_ipc emptyShown true
+        # The last hold takes the clock's own remainder, so the transitions above never push past the target.
+        if (( i == segments - 1 )); then
+            each=$(( target_s - ( $(now_ms) - run_started_ms ) / 1000 ))
+            (( each < 3 )) && each=3
+        fi
+        if (( i == 0 )); then
+            shot closer-a
+            dwell 0.7
+            shot closer-b
+        fi
+        dwell "$each"
+    done
+    shot end
+}
+
+all_beats="open drag click transfer newfolder views scale quicklook errors search rename trash taildrop dropbox rail keys closer"
+
+run_beats() {
+    local beats="${*:-$all_beats}" b started
+    load_state
+    [[ -n "$(client_json "$addr_a")" ]] || fail "the staged window is gone, run stage again"
+    park_pointer
+    theme_pool
+    started=$(now_ms)
+    run_started_ms=$started
+    last_switch_ms=$started
+    rm -f "$work/rotation"
+    for b in $beats; do
+        declare -F "beat_$b" >/dev/null || fail "no beat called $b (have: $all_beats)"
+        # The opener and the closer belong to the mark on the theme stage found; everything between rotates.
+        case "$b" in
+            open) rotate_on=0 ;;
+            closer) rotate_on=0 ;;
+            *) rotate_on=1; rotate_point "before-$b" ;;
+        esac
+        # A beat that fails is skipped, not fatal: a take missing one beat is worth more than no take.
+        if ( "beat_$b" ); then
+            :
+        else
+            printf 'SKIPPED %s after a failure, carrying on\n' "$b"
+            recover_after_beat
+        fi
+        rotation_load
+        close_beat
+    done
+    printf 'SWITCHES %s\n' "$switches"
+    printf 'TOTAL %.1f s\n' "$(( $(now_ms) - started ))e-3"
+}
+
+# After a failed beat: any second window closed, any menu, dialog or preview dismissed, the pointer parked.
+recover_after_beat() {
+    local pid
+    for pid in $(fixture_instances); do
+        (( pid == pid_a )) || { kill "$pid" 2>/dev/null; printf 'RECOVER closed a second window, pid %s\n' "$pid"; }
+    done
+    ctrl_up
+    release
+    park_pointer
+    key -k Escape; key -k Escape; key -k Escape
+    place "$addr_a" "$(rest_x)" "$(rest_y)" "$width" "$height" >/dev/null 2>&1 || true
+}
+
+# ------------------------------------------------------------------ the theme check
+
+# The live re-skin has never been tested: one shot per surface under a switched theme, so a
+# surface that kept the old palette is a finding and not a staging note.
+surface_tour() {
+    local tag="$1"
+    goto_path "$iceland"
+    shot "$tag-list"
+    key m
+    expect_ipc contextMenuVisible true
+    shot "$tag-menu"
+    key -k Escape
+    expect_ipc contextMenuVisible false
+    key '?'
+    expect_ipc keymapSheetOpen true
+    shot "$tag-keys"
+    key -k Escape
+    expect_ipc keymapSheetOpen false
+    seek_row '*.jpg'
+    key -k space
+    expect_ipc previewKind image
+    dwell 1
+    shot "$tag-quicklook"
+    key -k Escape
+    expect_ipc previewOpen false
+    key -k Tab
+    expect_ipc focusView rail
+    key a
+    expect_ipc dialogOpen true
+    shot "$tag-network"
+    key -k Escape
+    expect_ipc dialogOpen false
+    key -k Escape
+    expect_ipc focusView list
+    view columns
+    shot "$tag-columns"
+    view list
+}
+
+theme_check() {
+    local name tag
+    shots=1
+    while read -r name; do
+        tag=theme-check-$(printf '%s' "$name" | tr 'A-Z ' 'a-z-')
+        theme_switch "$name"
+        wait_theme_applied "$name"
+        theme_wait
+        wait_foreground
+        surface_tour "$tag"
+    done < <(theme_targets)
+    theme_restore
+    wait_foreground
+    surface_tour theme-check-restored
+}
+
+# ------------------------------------------------------------------ the recording
+
+recording_path() {
+    grep '^recording=' "$state" | cut -d= -f2-
+}
+
+# The recorder called directly on the monitor: the stock command reaches only its very_high preset
+# and a picker. Native size, constant 60 fps, constant-quality ultra, cursor recorded, the same
+# CPU fallback the stock command passes. What it was actually launched with is read back from ps.
+cmd_record() {
+    local out stamp pid
+    load_state
+    command -v gpu-screen-recorder >/dev/null || fail "gpu-screen-recorder is missing"
+    grep -q '^recording=' "$state" && fail "a recording is already registered: $(recording_path)"
+    stamp=$(date +%Y-%m-%d-%H%M)
+    mkdir -p "$real_home/Videos"
+    out="$real_home/Videos/flea-showcase-$stamp-${stage_w}x${stage_h}.mp4"
+    gpu-screen-recorder -w "$monitor" -f "$gsr_fps" -fm cfr -k "$gsr_codec" -q "$gsr_quality" -bm qp \
+        -cursor yes -fallback-cpu-encoding yes -o "$out" >"$work/gsr.log" 2>&1 </dev/null 3>&- 4>&- &
+    pid=$!
+    for _attempt in $(seq 1 100); do
+        [[ -s "$out" ]] && break
+        kill -0 "$pid" 2>/dev/null || fail "the recorder exited before writing anything: $(tail -3 "$work/gsr.log")"
+        sleep 0.1
+    done
+    [[ -s "$out" ]] || fail "the recorder started but wrote nothing in 10 s: $(tail -3 "$work/gsr.log")"
+    printf 'recording=%s\ngsr_pid=%s\n' "$out" "$pid" >> "$state"
+    park_pointer
+    printf 'GSR %s\n' "$(ps -o args= -p "$pid")"
+    printf 'RECORDING %s\n' "$out"
+}
+
+# SIGINT is what saves the file, the same signal the stock command sends; then the facts of the
+# file itself, read by ffprobe, and never the settings this drive meant to pass.
+cmd_stop() {
+    local out pid
+    load_state
+    out=$(recording_path)
+    pid=$(grep '^gsr_pid=' "$state" | cut -d= -f2-)
+    [[ -n "$out" && -n "$pid" ]] || fail "no recording is registered"
+    kill -INT "$pid" 2>/dev/null
+    for _attempt in $(seq 1 100); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+    done
+    kill -0 "$pid" 2>/dev/null && fail "the recorder did not exit within 10 s of SIGINT; the file may be unfinished"
+    sed -i '/^recording=/d; /^gsr_pid=/d' "$state"
+    [[ -s "$out" ]] || fail "no file at $out"
+    printf 'FILE %s\n' "$out"
+    printf 'SIZE %s bytes\n' "$(stat -c %s "$out")"
+    ffprobe -v error -show_entries format=duration:stream=codec_name,width,height,r_frame_rate,pix_fmt -of default=nw=1 "$out"
+}
+
+# ------------------------------------------------------------------ the commands
+
+save_state() {
+    printf 'theme=%s\nbackground=%s\npid_a=%s\nid_a=%s\naddr_a=%s\nstage_x=%s\nstage_y=%s\nstage_w=%s\nstage_h=%s\nmonitor=%s\n' \
+        "$(theme_current)" "$(background_current)" "$pid_a" "$id_a" "$addr_a" \
+        "$stage_x" "$stage_y" "$stage_w" "$stage_h" "$monitor" >> "$state"
+}
+
+# stage, record, run and stop are separate invocations, so the window and the stage travel through this file.
+load_state() {
+    [[ -f "$state" ]] || fail "nothing is staged, run stage first"
+    pid_a=$(grep '^pid_a=' "$state" | cut -d= -f2-)
+    id_a=$(grep '^id_a=' "$state" | cut -d= -f2-)
+    addr_a=$(grep '^addr_a=' "$state" | cut -d= -f2-)
+    stage_x=$(grep '^stage_x=' "$state" | cut -d= -f2-)
+    stage_y=$(grep '^stage_y=' "$state" | cut -d= -f2-)
+    stage_w=$(grep '^stage_w=' "$state" | cut -d= -f2-)
+    stage_h=$(grep '^stage_h=' "$state" | cut -d= -f2-)
+    monitor=$(grep '^monitor=' "$state" | cut -d= -f2-)
+    [[ -n "$addr_a" && -n "$id_a" && -n "$monitor" ]] || fail "the state file names no window or monitor"
+}
+
+cmd_stage() {
+    assert_box_clear
+    fixture_build
+    mkdir -p "$work"
+    : > "$state"
+    bar_hide
+    dnd_on
+    # Read after the bar has gone, so the strut it reserved is not subtracted from the stage.
+    read_stage
+    read -r pid_a id_a addr_a < <(spawn "$empty_a")
+    expect_ipc themeLoaded true
+    place "$addr_a" "$(rest_x)" "$(rest_y)" "$width" "$height"
+    save_state
+    park_pointer
+    wait_path "$empty_a"
+    expect_ipc emptyShown true
+    printf 'STAGE %s %sx%s at %s,%s (the whole monitor is recorded)\n' "$monitor" "$stage_w" "$stage_h" "$stage_x" "$stage_y"
+    printf 'STAGED theme=%s background=%s\n' "$(theme_current)" "$(background_current)"
+}
+
+cmd_teardown() {
+    local trouble=0
+    # The trap is disarmed first, so a fail inside a restore cannot start a second teardown.
+    trap - EXIT
+    printf 'TEARDOWN begins, state %s, manifest %s\n' "$([[ -f "$state" ]] && echo present || echo absent)" "$([[ -f "$manifest" ]] && echo present || echo absent)"
+    if [[ -f "$state" ]] && grep -q '^gsr_pid=' "$state"; then
+        cmd_stop || trouble=1
+    fi
+    # The theme first: measured on one run, the bar stayed hidden for 90 s with its flag clear and
+    # re-mapped the moment the theme changed, so the theme restore is what wakes the bar. Then quiet.
+    printf 'TEARDOWN theme\n'; theme_restore || trouble=1
+    printf 'TEARDOWN bar\n';   bar_restore || trouble=1
+    printf 'TEARDOWN quiet\n'; dnd_restore || trouble=1
+    printf 'TEARDOWN windows\n'; kill_flea
+    printf 'TEARDOWN furnishing\n'; fixture_remove || trouble=1
+    rm -f "$state"
+    if (( trouble == 0 )); then
+        printf 'TEARDOWN done\n'
+    else
+        printf 'TEARDOWN finished with something not restored, see above\n' >&2
+        exit 1
+    fi
+}
+
+case "${1:-}" in
+    fixture) fixture_build ;;
+    stage) cmd_stage ;;
+    record) cmd_record ;;
+    run) shift; run_beats "$@" ;;
+    stop) cmd_stop ;;
+    dry-run)
+        shift
+        shots=1
+        trap cmd_teardown EXIT
+        cmd_stage
+        run_beats "$@"
+        theme_check
+        ;;
+    theme-check)
+        trap cmd_teardown EXIT
+        cmd_stage
+        theme_check
+        ;;
+    teardown) cmd_teardown ;;
+    *)
+        sed -n '2,12p' "$0" | cut -c3-
+        exit 2
+        ;;
+esac

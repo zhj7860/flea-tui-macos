@@ -1,0 +1,2944 @@
+#!/usr/bin/env bash
+# The display half of tools/flea-acceptance, which sources this. Everything in here needs a real
+# Flea window, which is why it is a separate file behind a separate flag: the request battery still
+# runs headless on a box whose one display another lane is holding.
+#
+# Nothing here is a key list. Every chord is derived from keys.toml at run time by derive_bindings
+# below, so the keymap lane's Finder chords were driven the day they landed and a key added tomorrow
+# arrives as an item nobody drives rather than as nothing at all. The menu derives its rows from
+# ui/js/Menu.js the same way, and the Omarchy group derives its chords from Omarchy's own
+# /usr/share/omarchy/default/hypr/bindings/clipboard.lua.
+#
+# Every check reads a value before the chord and a value after it. An assertion whose before value
+# already equals what it is about to require cannot fail, so changed_to and changed_from below
+# refuse that case rather than printing a pass.
+#
+# Hard rule 9: every write and delete is inside the sandbox tools/flea-sandbox-guard made.
+
+# ---- the graphical session -----------------------------------------------------------------------
+
+# The window coalescer is 16 ms and a refill is a round trip, the same settle tests/ui.sh uses.
+SETTLE_S=${FLEA_DRIVE_SETTLE_S:-0.4}
+# A transfer crosses a process boundary and lands on disk, so it gets its own longer wait.
+TRANSFER_WAIT_S=${FLEA_DRIVE_TRANSFER_WAIT_S:-15}
+# The backend's own DRAIN_LIMIT is 25 s, the same wait tests/ui.sh gives it.
+DRAIN_WAIT_S=30
+DRIVE_PRESET=default
+DRIVE_CONTEXT=listing
+DRIVE_ROW_ID=setup
+DRIVE_SHOTS=0
+
+# omarchy-drive env omits the Qt platform theme, without which no row icon resolves; the same
+# three-step recovery tests/ui.sh and tools/flea-showcase both use, ending at a live client's own
+# environment, which is the only authoritative answer.
+platform_theme() {
+  systemctl --user show-environment | grep '^QT_QPA_PLATFORMTHEME=' | cut -d= -f2-
+}
+
+platform_theme_from_a_live_client() {
+  local pid
+  pid=$(pgrep -x quickshell | head -1)
+  [ -n "$pid" ] || return 0
+  tr '\0' '\n' < "/proc/$pid/environ" | grep '^QT_QPA_PLATFORMTHEME=' | cut -d= -f2-
+}
+
+drive_session_setup() {
+  export PATH="$HOME/.local/bin:$PATH"
+  command -v omarchy-drive >/dev/null || die "omarchy-drive is not on PATH, so no window can be driven"
+  local session line name names=" "
+  session=$(omarchy-drive env) || die "omarchy-drive env failed"
+  # Sample session line: export XDG_RUNTIME_DIR=/run/user/1000.
+  while IFS= read -r line; do
+    name=${line%%=*}; name=${name#export }
+    case "$name" in
+      XDG_RUNTIME_DIR|WAYLAND_DISPLAY|HYPRLAND_INSTANCE_SIGNATURE|YDOTOOL_SOCKET|OMARCHY_PATH|QT_LINUX_ACCESSIBILITY_ALWAYS_ON) ;;
+      *) die "unexpected omarchy-drive environment name: $name" ;;
+    esac
+    [[ "$line" == "export $name="* && "$names" != *" $name "* ]] || die "invalid or duplicate session variable: $name"
+    printf -v "$name" '%s' "${line#*=}"
+    export "${name?}"
+    names="$names$name "
+  done <<< "$session"
+  for name in XDG_RUNTIME_DIR WAYLAND_DISPLAY HYPRLAND_INSTANCE_SIGNATURE YDOTOOL_SOCKET OMARCHY_PATH QT_LINUX_ACCESSIBILITY_ALWAYS_ON; do
+    [[ "$names" == *" $name "* && -n "${!name}" ]] || die "session omitted $name"
+  done
+  [[ "$XDG_RUNTIME_DIR" == "/run/user/$(id -u)" && "$OMARCHY_PATH" == /usr/share/omarchy \
+     && "$YDOTOOL_SOCKET" == "$XDG_RUNTIME_DIR/.ydotool_socket" && "$WAYLAND_DISPLAY" =~ ^wayland-[0-9]+$ ]] \
+    || die "omarchy-drive returned an unexpected session"
+  exec {DRIVE_LOCK}>"$XDG_RUNTIME_DIR/flea-display.lock"
+  flock -n "$DRIVE_LOCK" || die "another owner holds flea-display.lock"
+  [ -n "${QT_QPA_PLATFORMTHEME:-}" ] || export QT_QPA_PLATFORMTHEME="$(platform_theme)"
+  [ -n "$QT_QPA_PLATFORMTHEME" ] || export QT_QPA_PLATFORMTHEME="$(platform_theme_from_a_live_client)"
+  [ -n "$QT_QPA_PLATFORMTHEME" ] || die "nothing published QT_QPA_PLATFORMTHEME, so no row would draw an icon"
+}
+
+# ---- the seam into the running window --------------------------------------------------------------
+
+ipc() {
+  omarchy-drive ipc -p "$REPO/ui" flea "$@"
+}
+
+# Every keystroke goes through omarchy-drive, which focuses the window and refuses a wrong class first.
+k() {
+  local identity active shift_letter=""
+  # omarchy-drive silently drops a -- argument and still exits 0, so a chord built with one presses
+  # nothing and every check behind it fails for a reason that is not the product.
+  [ "${1:-}" != -- ] || die "a -- argument is silently dropped by omarchy-drive key; pass the text bare"
+  identity=$(drive_window_identity) || die "native key target lost its owned identity"
+  drive_mutation_guard "$(ipc path)" || die "native key target left the owned listing"
+  printf 'KEY %s' "$DRIVE_ROW_ID" >> "$DRIVE_EVIDENCE/commands.log"
+  printf ' %q' "$@" >> "$DRIVE_EVIDENCE/commands.log"
+  printf '\n' >> "$DRIVE_EVIDENCE/commands.log"
+  if [[ "$#" == 1 && "$1" =~ ^[A-Z]$ ]]; then shift_letter=${1,,}; fi
+  if [[ "$#" == 6 && "$1" == -M && "$2" == shift && "$3" == -k && "$4" =~ ^[a-z]$ && "$5" == -m && "$6" == shift ]]; then
+    shift_letter=$4
+  fi
+  if [[ -n "$shift_letter" ]]; then
+    omarchy-drive focus "$DRIVE_WINDOW_ADDRESS" || die "Shift-letter target could not receive focus"
+    active=$(hyprctl activewindow -j) || die "active window unavailable before kernel input"
+    jq -e --argjson owned "$identity" '.address == $owned.address and .pid == $owned.pid' <<< "$active" >/dev/null \
+      || die "kernel input refused: the owned candidate does not have focus"
+    printf 'ROUTE kernel Shift+%s\n' "$shift_letter" >> "$DRIVE_EVIDENCE/commands.log"
+    omarchy-drive hotkey --global shift "$shift_letter" >> "$DRIVE_EVIDENCE/commands.log" 2>&1 \
+      || die "native Shift-letter delivery failed for $DRIVE_ROW_ID"
+    return
+  fi
+  omarchy-drive key --window "$DRIVE_WINDOW_ADDRESS" "$@" >> "$DRIVE_EVIDENCE/commands.log" 2>&1 \
+    || die "omarchy-drive key failed for $DRIVE_ROW_ID"
+}
+
+settle() {
+  sleep "$SETTLE_S"
+}
+
+park_pointer() {
+  local x y
+  read -r x y < <(hyprctl monitors -j | jq -er '.[0] | "\(.x) \(.y)"')
+  [[ "$x" =~ ^-?[0-9]+$ && "$y" =~ ^-?[0-9]+$ ]] || die "monitor origin unavailable"
+  omarchy-drive move "$x" "$y" || die "pointer parking failed"
+}
+
+# A picture of one surface, for a claim no IPC reader can carry. It is never an assertion on its own:
+# the check beside it still has to read a value back.
+drive_shot() {
+  local output
+  [[ "$1" =~ ^[a-zA-Z0-9_-]+$ ]] || die "unsafe screenshot label: $1"
+  DRIVE_SHOTS=$((DRIVE_SHOTS + 1))
+  output="$DRIVE_EVIDENCE/$DRIVE_ROW_ID-$DRIVE_SHOTS-$1.png"
+  drive_guard "$output"
+  [[ ! -e "$output" ]] || die "screenshot output already exists: $output"
+  drive_window_identity >/dev/null || die "screenshot target lost ownership"
+  omarchy-drive shot "$output" "$DRIVE_WINDOW_ADDRESS" || die "native screenshot failed: $output"
+  [[ -s "$output" && "$(od -An -tx1 -N8 "$output" | tr -d ' \n')" == 89504e470d0a1a0a ]] \
+    || die "native screenshot did not create a fresh PNG: $output"
+  printf 'SHOT %s sha256=%s visual_inspection=pending\n' "$output" "$(sha256sum "$output" | cut -d' ' -f1)"
+}
+
+window_json() {
+  drive_window_identity
+}
+
+# Sample input, one hyprctl client: {"address":"0x5a1c","at":[12,742],"size":[1261,686],...}
+# The window is tiled and is not at the origin, so a click aimed with window-relative coordinates
+# and no origin lands in whatever window happens to be above this one. This function existed only in
+# tools/flea-showcase and click_row called it anyway: an undefined command inside a process
+# substitution prints nothing, read leaves the variables empty, and bash arithmetic reads empty as
+# zero, so the correction silently became "add nothing" and every pointer check failed.
+window_geometry() {
+  window_json | jq -r '"\(.at[0]) \(.at[1]) \(.size[0]) \(.size[1]) \(.address)"'
+}
+
+flea_pids() {
+  local pid
+  for pid in $(pgrep -x qs || true); do
+    [ -r "/proc/$pid/cmdline" ] || continue
+    if tr '\0' ' ' 2>/dev/null < "/proc/$pid/cmdline" | grep -Fq "$REPO/ui"; then
+      printf '%s\n' "$pid"
+    fi
+  done
+}
+
+backend_pids() {
+  local pid
+  for pid in $(pgrep -x flea || true); do
+    [ -r "/proc/$pid/cmdline" ] || continue
+    if tr '\0' ' ' 2>/dev/null < "/proc/$pid/cmdline" | grep -Fq -- "$BIN --backend"; then
+      printf '%s\n' "$pid"
+    fi
+  done
+}
+
+# ---- the assertions ------------------------------------------------------------------------------
+
+# The reason the last driver refused, read by the caller so one item reports once however many
+# bindings it drove.
+WHY=""
+
+# An assertion whose before value already equals what it is about to require cannot fail. Both of
+# these refuse that case, which is the whole difference between a check and a decoration.
+changed_to() {
+  local what=$1 before=$2 after=$3 want=$4
+  printf 'ASSERT %s before=%q after=%q expected=%q\n' "$what" "$before" "$after" "$want"
+  if [ "$before" = "$want" ]; then
+    WHY="$what was already '$want' before the chord, so this check could not fail"
+    return 1
+  fi
+  [ "$after" = "$want" ] && return 0
+  WHY="$what went '$before' to '$after', wanted '$want'"
+  return 1
+}
+
+changed_from() {
+  local what=$1 before=$2 after=$3
+  printf 'ASSERT %s before=%q after=%q expected=changed\n' "$what" "$before" "$after"
+  [ "$before" != "$after" ] && return 0
+  WHY="$what stayed '$before', so the chord had no effect"
+  return 1
+}
+
+# ---- the chords, derived from keys.toml ----------------------------------------------------------
+
+# Sample row: key-id|mac|gui|listing|ctrl|X| (empty action is an explicit refusal).
+derive_bindings() {
+  python3 - "$REPO/ui/js/Keymap.js" <<'PYTHON'
+import hashlib, json, os, pathlib, re, shutil, subprocess, sys, tempfile
+keymap = pathlib.Path(sys.argv[1]).resolve()
+# The same derivation calls the real lookupFor under Node or the existing headless Qt runner.
+script = r"""
+function derive(context, Qt, emit) {
+    var punctuation = { ' ': 'Space', '/': 'Slash', '?': 'Question', '.': 'Period', ',': 'Comma',
+        '-': 'Minus', '_': 'Underscore', '+': 'Plus', '=': 'Equal', '>': 'Greater',
+        '<': 'Less', '[': 'BracketLeft', ']': 'BracketRight' };
+    function event(row) {
+        var plain = !(row.mask & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier));
+        var namedText = Object.keys(punctuation).find(function(char) { return punctuation[char] === row.key; });
+        var text = row.mods === 'text' ? row.text : !plain ? '' : namedText ||
+            (row.key.length === 1 ? (row.mask & Qt.ShiftModifier ? row.key : row.key.toLowerCase()) : '');
+        var code = text ? 'Key_' + (punctuation[text] || text.toUpperCase()) : row.code;
+        return { key: Qt[code], text: text,
+            mask: row.mods === 'text' ? (/^[A-Z?_<>+]$/.test(text) ? Qt.ShiftModifier : 0) : row.mask };
+    }
+    var candidates = context.PRESET_KEYS.concat(context.SHARED_KEYS);
+    for (var digit = context.DIGITS.from; digit <= context.DIGITS.to; digit++)
+        candidates.push({ preset: 'all', mods: 'text', key: String(digit), text: String(digit), code: '', mask: 0 });
+    var count = 0;
+    context.PRESETS.forEach(function(preset) {
+        ['gui', 'tui'].forEach(function(frontend) {
+            ['listing', 'rail', 'menu', 'panel', 'preview', 'pdf', 'media', 'editor'].forEach(function(scope) {
+                var seen = {};
+                candidates.forEach(function(row) {
+                    if (row.preset !== 'all' && row.preset !== preset) return;
+                    // A listing chord also needs a refusal row in every overlay that does not bind it.
+                    var identity = [preset, frontend, scope, row.mods, row.key].join('|');
+                    if (seen[identity]) return;
+                    seen[identity] = true;
+                    var input = event(row);
+                    var action = context.lookupFor(preset, input.key, input.text, input.mask, scope, frontend);
+                    var fields = [preset, frontend, scope, row.mods, row.key, action];
+                    if (fields.some(function(value) { return /[|\r\n]/.test(value); }))
+                        throw new Error('unrepresentable key matrix field');
+                    emit(fields.join('|'));
+                    count++;
+                });
+            });
+        });
+    });
+    emit('__DONE__|' + count);
+}
+"""
+engine = os.environ.get('FLEA_MATRIX_ENGINE', '')
+if engine not in ('', 'node', 'qml6'):
+    raise SystemExit('unknown key matrix engine: ' + engine)
+engine = engine or ('node' if shutil.which('node') else 'qml6')
+if not shutil.which(engine):
+    raise SystemExit('key matrix requires existing node or qml6')
+scratch = None
+try:
+    if engine == 'node':
+        source = re.sub(r'^\.pragma library\s*', '', keymap.read_text())
+        bootstrap = r"""
+const vm = require('node:vm');
+const Qt = {NoModifier:0, ShiftModifier:0x02000000, ControlModifier:0x04000000,
+    AltModifier:0x08000000, MetaModifier:0x10000000};
+const source = SOURCE;
+for (const name of new Set(source.match(/Key_[A-Za-z0-9_]+/g))) Qt[name] = name;
+const context = vm.createContext({Qt});
+vm.runInContext(source, context, {timeout:1000});
+""".replace('SOURCE', json.dumps(source))
+        body = bootstrap + script + '\nderive(context, Qt, row => console.log("FLEA_MATRIX_ROW " + row));\n'
+        result = subprocess.run(['node', '-'], input=body, text=True, capture_output=True, timeout=30)
+    else:
+        scratch = pathlib.Path(tempfile.mkdtemp(prefix='flea-acceptance-matrix.', dir='/tmp'))
+        (scratch / '.flea-matrix').write_text('owned key derivation fixture\n')
+        (scratch / 'derive.js').write_text(script)
+        (scratch / 'matrix.qml').write_text('import QtQuick\nimport ' + json.dumps(keymap.as_uri()) + r""" as Keymap
+import "derive.js" as Matrix
+QtObject {
+    Component.onCompleted: {
+        try { Matrix.derive(Keymap, Qt, function(row) { console.log("FLEA_MATRIX_ROW " + row); }); }
+        catch (error) { console.error(error); Qt.exit(1); return; }
+        Qt.quit();
+    }
+}
+""")
+        environment = dict(os.environ, QT_QPA_PLATFORM='offscreen', QT_FORCE_STDERR_LOGGING='1',
+            QML_DISABLE_DISK_CACHE='1', XDG_CACHE_HOME=str(scratch / 'cache'))
+        result = subprocess.run(['qml6', str(scratch / 'matrix.qml')], env=environment,
+            text=True, capture_output=True, timeout=30)
+    if result.returncode:
+        raise SystemExit('key matrix engine failed: ' + result.stdout + result.stderr)
+    rows, done = [], []
+    for line in (result.stdout + result.stderr).splitlines():
+        if 'FLEA_MATRIX_ROW ' not in line:
+            continue
+        row = line.split('FLEA_MATRIX_ROW ', 1)[1]
+        if row.startswith('__DONE__|'):
+            done.append(int(row.split('|')[1]))
+        else:
+            rows.append(row)
+    if done != [len(rows)] or not rows or len(set(rows)) != len(rows):
+        raise SystemExit('key matrix engine omitted its completion tally or returned duplicate rows')
+    for row in rows:
+        fields = row.split('|')
+        if len(fields) != 6:
+            raise SystemExit('invalid key matrix row: ' + row)
+        identity = '|'.join(fields[:5])
+        print('key-' + hashlib.sha256(identity.encode()).hexdigest()[:16] + '|' + row)
+finally:
+    if scratch is not None:
+        if not str(scratch) or not scratch.is_absolute() or scratch.parent != pathlib.Path('/tmp') \
+                or not scratch.name.startswith('flea-acceptance-matrix.') or not (scratch / '.flea-matrix').is_file():
+            raise SystemExit('refusing unsafe key matrix fixture cleanup')
+        shutil.rmtree(scratch)
+PYTHON
+}
+
+# keys.toml names keys the way Qt does; wtype speaks xkb keysyms. A name with no row here makes its
+# binding report as undriven rather than be guessed at, so a key added to the table tomorrow says it
+# needs a keysym instead of silently never being pressed.
+# Sample input: "Return" gives "Return", "Enter" gives "KP_Enter", "D" gives "d", "1" gives "1".
+keysym_for() {
+  case $1 in
+    Return|Delete|Escape|Tab|Up|Down|Left|Right|F2|F10|Home|End|Insert|Menu) printf '%s' "$1" ;;
+    Backtab) printf 'ISO_Left_Tab' ;;
+    PageUp) printf 'Prior' ;;
+    PageDown) printf 'Next' ;;
+    Enter) printf 'KP_Enter' ;;
+    Backspace) printf 'BackSpace' ;;
+    Space) printf 'space' ;;
+    Greater) printf 'greater' ;;
+    Period) printf 'period' ;;
+    Comma) printf 'comma' ;;
+    BracketLeft) printf 'bracketleft' ;;
+    BracketRight) printf 'bracketright' ;;
+    Plus) printf 'plus' ;;
+    Equal) printf 'equal' ;;
+    Minus) printf 'minus' ;;
+    Underscore) printf 'underscore' ;;
+    [A-Z]) printf '%s' "$1" | tr 'A-Z' 'a-z' ;;
+    [0-9]) printf '%s' "$1" ;;
+    *) return 1 ;;
+  esac
+}
+
+# The wtype arguments for one binding, one per line so the caller reads them into an array without a
+# word split. A [[text]] row types its character; every other table is a chord on a keysym with the
+# modifiers pressed around it.
+chord_args() {
+  local table=$1 keyname=$2 sym
+  # Text goes bare because `--` is dropped; `-` uses its keysym because wtype parses it as a flag.
+  if [ "$table" = text ]; then
+    if [ "$keyname" = - ]; then
+      printf -- '-k\nminus\n'
+    else
+      printf -- '%s\n' "$keyname"
+    fi
+    return 0
+  fi
+  sym=$(keysym_for "$keyname") || return 1
+  case $table in
+    ctrl)      printf -- '-M\nctrl\n-k\n%s\n-m\nctrl\n' "$sym" ;;
+    ctrlshift) printf -- '-M\nctrl\n-M\nshift\n-k\n%s\n-m\nshift\n-m\nctrl\n' "$sym" ;;
+    shift)     printf -- '-M\nshift\n-k\n%s\n-m\nshift\n' "$sym" ;;
+    code|none) printf -- '-k\n%s\n' "$sym" ;;
+    alt)       printf -- '-M\nalt\n-k\n%s\n-m\nalt\n' "$sym" ;;
+    super)     printf -- '-M\nlogo\n-k\n%s\n-m\nlogo\n' "$sym" ;;
+    supershift) printf -- '-M\nlogo\n-M\nshift\n-k\n%s\n-m\nshift\n-m\nlogo\n' "$sym" ;;
+    superalt)  printf -- '-M\nlogo\n-M\nalt\n-k\n%s\n-m\nalt\n-m\nlogo\n' "$sym" ;;
+    *) return 1 ;;
+  esac
+}
+
+# How a chord is written in the report, so a reader can tell which of an action's keys was pressed.
+chord_label() {
+  case $1 in
+    ctrl) printf '^%s' "$2" ;;
+    ctrlshift) printf '^S-%s' "$2" ;;
+    shift) printf 'S-%s' "$2" ;;
+    code) printf '<%s>' "$2" ;;
+    *) printf '%s' "$2" ;;
+  esac
+}
+
+# The chord array for the first binding of an action, which is how the helpers below move the cursor
+# and unwind state without naming a key themselves.
+# Dies rather than returning empty: every action asked for here is one this battery drives, so a
+# chord that cannot be resolved means keys.toml lost a binding. An empty array would send no keys at
+# all and leave the checks that depend on it failing for a reason nothing names.
+first_chord() {
+  local action=$1 context=${2:-listing} id preset frontend scope mods keyname act wanted
+  for wanted in "$action" "${action}Arm"; do
+    while IFS='|' read -r id preset frontend scope mods keyname act; do
+      [[ "$preset" == "$DRIVE_PRESET" && "$frontend" == gui && "$scope" == "$context" && "$act" == "$wanted" ]] || continue
+      chord_args "$mods" "$keyname" || continue
+      [[ "$wanted" == "$action" ]] || chord_args "$mods" "$keyname" || return 1
+      return 0
+    done < "$BINDINGS"
+  done
+  die "no deliverable $DRIVE_PRESET/gui/$context binding for setup action '$action'"
+}
+
+# ---- the fixture ---------------------------------------------------------------------------------
+
+# Rows enough that a page step and a jump to the end both move, plus one file of every kind a
+# preview or a menu row needs. Every name is generated here, so nothing personal is ever in it.
+BULK_ROWS=30
+HAVE_IMAGE=0
+HAVE_PDF=0
+HAVE_MEDIA=0
+HAVE_ARCHIVE=0
+
+drive_fixture_build() {
+  local n name
+  # A scratch, not a sandbox of its own: sandbox_make would drop its marker file into the very
+  # directory whose row count these checks assert. The marker stays up on $SB.
+  sandbox_scratch "$DRIVE_FIXTURE"
+  mkdir -p "$DRIVE_FIXTURE/sub" "$DRIVE_FIXTURE/dest"
+  printf 'alpha\n' > "$DRIVE_FIXTURE/a-note.txt"
+  printf 'inner\n' > "$DRIVE_FIXTURE/sub/inner.txt"
+  printf 'hidden\n' > "$DRIVE_FIXTURE/.a-hidden.txt"
+  printf 'filter me\n' > "$DRIVE_FIXTURE/zz-unique-filter.txt"
+  # One file per operation, so no two checks fight over the same row and every negative control
+  # ("this is not at the destination yet") means something.
+  for name in op-copy op-cut op-paste op-trash op-undo menu-trash op-rename-click \
+              super-copy super-cut super-paste; do
+    printf '%s\n' "$name" > "$DRIVE_FIXTURE/$name.txt"
+  done
+  for n in $(seq -w 1 "$BULK_ROWS"); do
+    printf 'row %s\n' "$n" > "$DRIVE_FIXTURE/f-$n.txt"
+  done
+  # A missing tool is not a skipped check: the items needing it report undriven and name it.
+  if command -v magick >/dev/null; then
+    magick -size 320x200 gradient:'#0e1112-#b38956' "$DRIVE_FIXTURE/b-image.png" 2>/dev/null && HAVE_IMAGE=1
+    # Each page in its own parentheses, or magick draws one annotation onto every page. The pages
+    # carry different text because the page turn is asserted by reading the page back off the screen.
+    magick \( -size 400x560 xc:white -fill black -font Liberation-Sans -pointsize 40 -annotate +40+80 'PAGEONE' \) \
+           \( -size 400x560 xc:white -fill black -font Liberation-Sans -pointsize 40 -annotate +40+80 'PAGETWO' \) \
+           \( -size 400x560 xc:white -fill black -font Liberation-Sans -pointsize 40 -annotate +40+80 'PAGETHREE' \) \
+           "$DRIVE_FIXTURE/c-doc.pdf" 2>/dev/null && HAVE_PDF=1
+  fi
+  if command -v ffmpeg >/dev/null; then
+    ffmpeg -loglevel error -y -f lavfi -i 'testsrc2=size=320x240:rate=30' -t 30 \
+      -pix_fmt yuv420p "$DRIVE_FIXTURE/d-clip.mp4" 2>/dev/null && HAVE_MEDIA=1
+  fi
+  if command -v bsdtar >/dev/null; then
+    bsdtar -a -c -f "$DRIVE_FIXTURE/e-bundle.tar.zst" -C "$DRIVE_FIXTURE/sub" . 2>/dev/null && HAVE_ARCHIVE=1
+  fi
+}
+
+# ---- the window ------------------------------------------------------------------------------------
+
+# Whatever Flea is running before this function is somebody else's, most likely the operator's own,
+# and the teardown must never take it. This ran once with an indiscriminate teardown behind it and
+# killed the operator's window from the very refusal path that exists to protect it: the trap is
+# armed before the launch, so the refusal below still ran the teardown on its way out.
+DRIVE_LAUNCHED=0
+DRIVE_WINDOW_ADDRESS=""
+DRIVE_BUS_PID=""
+
+drive_guard() {
+  [[ -n "$1" && "$1" == /* && -f "$SB/$SANDBOX_MARKER" ]] || die "unmarked or non-absolute acceptance mutation: $1"
+  sandbox_require "$1"
+  [[ "$SANDBOX_PATH" == "$SB/"* ]] || die "acceptance mutation escaped its own sandbox: $1"
+}
+
+drive_mutation_guard() {
+  local path
+  [[ -n "$1" && "$1" == /* && -f "$SB/$SANDBOX_MARKER" ]] || return 1
+  path=$(realpath -m -- "$1") || return 1
+  [[ "$path" == "$DRIVE_FIXTURE" || "$path" == "$DRIVE_FIXTURE/"* ]]
+}
+
+drive_owned_pids() {
+  python3 - "$SB" "${1:-}" <<'PY'
+import os, pathlib, sys
+root, requested = sys.argv[1:]
+for process in [pathlib.Path('/proc', requested)] if requested else pathlib.Path('/proc').iterdir():
+    if not process.name.isdigit() or int(process.name) in (os.getpid(), os.getppid()):
+        continue
+    try:
+        environment = dict(item.split(b'=', 1) for item in (process / 'environ').read_bytes().split(b'\0') if b'=' in item)
+        bus, separator, guid = environment.get(b'DBUS_SESSION_BUS_ADDRESS', b'').partition(b',guid=')
+        private = bus == os.fsencode('unix:path=' + root + '/bus') and (not separator or len(guid) == 32 and all(byte in b'0123456789abcdef' for byte in guid))
+        private = private and environment.get(b'XDG_DATA_HOME') == os.fsencode(root + '/data')
+        tagged = environment.get(b'FLEA_ACCEPTANCE_RUN') == os.fsencode(root)
+        if process.stat().st_uid == os.getuid() and (tagged or private):
+            print(process.name)
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        continue
+PY
+}
+
+drive_window_identity() {
+  python3 - "$SB" "$BIN" "$REPO/ui" "${1:-$DRIVE_WINDOW_ADDRESS}" <<'PY'
+import json, os, pathlib, subprocess, sys
+root, binary, ui, address = sys.argv[1:]
+clients = json.loads(subprocess.check_output(['hyprctl', 'clients', '-j']))
+matches = [row for row in clients if row.get('class') == 'com.thisisgm.flea' and (not address or row['address'] == address)]
+if len(matches) != 1:
+    raise SystemExit('owned Flea window is missing or ambiguous')
+window = matches[0]
+process = pathlib.Path('/proc', str(window['pid']))
+environment = (process / 'environ').read_bytes().split(b'\0')
+required = ['FLEA_ACCEPTANCE_RUN=' + root, 'FLEA_UI=' + ui, 'FLEA_BIN=' + binary]
+if process.stat().st_uid != os.getuid() or any(os.fsencode(value) not in environment for value in required):
+    raise SystemExit('Flea window environment does not belong to this candidate run')
+if os.fsencode(ui) not in (process / 'cmdline').read_bytes().split(b'\0'):
+    raise SystemExit('Flea window did not load the identified UI directory')
+print(json.dumps(window, separators=(',', ':')))
+PY
+}
+
+drive_private_state() {
+  local directory
+  export FLEA_ACCEPTANCE_RUN="$SB"
+  export XDG_STATE_HOME="$SB/state" XDG_CONFIG_HOME="$SB/config"
+  export XDG_DATA_HOME="$SB/data" XDG_CACHE_HOME="$SB/cache"
+  # The undo journal has its own knob because the session runtime dir stays real.
+  export FLEA_UNDO_DIR="$SB/undo"
+  for directory in "$XDG_STATE_HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$FLEA_UNDO_DIR"; do
+    drive_guard "$directory"
+    mkdir -p "$directory" || die "cannot create private XDG directory: $directory"
+  done
+  chmod 0700 "$FLEA_UNDO_DIR" || die "cannot lock down the private undo directory"
+  # The native terminal uses POSIX sh, whose interactive startup file and history are fixture-owned.
+  export SHELL=/bin/sh ENV="$XDG_CONFIG_HOME/terminal-env" HISTFILE="$SB/terminal-history"
+  drive_guard "$ENV"
+  : > "$ENV" || die "cannot create private terminal startup file"
+  printf 'foot.desktop\n' > "$XDG_CONFIG_HOME/xdg-terminals.list" || die "cannot select the private native terminal"
+  drive_guard "$XDG_CONFIG_HOME/foot"
+  mkdir "$XDG_CONFIG_HOME/foot" || die "cannot create private foot configuration"
+  printf '[main]\nshell=/bin/sh\nlogin-shell=no\n' > "$XDG_CONFIG_HOME/foot/foot.ini" || die "cannot isolate native terminal startup"
+}
+
+drive_seed_preset() {
+  drive_guard "$XDG_STATE_HOME/flea"
+  "$BIN" --ui-state "$(jq -cn --arg preset "$DRIVE_PRESET" '{keys:$preset,view:"list",hidden:false,sort:{key:"name",reverse:false},preview:{column:true,loadOn:"manual"},display:{textSize:{mode:"system"}},menu:{hidden:[]}}')" \
+    > "$SB/state-seed-$DRIVE_PRESET.log" || die "could not seed private $DRIVE_PRESET preferences"
+}
+
+drive_bus_id() {
+  gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
+    --method org.freedesktop.DBus.GetId | python3 -c 'import ast,sys; print(ast.literal_eval(sys.stdin.read())[0])'
+}
+
+drive_private_trash() {
+  local parent current="" end provider_count=0 pid
+  parent=$(drive_bus_id) || die "parent D-Bus identity unavailable"
+  export DBUS_SESSION_BUS_ADDRESS="unix:path=$SB/bus"
+  dbus-daemon --session --nofork --address="$DBUS_SESSION_BUS_ADDRESS" > "$SB/dbus.log" 2>&1 &
+  DRIVE_BUS_PID=$!
+  end=$((SECONDS + 10))
+  while (( SECONDS < end )); do
+    current=$(drive_bus_id 2>/dev/null) && break
+    kill -0 "$DRIVE_BUS_PID" 2>/dev/null || die "private D-Bus daemon exited"
+    sleep 0.05
+  done
+  [[ -n "$current" && "$current" != "$parent" ]] || die "private D-Bus identity was not established"
+  [[ "$(realpath -e "$(command -v gio)")" == /usr/bin/gio ]] || die "gio resolves to a stub"
+  /usr/bin/gio list trash:/// > "$SB/initial-trash.log" || die "private GIO Trash mount failed"
+  [[ ! -s "$SB/initial-trash.log" ]] || die "private Trash is not empty; refusing to exercise it"
+  for pid in $(drive_owned_pids); do
+    if [[ "$(cat "/proc/$pid/comm")" == gvfsd-trash ]]; then provider_count=$((provider_count + 1)); fi
+  done
+  [[ "$provider_count" == 1 ]] || die "expected one attributable private Trash provider, found $provider_count"
+  printf 'TRASH_SESSION parent=%s private=%s daemon=%s root=%s\n' "$parent" "$current" "$DRIVE_BUS_PID" "$XDG_DATA_HOME"
+}
+
+# The product's own launcher, with both seams on the launch line so a packaged /usr/share/flea/ui can
+# never outrank this tree.
+drive_launch() {
+  if omarchy-drive wait window flea --timeout 0 >/dev/null 2>&1; then
+    die "a Flea window is already open, and only one lane may hold the display"
+  fi
+  FLEA_UI="$REPO/ui" FLEA_BIN="$BIN" setsid nohup "$BIN" --gui "$DRIVE_FIXTURE" \
+    >"$SB/flea-$DRIVE_PRESET.log" 2>&1 </dev/null &
+  DRIVE_LAUNCHED=1
+  omarchy-drive wait window flea --timeout 15 >/dev/null 2>&1 || die "no Flea window appeared in 15 s"
+  DRIVE_WINDOW_ADDRESS=$(drive_window_identity | jq -er '.address') || die "cannot identify native candidate window"
+  omarchy-drive focus "$DRIVE_WINDOW_ADDRESS" || die "owned candidate could not receive focus"
+  # The seam is built after the first listing, so the window has mapped before it answers.
+  omarchy-drive wait ipc -p "$REPO/ui" flea ready true --timeout 20 >/dev/null 2>&1 || die "the IPC seam never answered ready in 20 s"
+  # A window under a fixture HOME renders the fallback palette, and every colour claim off it is
+  # worthless; ui/Theme.qml carries the flag for exactly this check.
+  [ "$(ipc themeLoaded)" = true ] || die "themeLoaded is not true, so this window paints a fallback palette"
+  wait_path "$DRIVE_FIXTURE" || die "the pane never opened the fixture"
+  [[ "$(ipc keymapPreset)" == "$DRIVE_PRESET" ]] || die "live preset differs from seeded $DRIVE_PRESET"
+  local pid found=0
+  for pid in $(backend_pids); do
+    [[ "$(drive_owned_pids "$pid")" == "$pid" ]] || continue
+    [[ "$(readlink -f "/proc/$pid/exe")" == "$BIN" ]] || die "backend is not the identified candidate"
+    printf 'BACKEND pid=%s binary=%s\n' "$pid" "$BIN"
+    found=$((found + 1))
+  done
+  [[ "$found" -gt 0 ]] || die "owned candidate has no attributable backend"
+  printf 'NATIVE_WINDOW preset=%s identity=%s\n' "$DRIVE_PRESET" "$(drive_window_identity)"
+  park_pointer
+}
+
+# Kills only what this run started. A pid that was already there when drive_launch looked belongs to
+# somebody else and is skipped by name, not by timing.
+drive_teardown() {
+  local pid waited
+  [ "$DRIVE_LAUNCHED" = 1 ] || return 0
+  for pid in $(flea_pids); do
+    [[ "$(drive_owned_pids "$pid")" == "$pid" ]] || continue
+    kill "$pid" 2>/dev/null
+  done
+  for waited in $(seq 1 $((DRAIN_WAIT_S * 20))); do
+    [ -z "$(drive_product_pids)" ] && break
+    sleep 0.05
+  done
+  [[ -z "$(drive_product_pids)" ]] || { printf 'FAIL: candidate processes did not drain after %ss\n' "$DRAIN_WAIT_S" >&2; return 1; }
+  DRIVE_LAUNCHED=0
+  DRIVE_WINDOW_ADDRESS=""
+}
+
+drive_product_pids() {
+  local pid
+  for pid in $(flea_pids) $(backend_pids); do
+    [[ "$(drive_owned_pids "$pid")" != "$pid" ]] || printf '%s\n' "$pid"
+  done
+}
+
+wait_path() {
+  local want=$1 seen attempt
+  for attempt in $(seq 1 200); do
+    seen=$(ipc path)
+    [ "$seen" = "$want" ] && return 0
+    sleep 0.05
+  done
+  WHY="the pane is at '$seen', not '$want'"
+  return 1
+}
+
+wait_file() {
+  local want=$1 attempt
+  for attempt in $(seq 1 $((TRANSFER_WAIT_S * 10))); do
+    [ -e "$want" ] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+# ---- putting the app in a known state -------------------------------------------------------------
+
+# Esc unwinds one thing at a time, so it is sent until every overlay reader is quiet rather than a
+# fixed number of times. Then the view and the directory are put back.
+reset_state() {
+  local attempt state quiet end=$((SECONDS + 20))
+  mapfile -t esc < <(chord_args code Escape)
+  while (( SECONDS < end )); do
+    state=$(ipc keyDeliveryState) || { WHY="key delivery observer unavailable during reset"; return 1; }
+    quiet=$(jq -er '.searchMode == "" and (.filterTyping | not) and .filterQuery == "" and .keySequence == ""' <<< "$state")
+    if [ "$(ipc contextMenuVisible)" = false ] && [ "$(ipc previewOpen)" = false ] \
+       && [ "$(ipc dialogOpen)" = false ] && [ "$(ipc keymapSheetOpen)" = false ] \
+       && [ "$(ipc convertOpen)" = false ] && [ "$(ipc shareBrowserOpen)" = false ] \
+       && [ "$(ipc settingsOpen)" = false ] && [ "$(ipc renamingIndex)" = -1 ] \
+       && [[ "$(ipc menuDialogState | jq -r .opened)" == false && "$(ipc permissionsState | jq -r .opened)" == false ]] \
+       && [ "$(ipc selectionCount)" = 0 ] && [ "$(ipc focusView)" = list ] && [[ "$quiet" == true ]]; then
+      break
+    fi
+    k "${esc[@]}"
+    settle
+  done
+  (( SECONDS < end )) || { WHY="native Escape did not unwind all observed contexts"; return 1; }
+  if [ "$(ipc viewMode)" != list ]; then
+    mapfile -t chord < <(first_chord viewList)
+    k "${chord[@]}"
+    settle
+  fi
+  local tabs
+  for tabs in 1 2 3 4 5 6 7 8 9; do
+    [ "$(ipc tabCount)" -le 1 ] && break
+    mapfile -t closech < <(first_chord tabClose)
+    k "${closech[@]}"
+    settle
+  done
+  if [[ "$(ipc path)" != "$DRIVE_FIXTURE" ]]; then
+    mapfile -t chord < <(first_chord pathBar)
+    k "${chord[@]}"; settle
+    k -M ctrl -k a -m ctrl "$DRIVE_FIXTURE" -k Return
+    wait_path "$DRIVE_FIXTURE" || return 1
+  fi
+  jq -e '.listFocus or .paneFocus' <<< "$(ipc keyDeliveryState)" >/dev/null \
+    || { WHY="reset returned the logical listing without actual pane/list focus"; return 1; }
+}
+
+drive_expect() {
+  local reader=$1 predicate=$2 state end=$((SECONDS + 15))
+  while (( SECONDS < end )); do
+    state=$(ipc "$reader") || { WHY="$reader observation failed"; return 1; }
+    if jq -e "$predicate" <<< "$state" >/dev/null; then
+      printf 'OBSERVED %s %s %s\n' "$DRIVE_ROW_ID" "$reader" "$state"
+      return 0
+    fi
+    sleep 0.05
+  done
+  WHY="$reader did not satisfy $predicate; observed $state"
+  return 1
+}
+
+drive_action() {
+  local -a binding
+  mapfile -t binding < <(first_chord "$1" "${2:-listing}")
+  [[ "${#binding[@]}" -gt 0 ]] || return 1
+  k "${binding[@]}"
+  settle
+}
+
+# Walks the cursor to a row by name from the top, with the derived chords, so no check depends on an
+# index a sort could move. Both chords are driven as their own items before anything calls this, so a
+# broken one is reported plainly rather than only as every later check failing.
+seek_row_named() {
+  local want=$1 i
+  mapfile -t firstc < <(first_chord cursorFirst)
+  mapfile -t downc < <(first_chord cursorDown)
+  local pass
+  for pass in 1 2; do
+    k "${firstc[@]}"
+    settle
+    for i in $(seq 1 60); do
+      case "$(ipc rowAt "$(ipc cursor)")" in
+        "$want|"*) return 0 ;;
+      esac
+      k "${downc[@]}"
+    done
+    # A narrowed listing is the one state that hides a row that is really there, and it is not on the
+    # IPC seam, so the walk unwinds and tries once more rather than reporting the product missing it.
+    mapfile -t escs < <(chord_args code Escape)
+    k "${escs[@]}"; k "${escs[@]}"; k "${escs[@]}"
+    settle
+  done
+  WHY="could not put the cursor on $want, even after unwinding, so the listing is not showing the fixture"
+  return 1
+}
+
+# The status bar clears a transient after ui/StatusBar.qml's messageMs, which is 4000. Waiting for
+# that empty is what keeps a message assertion honest: nine tab keys all say the same sentence, so
+# without this the second one would read its own predecessor's line as the answer and pass on it.
+wait_message_clear() {
+  local attempt
+  for attempt in $(seq 1 70); do
+    [ -z "$(ipc lastMessage)" ] && return 0
+    sleep 0.1
+  done
+  WHY="the status line never cleared, it still reads '$(ipc lastMessage)'"
+  return 1
+}
+
+# Enters a directory by name and comes back, so an operation's destination is reached with the
+# product's own keys rather than by telling the backend where to go.
+enter_dir() {
+  seek_row_named "$1" || return 1
+  mapfile -t openc < <(first_chord open)
+  k "${openc[@]}"
+  wait_path "$DRIVE_FIXTURE/$1"
+}
+
+leave_dir() {
+  mapfile -t parentc < <(first_chord parent)
+  k "${parentc[@]}"
+  wait_path "$DRIVE_FIXTURE"
+}
+
+# ---- the key drivers -------------------------------------------------------------------------------
+#
+# One function per action, named keycase_<action>, taking the chord as its arguments. Each puts the
+# app in the state the action needs, reads the observable before the chord, sends it, and reads the
+# observable after. None of them reports: the runner does that once per action however many bindings
+# the action has, and a refusal comes back as WHY.
+
+# -- moving the cursor --
+
+keycase_cursorFirst() {
+  local before after
+  reset_state || return 1
+  mapfile -t downc < <(first_chord cursorDown)
+  k "${downc[@]}"; k "${downc[@]}"; k "${downc[@]}"; settle
+  before=$(ipc cursor)
+  k "$@"; settle
+  after=$(ipc cursor)
+  changed_to cursor "$before" "$after" 0
+}
+
+keycase_cursorDown() {
+  local before after
+  reset_state || return 1
+  mapfile -t firstc < <(first_chord cursorFirst)
+  k "${firstc[@]}"; settle
+  before=$(ipc cursor)
+  k "$@"; settle
+  after=$(ipc cursor)
+  changed_to cursor "$before" "$after" "$((before + 1))"
+}
+
+keycase_cursorUp() {
+  local before after
+  reset_state || return 1
+  mapfile -t firstc < <(first_chord cursorFirst)
+  mapfile -t downc < <(first_chord cursorDown)
+  k "${firstc[@]}"; k "${downc[@]}"; k "${downc[@]}"; settle
+  before=$(ipc cursor)
+  k "$@"; settle
+  after=$(ipc cursor)
+  changed_to cursor "$before" "$after" "$((before - 1))"
+}
+
+keycase_cursorLast() {
+  local before after total
+  reset_state || return 1
+  mapfile -t firstc < <(first_chord cursorFirst)
+  k "${firstc[@]}"; settle
+  total=$(ipc total)
+  before=$(ipc cursor)
+  k "$@"; settle
+  after=$(ipc cursor)
+  changed_to cursor "$before" "$after" "$((total - 1))"
+}
+
+keycase_pageDown() {
+  local before after
+  reset_state || return 1
+  mapfile -t firstc < <(first_chord cursorFirst)
+  k "${firstc[@]}"; settle
+  before=$(ipc cursor)
+  k "$@"; settle
+  after=$(ipc cursor)
+  changed_from cursor "$before" "$after" || return 1
+  [ "$after" -gt "$before" ] && return 0
+  WHY="the cursor went up, from $before to $after"
+  return 1
+}
+
+keycase_pageUp() {
+  local before after
+  reset_state || return 1
+  mapfile -t lastc < <(first_chord cursorLast)
+  k "${lastc[@]}"; settle
+  before=$(ipc cursor)
+  k "$@"; settle
+  after=$(ipc cursor)
+  changed_from cursor "$before" "$after" || return 1
+  [ "$after" -lt "$before" ] && return 0
+  WHY="the cursor went down, from $before to $after"
+  return 1
+}
+
+# -- selecting --
+
+expect_selection() {
+  local cursor=$1 members=$2 seen_cursor seen_members
+  seen_cursor=$(ipc cursor) && seen_members=$(ipc selectedIndices) || return 1
+  printf 'ASSERT selection cursor=%s members=%q expected_cursor=%s expected_members=%q\n' "$seen_cursor" "$seen_members" "$cursor" "$members"
+  [[ "$seen_cursor" == "$cursor" && "$seen_members" == "$members" ]] \
+    || { WHY="selection has cursor=$seen_cursor and members=$seen_members; expected cursor=$cursor and members=$members"; return 1; }
+}
+
+keycase_toggleSelect() {
+  local cursor
+  reset_state || return 1
+  cursor=$(ipc cursor)
+  expect_selection "$cursor" "" || return 1
+  k "$@"; settle
+  expect_selection "$cursor" "$cursor"
+}
+
+keycase_extendDown() {
+  reset_state || return 1
+  mapfile -t firstc < <(first_chord cursorFirst)
+  k "${firstc[@]}"; settle
+  expect_selection 0 "" || return 1
+  k "$@"; settle
+  expect_selection 1 "0,1"
+}
+
+keycase_extendUp() {
+  local last
+  reset_state || return 1
+  mapfile -t lastc < <(first_chord cursorLast)
+  k "${lastc[@]}"; settle
+  last=$(( $(ipc total) - 1 ))
+  expect_selection "$last" "" || return 1
+  k "$@"; settle
+  expect_selection "$((last - 1))" "$((last - 1)),$last"
+}
+
+keycase_selectAll() {
+  local cursor total members
+  reset_state || return 1
+  cursor=$(ipc cursor); total=$(ipc total)
+  expect_selection "$cursor" "" || return 1
+  members=$(seq 0 "$((total - 1))" | paste -sd, -)
+  k "$@"; settle
+  expect_selection "$cursor" "$members"
+}
+
+keycase_escape() {
+  local cursor
+  reset_state || return 1
+  cursor=$(ipc cursor)
+  mapfile -t selc < <(first_chord toggleSelect)
+  k "${selc[@]}"; settle
+  expect_selection "$cursor" "$cursor" || return 1
+  k "$@"; settle
+  expect_selection "$cursor" ""
+}
+
+# -- the three views, the two sorts, the hidden files --
+
+keycase_viewList() {
+  local before after
+  reset_state || return 1
+  mapfile -t gridc < <(first_chord viewGrid)
+  k "${gridc[@]}"; settle
+  before=$(ipc viewMode)
+  k "$@"; settle
+  after=$(ipc viewMode)
+  changed_to "the view mode" "$before" "$after" list
+}
+
+keycase_viewColumns() {
+  local before after
+  reset_state || return 1
+  before=$(ipc viewMode)
+  k "$@"; settle
+  after=$(ipc viewMode)
+  changed_to "the view mode" "$before" "$after" columns
+}
+
+keycase_viewGrid() {
+  local before after
+  reset_state || return 1
+  before=$(ipc viewMode)
+  k "$@"; settle
+  after=$(ipc viewMode)
+  changed_to "the view mode" "$before" "$after" grid
+}
+
+keycase_sortNext() {
+  local before after
+  reset_state || return 1
+  before=$(ipc sortMark)
+  k "$@"; settle
+  after=$(ipc sortMark)
+  changed_from "the sort mark" "$before" "$after"
+}
+
+keycase_sortReverse() {
+  local before after
+  reset_state || return 1
+  before=$(ipc sortMark)
+  k "$@"; settle
+  after=$(ipc sortMark)
+  changed_from "the sort mark" "$before" "$after"
+}
+
+keycase_toggleHidden() {
+  local before after want
+  reset_state || return 1
+  before=$(ipc showHidden)
+  want=true
+  [ "$before" = true ] && want=false
+  k "$@"; settle
+  after=$(ipc showHidden)
+  changed_to "the hidden-file flag" "$before" "$after" "$want"
+}
+
+# -- the overlays and the one dialog --
+
+keycase_menu() {
+  local before after
+  reset_state || return 1
+  seek_row_named a-note.txt || return 1
+  before=$(ipc contextMenuVisible)
+  k "$@"; settle
+  after=$(ipc contextMenuVisible)
+  changed_to "the context menu" "$before" "$after" true || return 1
+  drive_shot menu-listing
+}
+
+keycase_keymapSheet() {
+  local before after
+  reset_state || return 1
+  before=$(ipc keymapSheetOpen)
+  k "$@"; settle
+  after=$(ipc keymapSheetOpen)
+  changed_to "the keymap sheet" "$before" "$after" true
+}
+
+keycase_addNetwork() {
+  local before after
+  reset_state || return 1
+  before=$(ipc dialogOpen)
+  k "$@"; settle
+  after=$(ipc dialogOpen)
+  changed_to "the network dialog" "$before" "$after" true
+}
+
+keycase_preview() {
+  local before after
+  reset_state || return 1
+  seek_row_named a-note.txt || return 1
+  before=$(ipc previewOpen)
+  k "$@"; settle
+  after=$(ipc previewOpen)
+  changed_to "the preview" "$before" "$after" true
+}
+
+keycase_rename() {
+  local before after
+  reset_state || return 1
+  seek_row_named a-note.txt || return 1
+  before=$(ipc renamingIndex)
+  k "$@"; settle
+  after=$(ipc renamingIndex)
+  if [ "$before" != "-1" ]; then
+    WHY="a row was already its own editor before the chord, so this check could not fail"
+    return 1
+  fi
+  [ "$after" != "-1" ] && return 0
+  WHY="no row became its own editor, renamingIndex is still $after"
+  return 1
+}
+
+keycase_focusNext() {
+  local before after
+  reset_state || return 1
+  before=$(ipc focusView)
+  k "$@"; settle
+  after=$(ipc focusView)
+  changed_to "the focused view" "$before" "$after" rail
+}
+
+# -- narrowing and walking --
+
+keycase_filter() {
+  local before after
+  reset_state || return 1
+  mapfile -t firstc < <(first_chord cursorFirst)
+  k "${firstc[@]}"; settle
+  before=$(ipc rowAt 0)
+  k "$@"; settle
+  k -d 40 'zz-unique'
+  settle; settle
+  after=$(ipc rowAt 0)
+  # Closed here as well as in reset_state: a driver that leaves a query line up hands the next check
+  # a listing of one row and a caret that eats its keys.
+  mapfile -t escf < <(chord_args code Escape)
+  k "${escf[@]}"; k "${escf[@]}"; settle
+  changed_from "the first drawn row" "$before" "$after" || return 1
+  case $after in
+    'zz-unique-filter.txt|'*) return 0 ;;
+  esac
+  WHY="the first drawn row is '$after', wanted the one file matching the query"
+  return 1
+}
+
+keycase_search() {
+  local before after
+  reset_state || return 1
+  before=$(ipc rowAt 0)
+  k "$@"; settle
+  k -d 40 'inner'
+  mapfile -t retc < <(chord_args code Return)
+  k "${retc[@]}"
+  sleep 2
+  after=$(ipc rowAt 0)
+  changed_from "the first drawn row" "$before" "$after" || return 1
+  # docs/protocol.md: the walk matches over the whole relative path, so the row is named by that
+  # path and not by its base name. A driver expecting the base name reads a correct product as broken.
+  case $after in
+    *'inner.txt|'*) return 0 ;;
+  esac
+  # If search becomes a universal walk of $HOME (the operator's own defect 3), this fixture is at
+  # $FIXTURE_ROOT and deliberately outside $HOME, so the walk would find nothing here and the reason
+  # would look like a product defect. Say the assumption in the message rather than leave it implied.
+  WHY="the first result row is '$after', wanted the one file under sub/ matching the walk; if search is now scoped to \$HOME, this fixture sits at $DRIVE_FIXTURE, outside it by hard rule 9, and the driver needs a new home rather than the product being wrong"
+  return 1
+}
+
+keycase_reveal() {
+  local before after
+  reset_state || return 1
+  mapfile -t searchc < <(first_chord search)
+  k "${searchc[@]}"; settle
+  k -d 40 'inner'
+  mapfile -t retc < <(chord_args code Return)
+  k "${retc[@]}"
+  sleep 2
+  case "$(ipc rowAt 0)" in
+    *'inner.txt|'*) ;;
+    *) WHY="the search this needs produced no inner.txt result to reveal"; return 1 ;;
+  esac
+  before=$(ipc path)
+  k "$@"
+  sleep 1
+  after=$(ipc path)
+  changed_to "the open directory" "$before" "$after" "$DRIVE_FIXTURE/sub"
+}
+
+# -- moving between directories --
+
+keycase_open() {
+  local before after
+  reset_state || return 1
+  seek_row_named sub || return 1
+  before=$(ipc path)
+  k "$@"
+  sleep 1
+  after=$(ipc path)
+  changed_to "the open directory" "$before" "$after" "$DRIVE_FIXTURE/sub"
+}
+
+keycase_parent() {
+  local before after
+  reset_state || return 1
+  enter_dir sub || return 1
+  before=$(ipc path)
+  k "$@"
+  sleep 1
+  after=$(ipc path)
+  changed_to "the open directory" "$before" "$after" "$DRIVE_FIXTURE"
+}
+
+# -- the write operations, every one of them inside the sandbox --
+#
+# Each asserts a file that only its own chord could have produced, never a status line: a sentence in
+# the bar proves a message was set and a landed file proves the operation ran. Every one puts the
+# tree back with the product's own undo, so the next binding of the same action meets the same state
+# and its own negative control still means something.
+
+keycase_copy() {
+  reset_state || return 1
+  [ -e "$DRIVE_FIXTURE/dest/op-copy.txt" ] \
+    && { WHY="dest/op-copy.txt existed before the copy, so the check could not fail"; return 1; }
+  seek_row_named op-copy.txt || return 1
+  k "$@"; settle
+  enter_dir dest || return 1
+  mapfile -t pastec < <(first_chord paste)
+  k "${pastec[@]}"
+  wait_file "$DRIVE_FIXTURE/dest/op-copy.txt" \
+    || { WHY="nothing landed at dest/op-copy.txt within ${TRANSFER_WAIT_S}s"; leave_dir; return 1; }
+  # A copy leaves the source where it was; a cut does not, and that is the whole difference.
+  [ -e "$DRIVE_FIXTURE/op-copy.txt" ] \
+    || { WHY="the source op-copy.txt is gone, so that chord cut rather than copied"; leave_dir; return 1; }
+  cmp -s "$DRIVE_FIXTURE/op-copy.txt" "$DRIVE_FIXTURE/dest/op-copy.txt" || { WHY="Copy changed file bytes"; return 1; }
+  drive_undo_transfer "$DRIVE_FIXTURE/dest/op-copy.txt" || return 1
+  leave_dir
+}
+
+keycase_cut() {
+  reset_state || return 1
+  [ -e "$DRIVE_FIXTURE/dest/op-cut.txt" ] \
+    && { WHY="dest/op-cut.txt existed before the cut, so the check could not fail"; return 1; }
+  seek_row_named op-cut.txt || return 1
+  k "$@"; settle
+  enter_dir dest || return 1
+  mapfile -t pastec < <(first_chord paste)
+  k "${pastec[@]}"
+  wait_file "$DRIVE_FIXTURE/dest/op-cut.txt" \
+    || { WHY="nothing landed at dest/op-cut.txt within ${TRANSFER_WAIT_S}s"; leave_dir; return 1; }
+  [ -e "$DRIVE_FIXTURE/op-cut.txt" ] \
+    && { WHY="the source op-cut.txt is still there, so that chord copied rather than cut"; leave_dir; return 1; }
+  [[ "$(cat "$DRIVE_FIXTURE/dest/op-cut.txt")" == op-cut ]] || { WHY="Cut/Paste changed file bytes"; return 1; }
+  drive_undo_transfer "$DRIVE_FIXTURE/dest/op-cut.txt" || return 1
+  leave_dir || return 1
+  # The move is undone back to the parent, so the source has to be there again for the next binding.
+  wait_file "$DRIVE_FIXTURE/op-cut.txt" \
+    || { WHY="undo did not put op-cut.txt back, so the tree is not restored"; return 1; }
+}
+
+keycase_paste() {
+  reset_state || return 1
+  [ -e "$DRIVE_FIXTURE/dest/op-paste.txt" ] \
+    && { WHY="dest/op-paste.txt existed before the paste, so the check could not fail"; return 1; }
+  seek_row_named op-paste.txt || return 1
+  mapfile -t copyc < <(first_chord copy)
+  k "${copyc[@]}"; settle
+  enter_dir dest || return 1
+  k "$@"
+  wait_file "$DRIVE_FIXTURE/dest/op-paste.txt" \
+    || { WHY="nothing landed at dest/op-paste.txt within ${TRANSFER_WAIT_S}s"; leave_dir; return 1; }
+  cmp -s "$DRIVE_FIXTURE/op-paste.txt" "$DRIVE_FIXTURE/dest/op-paste.txt" || { WHY="Paste changed file bytes"; return 1; }
+  drive_undo_transfer "$DRIVE_FIXTURE/dest/op-paste.txt" || return 1
+  leave_dir
+}
+
+keycase_trash() {
+  reset_state || return 1
+  [ -e "$DRIVE_FIXTURE/op-trash.txt" ] \
+    || { WHY="op-trash.txt is not there to trash, so the check could not fail"; return 1; }
+  seek_row_named op-trash.txt || return 1
+  k "$@"
+  drive_wait_gone "$DRIVE_FIXTURE/op-trash.txt" \
+    || { WHY="op-trash.txt is still on disk ${TRANSFER_WAIT_S}s after the chord"; return 1; }
+  # Undo is what puts it back for the next binding, and its own item asserts the same journal.
+  mapfile -t undoc < <(first_chord undo)
+  k "${undoc[@]}"
+  wait_file "$DRIVE_FIXTURE/op-trash.txt" \
+    || { WHY="undo did not put op-trash.txt back, so the tree is not restored"; return 1; }
+  [[ "$(cat "$DRIVE_FIXTURE/op-trash.txt")" == op-trash ]] || { WHY="Trash/Undo changed file bytes"; return 1; }
+  return 0
+}
+
+keycase_undo() {
+  reset_state || return 1
+  [ -e "$DRIVE_FIXTURE/op-undo.txt" ] \
+    || { WHY="op-undo.txt is not there, so there is nothing for undo to put back"; return 1; }
+  seek_row_named op-undo.txt || return 1
+  mapfile -t trashc < <(first_chord trash)
+  k "${trashc[@]}"
+  drive_wait_gone "$DRIVE_FIXTURE/op-undo.txt" \
+    || { WHY="the trash this needs did not remove op-undo.txt, so undo has nothing to reverse"; return 1; }
+  k "$@"
+  wait_file "$DRIVE_FIXTURE/op-undo.txt" \
+    || { WHY="op-undo.txt did not come back within ${TRANSFER_WAIT_S}s"; return 1; }
+  [[ "$(cat "$DRIVE_FIXTURE/op-undo.txt")" == op-undo ]] || { WHY="Undo changed file bytes"; return 1; }
+  return 0
+}
+
+drive_wait_gone() {
+  local path=$1 attempt
+  for attempt in $(seq 1 $((TRANSFER_WAIT_S * 10))); do
+    [ -e "$path" ] || return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+# Puts a landed transfer back, so the next binding of the same action meets the state its own
+# negative control assumes. A failure here is reported by the caller's next negative control rather
+# than swallowed, which is why this returns quietly.
+drive_undo_transfer() {
+  mapfile -t undoc < <(first_chord undo)
+  k "${undoc[@]}"
+  drive_wait_gone "$1"
+}
+
+# -- the keys bound ahead of their features, which say so rather than doing nothing --
+
+# The message is read after waiting for the bar to clear, so nine tab keys saying one sentence cannot
+# each read the previous one's line as their own answer.
+keycase_message_is() {
+  local want=$1
+  shift
+  reset_state || return 1
+  wait_message_clear || return 1
+  k "$@"; settle
+  local after
+  after=$(ipc lastMessage)
+  changed_to "the status line" "" "$after" "$want"
+}
+
+# The path bar is built, so its key is driven by what it opens rather than by the sentence it used
+# to answer with. Closed again explicitly, the way keycase_filter closes its query line: a bar left
+# standing owns the keyboard and every later case would type its chords into the field.
+keycase_pathBar() {
+  local before after
+  reset_state || return 1
+  before=$(ipc pathBarOpen)
+  k "$@"; settle
+  after=$(ipc pathBarOpen)
+  mapfile -t escp < <(chord_args code Escape)
+  k "${escp[@]}"; settle
+  changed_to "the path bar" "$before" "$after" true
+}
+
+keycase_tabNew() {
+  local before after
+  reset_state || return 1
+  before=$(ipc tabCount)
+  k "$@"; settle
+  after=$(ipc tabCount)
+  changed_to "the tab count" "$before" "$after" "$((before + 1))"
+}
+
+keycase_tabClose() {
+  local before after
+  reset_state || return 1
+  mapfile -t newc < <(first_chord tabNew)
+  k "${newc[@]}"; settle
+  before=$(ipc tabCount)
+  k "$@"; settle
+  after=$(ipc tabCount)
+  changed_to "the tab count" "$before" "$after" "$((before - 1))"
+}
+
+# The backend answers mkdir with the first free "New Folder", so the assertion is a directory that
+# was not there before, read off the filesystem: a status line would also be set by a dead handler.
+drive_dir_count() {
+  find "$DRIVE_FIXTURE" -mindepth 1 -maxdepth 1 -type d | wc -l
+}
+
+keycase_newFolder() {
+  local before after
+  reset_state || return 1
+  before=$(drive_dir_count)
+  k "$@"
+  sleep 2
+  after=$(drive_dir_count)
+  changed_to "the directory count in the fixture" "$before" "$after" "$((before + 1))"
+}
+
+keycase_eject() {
+  local after
+  reset_state || return 1
+  wait_message_clear || return 1
+  k "$@"; settle
+  after=$(ipc lastMessage)
+  changed_to "the status line" "" "$after" \
+    "This directory is not inside a removable volume, so there is nothing to eject."
+}
+
+# -- the preview's own keys --
+
+# The media transport moves on its own while it plays, so the interval is measured with no key in it
+# first. A seek has to beat that drift by more than the drift itself, or the check would pass on a
+# clip that was simply playing.
+keycase_seek() {
+  local direction=$1
+  shift
+  local drift_a drift_b drift before after delta
+  reset_state || return 1
+  [ "$HAVE_MEDIA" = 1 ] || { WHY="no media fixture, ffmpeg is not on this box"; return 1; }
+  seek_row_named d-clip.mp4 || return 1
+  mapfile -t prevc < <(first_chord preview)
+  k "${prevc[@]}"
+  sleep 2
+  [ "$(ipc previewOpen)" = true ] || { WHY="the media preview did not open"; return 1; }
+  if [ "$direction" = back ]; then
+    mapfile -t fwdc < <(first_chord seekForward)
+    k "${fwdc[@]}"; settle
+  fi
+  drift_a=$(ipc previewPosition)
+  settle
+  drift_b=$(ipc previewPosition)
+  drift=$(( drift_b - drift_a )); [ "$drift" -lt 0 ] && drift=$(( -drift ))
+  before=$(ipc previewPosition)
+  k "$@"; settle
+  after=$(ipc previewPosition)
+  delta=$(( after - before )); [ "$delta" -lt 0 ] && delta=$(( -delta ))
+  if [ "$delta" -le "$drift" ] || [ "$delta" -lt 3000 ]; then
+    WHY="the position moved ${delta}ms against ${drift}ms of playback drift, which is not a seek"
+    return 1
+  fi
+  if [ "$direction" = back ] && [ "$after" -ge "$before" ]; then
+    WHY="the position went forward, from $before to $after"
+    return 1
+  fi
+  if [ "$direction" = forward ] && [ "$after" -le "$before" ]; then
+    WHY="the position went back, from $before to $after"
+    return 1
+  fi
+  return 0
+}
+
+keycase_seekBack()    { keycase_seek back "$@"; }
+keycase_seekForward() { keycase_seek forward "$@"; }
+
+# Open the two-page fixture through Flea's real preview action for every PDF key assertion.
+open_pdf_preview() {
+  reset_state || return 1
+  [ "$HAVE_PDF" = 1 ] || { WHY="no PDF fixture, magick is not on this box"; return 1; }
+  seek_row_named c-doc.pdf || return 1
+  mapfile -t prevc < <(first_chord preview)
+  k "${prevc[@]}"
+  sleep 3
+  [ "$(ipc previewOpen)" = true ] || { WHY="the PDF preview did not open"; return 1; }
+  [ "$(ipc previewKind)" = pdf ] || { WHY="the preview opened as $(ipc previewKind), not pdf"; return 1; }
+}
+
+# The fixture gives each page a distinct word, so both state and paint must advance.
+keycase_pageForward() {
+  local before before_text expected
+  open_pdf_preview || return 1
+  before=$(ipc previewPdfPage)
+  [ -n "$before" ] || { WHY="the PDF page reader returned no value"; return 1; }
+  before_text=$(omarchy-drive ocr flea 2>/dev/null)
+  case $before_text in
+    *PAGEONE*) ;;
+    *) WHY="UNREADABLE: the first page's text did not come back off the screen, so a page turn is not assertable here"
+       return 2 ;;
+  esac
+  expected=$((before + 1))
+  k "$@"
+  omarchy-drive wait ipc -p "$REPO/ui" flea previewPdfPage "$expected" --timeout 10 >/dev/null \
+    || { WHY="the PDF page stayed at $(ipc previewPdfPage) after the chord"; return 1; }
+  omarchy-drive wait ocr flea PAGETWO --timeout 10 >/dev/null 2>&1 \
+    || { WHY="the preview state advanced but the second page was not painted"; return 1; }
+}
+
+keycase_zoomIn() {
+  local before after
+  open_pdf_preview || return 1
+  before=$(ipc previewPdfZoom)
+  k "$@"; settle
+  after=$(ipc previewPdfZoom)
+  changed_to "the PDF zoom" "$before" "$after" "1.25"
+}
+
+keycase_zoomOut() {
+  local before after
+  open_pdf_preview || return 1
+  mapfile -t inc < <(first_chord zoomIn)
+  k "${inc[@]}"; settle
+  before=$(ipc previewPdfZoom)
+  k "$@"; settle
+  after=$(ipc previewPdfZoom)
+  changed_to "the PDF zoom" "$before" "$after" "1"
+}
+
+keycase_expand() {
+  local before after
+  open_pdf_preview || return 1
+  before=$(ipc previewExpanded)
+  k "$@"; settle
+  after=$(ipc previewExpanded)
+  changed_to "the PDF expand flag" "$before" "$after" "true"
+}
+
+keycase_focusPrevious() { keycase_focusNext "$@"; }
+
+keycase_settings() {
+  reset_state || return 1
+  [[ "$(ipc settingsOpen)" == false ]] || return 1
+  k "$@"
+  drive_expect settingsOpen '. == true'
+}
+
+keycase_historyBack() {
+  reset_state && enter_dir sub || return 1
+  k "$@"
+  wait_path "$DRIVE_FIXTURE"
+}
+
+keycase_historyForward() {
+  reset_state && enter_dir sub && drive_action historyBack || return 1
+  wait_path "$DRIVE_FIXTURE" || return 1
+  k "$@"
+  wait_path "$DRIVE_FIXTURE/sub"
+}
+
+drive_tab_step() {
+  local direction=$1 before after
+  shift
+  reset_state && drive_action tabNew && drive_action tabNew || return 1
+  before=$(ipc tabIndex)
+  [[ "$before" == 2 && "$(ipc tabCount)" == 3 ]] || { WHY="tab setup did not create three tabs"; return 1; }
+  k "$@"; settle
+  after=$(ipc tabIndex)
+  changed_to "tab direction $direction" "$before" "$after" "$(((before + direction + 3) % 3))"
+}
+
+keycase_tabNext() { drive_tab_step 1 "$@"; }
+keycase_tabPrevious() { drive_tab_step -1 "$@"; }
+
+keycase_togglePreview() {
+  reset_state || return 1
+  local before after
+  before=$(ipc uiSettings | jq -r '.preview.column')
+  k "$@"; settle
+  after=$(ipc uiSettings | jq -r '.preview.column')
+  changed_to "preview preference" "$before" "$after" "$([[ "$before" == true ]] && printf false || printf true)"
+}
+
+drive_manual_preview() {
+  reset_state || return 1
+  [[ "$HAVE_IMAGE" == 1 ]] || { WHY="image fixture unavailable"; return 2; }
+  if [[ "$(ipc uiSettings | jq -r '.preview.column')" != true ]]; then drive_action togglePreview || return 1; fi
+  drive_action viewColumns && seek_row_named b-image.png || return 1
+}
+
+keycase_loadPreview() {
+  drive_manual_preview || return $?
+  [[ "$(ipc columnFrameReady)" == false ]] || { WHY="manual image already loaded before activation"; return 1; }
+  k "$@"
+  drive_expect columnFrameReady '. == true'
+}
+
+keycase_focusPreview() {
+  drive_manual_preview || return $?
+  drive_action loadPreview || return 1
+  drive_expect columnFrameReady '. == true' || return 1
+  drive_expect previewSelectionState '.focused == false' || return 1
+  k "$@"
+  drive_expect previewSelectionState '.focused == true'
+}
+
+keycase_textSizeUp() {
+  reset_state && drive_action textSizeReset || return 1
+  local before after mode
+  before=$(ipc bodyPx)
+  k "$@"; settle
+  after=$(ipc bodyPx)
+  mode=$(ipc uiSettings | jq -r '.display.textSize.mode')
+  [[ "$mode" == "$after" && "$after" -ge "$before" ]] || { WHY="text-size increase did not reach the live body font: $before/$after/$mode"; return 1; }
+  changed_from "text-size mode" system "$mode"
+}
+
+keycase_textSizeDown() {
+  reset_state && drive_action textSizeReset && drive_action textSizeUp || return 1
+  local before after mode
+  before=$(ipc bodyPx)
+  k "$@"; settle
+  after=$(ipc bodyPx)
+  mode=$(ipc uiSettings | jq -r '.display.textSize.mode')
+  [[ "$mode" == "$after" && "$after" -lt "$before" ]] || { WHY="text-size decrease did not reach the live body font: $before/$after/$mode"; return 1; }
+}
+
+keycase_textSizeReset() {
+  reset_state && drive_action textSizeUp || return 1
+  local before after
+  before=$(ipc uiSettings | jq -r '.display.textSize.mode')
+  k "$@"; settle
+  after=$(ipc uiSettings | jq -r '.display.textSize.mode')
+  changed_to "text-size mode" "$before" "$after" system
+}
+
+keycase_properties() {
+  reset_state && seek_row_named a-note.txt || return 1
+  k "$@"
+  drive_expect menuDialogState ".opened and .action == \"properties\" and .facts.ok and .facts.kind == \"File\" and .facts.path == $(jq -Rn --arg path "$DRIVE_FIXTURE/a-note.txt" '$path')"
+}
+
+keycase_deletePermanently() {
+  reset_state || return 1
+  local target="$DRIVE_FIXTURE/delete-$DRIVE_ROW_ID.txt"
+  drive_guard "$target"
+  [[ ! -e "$target" ]] || { WHY="permanent-delete source existed before setup"; return 1; }
+  printf 'owned permanent deletion\n' > "$target" || return 1
+  seek_row_named "${target##*/}" || return 1
+  k "$@"
+  drive_expect menuDialogState '.confirmation.opened and (.confirmation.destructiveFocus | not)' || return 1
+  [[ -f "$target" ]] || { WHY="Delete bypassed its confirmation"; return 1; }
+  k -k Return
+  drive_expect menuDialogState '.opened | not' || return 1
+  [[ -f "$target" ]] || { WHY="reflexive Return did not cancel deletion"; return 1; }
+  k "$@"
+  drive_expect menuDialogState '.confirmation.opened and (.confirmation.destructiveFocus | not)' || return 1
+  k -k Tab
+  drive_expect menuDialogState '.confirmation.destructiveFocus' || return 1
+  drive_guard "$target"
+  k -k Return
+  drive_wait_gone "$target" || { WHY="confirmed permanent deletion left its source"; return 1; }
+  drive_expect menuDialogState '(.opened | not) and (.committing | not)'
+}
+
+keycase_duplicate() {
+  reset_state && seek_row_named a-note.txt || return 1
+  local target="$DRIVE_FIXTURE/a-note copy.txt"
+  drive_guard "$target"
+  [[ ! -e "$target" ]] || { WHY="duplicate destination existed before activation"; return 1; }
+  k "$@"
+  wait_file "$target" || { WHY="Duplicate created no file"; return 1; }
+  cmp -s "$DRIVE_FIXTURE/a-note.txt" "$target" || { WHY="Duplicate changed file bytes"; return 1; }
+  drive_undo_transfer "$target" || { WHY="Duplicate cleanup through Undo failed"; return 1; }
+}
+
+keycase_movePaste() {
+  reset_state && seek_row_named op-cut.txt && drive_action copy && enter_dir dest || return 1
+  local target="$DRIVE_FIXTURE/dest/op-cut.txt"
+  drive_guard "$target"
+  [[ ! -e "$target" ]] || { WHY="move destination existed before activation"; return 1; }
+  k "$@"
+  wait_file "$target" || { WHY="Move pasted no file"; return 1; }
+  [[ ! -e "$DRIVE_FIXTURE/op-cut.txt" ]] || { WHY="Move paste retained its source"; return 1; }
+  [[ "$(cat "$target")" == op-cut ]] || { WHY="Move paste changed bytes"; return 1; }
+  drive_undo_transfer "$target" && leave_dir && wait_file "$DRIVE_FIXTURE/op-cut.txt"
+}
+
+keycase_redo() {
+  reset_state && seek_row_named a-note.txt || return 1
+  local target="$DRIVE_FIXTURE/a-note copy.txt"
+  [[ ! -e "$target" ]] || { WHY="Redo destination existed before setup"; return 1; }
+  drive_action duplicate || return 1
+  wait_file "$target" && drive_undo_transfer "$target" || { WHY="Redo setup did not create and undo a duplicate"; return 1; }
+  k "$@"
+  wait_file "$target" || { WHY="Redo did not recreate the duplicate"; return 1; }
+  cmp -s "$DRIVE_FIXTURE/a-note.txt" "$target" || { WHY="Redo changed bytes"; return 1; }
+  drive_undo_transfer "$target"
+}
+
+keycase_copydirpath() {
+  reset_state || return 1
+  local before after
+  enter_dir sub || return 1
+  drive_action copydirpath || return 1
+  before=$(wl-paste --no-newline) || { WHY="clipboard cannot be observed"; return 2; }
+  [[ "$before" == "$DRIVE_FIXTURE/sub" ]] || { WHY="clipboard setup did not publish the owned child path"; return 1; }
+  leave_dir || return 1
+  k "$@"; settle
+  after=$(wl-paste --no-newline) || return 1
+  changed_to "copied directory path" "$before" "$after" "$DRIVE_FIXTURE"
+}
+
+drive_arm() {
+  local action=$1 final=$2 row=$3 before after
+  shift 3
+  reset_state && seek_row_named "$row" || return 1
+  before=$(ipc keyDeliveryState)
+  k "$@"
+  after=$(ipc keyDeliveryState)
+  [[ "$(jq -c '.clipboard' <<< "$before")" == "$(jq -c '.clipboard' <<< "$after")" ]] \
+    || { WHY="first $action input mutated the clipboard"; return 1; }
+  if [[ "$action" == trashArm ]]; then
+    jq -e '.trashArmedAt > 0' <<< "$after" >/dev/null || return 1
+    [[ -e "$DRIVE_FIXTURE/$row" ]] || { WHY="first d already trashed its source"; return 1; }
+  else
+    jq -e --arg action "$action" '.keySequence == $action and .keySequenceIdentity != ""' <<< "$after" >/dev/null || return 1
+  fi
+  printf 'OBSERVED %s first-arm=%s\n' "$DRIVE_ROW_ID" "$after"
+  k -k Escape
+  # The ordinary action assertion then proves two consecutive inputs execute the complete operation.
+  "keycase_$final" "$@" "$@"
+}
+
+keycase_copyArm() { drive_arm copyArm copy op-copy.txt "$@"; }
+keycase_cutArm() { drive_arm cutArm cut op-cut.txt "$@"; }
+keycase_pasteArm() { drive_arm pasteArm paste op-paste.txt "$@"; }
+keycase_cursorFirstArm() { drive_arm cursorFirstArm cursorFirst a-note.txt "$@"; }
+keycase_trashArm() { drive_arm trashArm trash op-trash.txt "$@"; }
+
+keycase_menuRight() {
+  WHY="menuRight requires a selected submenu; this row is not in a menu context"
+  return 2
+}
+
+keycase_openTerminal() {
+  command -v foot >/dev/null || { WHY="native foot terminal unavailable; existing ui-tui.sh terminal matrix also requires it"; return 2; }
+  reset_state || return 1
+  local before terminal="" pid shell_pid="" child output end
+  before=$(hyprctl clients -j | jq -c 'map(.address)') || return 1
+  k "$@"
+  end=$((SECONDS + 15))
+  while (( SECONDS < end )); do
+    terminal=$(hyprctl clients -j | jq -c --argjson before "$before" '.[] | .address as $address | select($before | index($address) | not)') || return 1
+    if [[ -n "$terminal" ]]; then break; fi
+    sleep 0.05
+  done
+  [[ -n "$terminal" && "$(jq -s length <<< "$terminal")" == 1 ]] || { WHY="terminal activation did not produce exactly one attributable native window"; return 1; }
+  pid=$(jq -er '.pid' <<< "$terminal") || return 1
+  [[ "$(drive_owned_pids "$pid")" == "$pid" && "$(readlink -f "/proc/$pid/exe")" == "$(realpath -e "$(command -v foot)")" ]] \
+    || { WHY="new terminal window is not the owned stock foot process"; return 1; }
+  while (( SECONDS < end )); do
+    for child in $(pgrep -P "$pid" || true); do
+      if [[ "$(drive_owned_pids "$child")" == "$child" && "$(readlink -f "/proc/$child/exe")" == "$(realpath -e /bin/sh)" ]]; then shell_pid=$child; break; fi
+    done
+    [[ -n "$shell_pid" ]] && break
+    sleep 0.05
+  done
+  [[ -n "$shell_pid" && "$(readlink -f "/proc/$shell_pid/cwd")" == "$DRIVE_FIXTURE" ]] \
+    || { WHY="native terminal shell did not inherit the selected directory"; return 1; }
+  printf 'OBSERVED terminal=%s shell_pid=%s cwd=%s\n' "$terminal" "$shell_pid" "$(readlink -f "/proc/$shell_pid/cwd")"
+  output="$DRIVE_EVIDENCE/$DRIVE_ROW_ID-terminal.png"
+  drive_guard "$output"
+  [[ ! -e "$output" ]] || { WHY="terminal screenshot already exists"; return 1; }
+  terminal=$(jq -er .address <<< "$terminal") || return 1
+  omarchy-drive shot "$output" "$terminal" || { WHY="native terminal screenshot failed"; return 1; }
+  [[ -s "$output" && "$(od -An -tx1 -N8 "$output" | tr -d ' \n')" == 89504e470d0a1a0a ]] || return 1
+  printf 'SHOT %s sha256=%s visual_inspection=pending\n' "$output" "$(sha256sum "$output" | cut -d' ' -f1)"
+  [[ "$(drive_owned_pids "$pid")" == "$pid" && "$(drive_owned_pids "$shell_pid")" == "$shell_pid" ]] || return 1
+  omarchy-drive key --window "$terminal" exit -k Return || { WHY="native terminal would not accept exit"; return 1; }
+  end=$((SECONDS + 15))
+  while (( SECONDS < end )); do
+    [[ -z "$(drive_owned_pids "$pid")" ]] && break
+    sleep 0.05
+  done
+  [[ -z "$(drive_owned_pids "$pid")" ]] || { WHY="native terminal remained after exit"; return 1; }
+  omarchy-drive focus "$DRIVE_WINDOW_ADDRESS"
+}
+
+keycase_windowNew() {
+  local before after pid
+  reset_state || return 1
+  before=$(hyprctl clients -j | jq '[.[] | select(.class == "com.thisisgm.flea")] | length')
+  k "$@"
+  local end=$((SECONDS + 15))
+  while (( SECONDS < end )); do
+    after=$(hyprctl clients -j | jq '[.[] | select(.class == "com.thisisgm.flea")] | length')
+    [[ "$after" == "$((before + 1))" ]] && break
+    sleep 0.05
+  done
+  [[ "$after" == "$((before + 1))" ]] || { WHY="New window did not create another native window"; return 1; }
+  local second
+  second=$(hyprctl clients -j | jq -er --arg first "$DRIVE_WINDOW_ADDRESS" '.[] | select(.class == "com.thisisgm.flea" and .address != $first) | .address') || return 1
+  drive_window_identity "$second" || return 1
+  pid=$(hyprctl clients -j | jq -er --arg address "$second" '.[] | select(.address == $address) | .pid') || return 1
+  [[ "$(drive_owned_pids "$pid")" == "$pid" ]] || { WHY="new window has foreign ownership"; return 1; }
+  hyprctl dispatch closewindow "address:$second" || return 1
+  while (( SECONDS < end )); do
+    [[ "$(hyprctl clients -j | jq '[.[] | select(.class == "com.thisisgm.flea")] | length')" == "$before" ]] && break
+    sleep 0.05
+  done
+  [[ "$(hyprctl clients -j | jq '[.[] | select(.class == "com.thisisgm.flea")] | length')" == "$before" ]] || return 1
+  omarchy-drive focus "$DRIVE_WINDOW_ADDRESS" || return 1
+}
+
+# ---- the key runner ---------------------------------------------------------------------------------
+
+drive_inert() {
+  local before after
+  before=$(drive_key_snapshot) || return 1
+  k "$@"; settle
+  after=$(drive_key_snapshot) || return 1
+  [[ "$before" == "$after" ]] || { WHY="context-refused key changed protected native state: $before / $after"; return 1; }
+  printf 'OBSERVED %s refused_key_state=%s\n' "$DRIVE_ROW_ID" "$after"
+}
+
+drive_key_snapshot() {
+  local state path cursor selected settings menu preview
+  state=$(ipc keyDeliveryState) && path=$(ipc path) && cursor=$(ipc cursor) && selected=$(ipc selectedIndices) \
+    && settings=$(ipc uiSettings) && menu=$(ipc contextMenuVisible) && preview=$(ipc previewOpen) || return 1
+  jq -cn --argjson state "$state" --arg path "$path" --argjson cursor "$cursor" --arg selected "$selected" \
+    --argjson settings "$settings" --argjson menu "$menu" --argjson preview "$preview" --arg context "$DRIVE_CONTEXT" \
+    --argjson settingsOpen "$(ipc settingsOpen)" --argjson pathBar "$(ipc pathBarOpen)" --argjson network "$(ipc dialogOpen)" \
+    '{state:($state | del(.activeFocusItem,.trashArmedAt) | if $context == "editor" then del(.paneFocus,.listFocus) else . end),
+      path:$path,cursor:$cursor,selected:$selected,settings:$settings,menu:$menu,preview:$preview,
+      settingsOpen:$settingsOpen,pathBar:$pathBar,network:$network}'
+}
+
+drive_refused_context() {
+  reset_state || return 1
+  case "$DRIVE_CONTEXT" in
+    rail) drive_action focusNext && drive_expect focusView '. == "rail"' || return 1 ;;
+    menu) seek_row_named a-note.txt && drive_action menu && drive_expect menuState '.opened and .snapshotReady' || return 1 ;;
+    panel) drive_action settings && drive_expect settingsOpen '. == true' || return 1 ;;
+    editor) seek_row_named a-note.txt && drive_action rename && drive_expect renameEditorLive '. == true' || return 1 ;;
+    preview) seek_row_named zz-unique-filter.txt && drive_action preview && drive_expect previewKind '. == "text"' || return 1 ;;
+    pdf) open_pdf_preview || return $? ;;
+    media)
+      [[ "$HAVE_MEDIA" == 1 ]] || { WHY="media refusal needs the native media fixture"; return 2; }
+      seek_row_named d-clip.mp4 && drive_action preview && drive_expect previewKind '. == "video"' || return 1 ;;
+    *) WHY="unknown refusal context $DRIVE_CONTEXT"; return 2 ;;
+  esac
+  if [[ "$DRIVE_CONTEXT" == editor ]]; then
+    printf 'EDITOR before=%q\n' "$(ipc renameEditorText)"
+  fi
+  drive_inert "$@" || return 1
+  if [[ "$DRIVE_CONTEXT" == editor ]]; then
+    # Text editing and submitting the unchanged name are legal; listing actions must remain refused.
+    printf 'EDITOR after=%q open=%s\n' "$(ipc renameEditorText)" "$(ipc renameEditorLive)"
+    [[ -f "$DRIVE_FIXTURE/a-note.txt" ]] || { WHY="editor key changed the underlying fixture file"; return 1; }
+  fi
+}
+
+drive_menu_select() {
+  local target cursor count
+  target=$(ipc menuState | jq -er --arg action "$1" '.entries | map(.action) | index($action)') \
+    || { WHY="menu lacks required $1 entry"; return 1; }
+  count=$(ipc menuState | jq -er '.entries | length') || return 1
+  while (( count-- > 0 )); do
+    cursor=$(ipc contextMenuCursor)
+    [[ "$cursor" == "$target" ]] && return 0
+    drive_action "$([[ "$cursor" -lt "$target" ]] && printf cursorDown || printf cursorUp)" menu || return 1
+  done
+  WHY="menu could not focus $1"
+  return 1
+}
+
+drive_menu_key() {
+  local action=$1 before after expected direction
+  shift
+  case "$action" in open|preview|escape|menuRight|parent|cursorDown|cursorUp) ;;
+    *) WHY="menu $action still needs its context-specific native assertion"; return 2 ;; esac
+  reset_state && seek_row_named sub && drive_action menu || return 1
+  drive_expect menuState '.opened and .snapshotReady' || return 1
+  case "$action" in
+    open|preview)
+      drive_menu_select open || return 1
+      k "$@"
+      wait_path "$DRIVE_FIXTURE/sub" ;;
+    escape)
+      k "$@"
+      drive_expect menuState '.opened | not' && drive_expect keyDeliveryState '.paneFocus or .listFocus' ;;
+    menuRight|parent)
+      drive_menu_select sort || return 1
+      [[ "$action" != parent ]] || drive_action menuRight menu || return 1
+      before=$(ipc menuState | jq -r .submenu)
+      k "$@"; settle
+      after=$(ipc menuState | jq -r .submenu)
+      changed_to "menu submenu" "$before" "$after" "$([[ "$action" == menuRight ]] && printf true || printf false)" ;;
+    cursorDown|cursorUp)
+      if [[ "$action" == cursorUp ]]; then drive_action cursorDown menu || return 1; direction=-1; else direction=1; fi
+      before=$(ipc contextMenuCursor)
+      expected=$(ipc menuState | jq -er --argjson direction "$direction" '
+        .cursor as $cursor | [.entries | to_entries[] | select(.value.separator != true and .value.disabled != true) | .key] |
+        if $direction > 0 then map(select(. > $cursor)) | first else map(select(. < $cursor)) | last end') || return 1
+      k "$@"; settle
+      after=$(ipc contextMenuCursor)
+      changed_to "menu cursor" "$before" "$after" "$expected" ;;
+    *) WHY="menu $action still needs its context-specific native assertion"; return 2 ;;
+  esac
+}
+
+drive_rail_key() {
+  local action=$1 before after total target
+  shift
+  case "$action" in escape|focusNext|focusPrevious|cursorFirst|cursorDown|cursorUp|cursorLast|addNetwork|menu|settings|keymapSheet|pathBar) ;;
+    *) WHY="rail $action requires its own eligibility and refusal state assertion"; return 2 ;; esac
+  reset_state && drive_action focusNext || return 1
+  [[ "$(ipc focusView)" == rail ]] || { WHY="rail did not receive focus"; return 1; }
+  case "$action" in
+    escape|focusNext|focusPrevious)
+      k "$@"; settle
+      changed_to "rail focus returns" rail "$(ipc focusView)" list ;;
+    cursorFirst|cursorDown|cursorUp|cursorLast)
+      drive_action cursorFirst rail || return 1
+      if [[ "$action" == cursorFirst || "$action" == cursorUp ]]; then drive_action cursorDown rail || return 1; fi
+      before=$(ipc railCursor); total=$(ipc railCount)
+      case "$action" in
+        cursorFirst) target=0 ;;
+        cursorDown) target=$((before + 1)) ;;
+        cursorUp) target=$((before - 1)) ;;
+        cursorLast) target=$((total - 1)) ;;
+      esac
+      k "$@"; settle
+      after=$(ipc railCursor)
+      changed_to "rail cursor" "$before" "$after" "$target" ;;
+    addNetwork)
+      k "$@"
+      drive_expect dialogOpen '. == true' ;;
+    menu)
+      drive_action cursorFirst rail || return 1
+      target=$(ipc railEntries | jq -er 'map(.group == "trash") | index(true)') || return 1
+      total=$(ipc railCount)
+      while [[ "$(ipc railCursor)" != "$target" ]] && (( total-- > 0 )); do drive_action cursorDown rail || return 1; done
+      [[ "$(ipc railCursor)" == "$target" ]] || return 1
+      k "$@"
+      drive_expect menuState '.opened and .forRail and any(.entries[]; .action == "emptyTrash")' ;;
+    settings)
+      k "$@"
+      drive_expect settingsOpen '. == true' ;;
+    keymapSheet)
+      k "$@"
+      drive_expect keymapSheetOpen '. == true' ;;
+    pathBar)
+      k "$@"
+      drive_expect pathBarOpen '. == true' ;;
+    *) WHY="rail $action requires its own eligibility and refusal state assertion"; return 2 ;;
+  esac
+}
+
+drive_panel_key() {
+  local action=$1 before after direction expected
+  shift
+  case "$action" in escape|focusNext|focusPrevious|open|preview|cursorDown|cursorUp) ;;
+    *) WHY="panel $action needs a named Settings control state"; return 2 ;; esac
+  reset_state && drive_action settings || return 1
+  drive_expect settingsOpen '. == true' || return 1
+  case "$action" in
+    escape)
+      k "$@"
+      drive_expect settingsOpen '. == false' ;;
+    focusNext|focusPrevious)
+      before=$(ipc settingsSide)
+      k "$@"; settle
+      changed_to "Settings side" "$before" "$(ipc settingsSide)" rail ;;
+    open|preview)
+      k -k Tab; settle
+      [[ "$(ipc settingsSide)" == rail ]] || return 1
+      k "$@"; settle
+      changed_to "Settings activation" rail "$(ipc settingsSide)" pane ;;
+    cursorDown|cursorUp)
+      if [[ "$action" == cursorUp ]]; then k -k Down; settle; fi
+      before=$(ipc settingsCursor)
+      direction=1
+      [[ "$action" != cursorUp ]] || direction=-1
+      expected=$(ipc settingsModel | jq -er --argjson cursor "$before" --argjson direction "$direction" '
+        [to_entries[] | select((.value.kind == "ruler" and .value.on == true) or
+          (.value.kind as $kind | ["check","master","choice","action","favourite","favouriteActions"] | index($kind))) | .key] |
+        if $direction > 0 then map(select(. > $cursor)) | first else map(select(. < $cursor)) | last end') \
+        || { WHY="Settings has no eligible control in direction $direction"; return 1; }
+      k "$@"; settle
+      after=$(ipc settingsCursor)
+      changed_to "Settings control cursor" "$before" "$after" "$expected" ;;
+    *) WHY="panel $action needs a named Settings control state"; return 2 ;;
+  esac
+}
+
+drive_preview_key() {
+  local action=$1 before after
+  shift
+  if [[ "$DRIVE_CONTEXT" == pdf ]]; then
+    case "$action" in
+      zoomIn|zoomOut|expand|pageForward) "keycase_$action" "$@"; return $? ;;
+      seekForward) keycase_pageForward "$@"; return $? ;;
+      seekBack|parent)
+        open_pdf_preview && drive_action pageForward pdf || return 1
+        before=$(ipc previewPdfPage)
+        k "$@"; settle
+        changed_to "PDF previous page" "$before" "$(ipc previewPdfPage)" "$((before - 1))"
+        return $? ;;
+      *) open_pdf_preview || return $? ;;
+    esac
+  elif [[ "$DRIVE_CONTEXT" == media ]]; then
+    case "$action" in seekBack|seekForward) "keycase_$action" "$@"; return $? ;; esac
+    reset_state && seek_row_named d-clip.mp4 && drive_action preview || return 1
+    drive_expect previewOpen '. == true' || return 1
+    [[ "$(ipc previewKind)" == video ]] || { WHY="media context did not load the video fixture"; return 1; }
+  else
+    reset_state && seek_row_named zz-unique-filter.txt && drive_action preview || return 1
+    [[ "$(ipc previewKind)" == text ]] || { WHY="preview context did not load text"; return 1; }
+  fi
+  case "$action" in
+    escape)
+      k "$@"
+      drive_expect previewOpen '. == false' ;;
+    preview)
+      if [[ "$DRIVE_CONTEXT" == media ]]; then
+        before=$(ipc previewState)
+        [[ "$before" == playing || "$before" == paused ]] || { WHY="media did not reach a playable state"; return 1; }
+        k "$@"; settle
+        changed_to "media play state" "$before" "$(ipc previewState)" "$([[ "$before" == playing ]] && printf paused || printf playing)"
+      elif [[ "$DRIVE_CONTEXT" == preview ]]; then
+        k "$@"
+        drive_expect previewOpen '. == false'
+      else WHY="PDF activation requires a named focused toolbar control"; return 2; fi ;;
+    cursorUp|cursorDown)
+      if [[ "$DRIVE_CONTEXT" != preview ]]; then WHY="$DRIVE_CONTEXT cursor action needs scroll/playback-specific evidence"; return 2; fi
+      if [[ "$action" == cursorDown ]]; then drive_action cursorUp preview || return 1; fi
+      before=$(ipc cursor)
+      k "$@"; settle
+      after=$(ipc cursor)
+      changed_to "preview follows cursor" "$before" "$after" "$((before + ($([[ "$action" == cursorDown ]] && printf 1 || printf -- -1))))" ;;
+    *) WHY="$DRIVE_CONTEXT $action requires a focused native control assertion"; return 2 ;;
+  esac
+}
+
+drive_key_row() {
+  local row=$1 frontend mods keyname action rc=2 result label
+  local -a chord
+  IFS='|' read -r DRIVE_ROW_ID DRIVE_PRESET frontend DRIVE_CONTEXT mods keyname action <<< "$row"
+  WHY=""
+  label="$DRIVE_PRESET/$frontend/$DRIVE_CONTEXT/$mods:$keyname/${action:-listing-action-refused}"
+  if [[ "$frontend" == tui ]]; then
+    WHY="pending native terminal row in tests/ui-tui.sh $DRIVE_PRESET; GUI delivery cannot establish this result"
+  elif ! chord_args "$mods" "$keyname" > "$SB/chord"; then
+    WHY="no native delivery mapping for $mods:$keyname"
+  else
+    mapfile -t chord < "$SB/chord"
+    if [[ -z "$action" && "$DRIVE_CONTEXT" != listing ]]; then
+      drive_refused_context "${chord[@]}"; rc=$?
+    else
+    case "$DRIVE_CONTEXT" in
+      listing)
+        case "$action" in
+          "") reset_state && drive_inert "${chord[@]}"; rc=$? ;;
+          seekBack|seekForward|zoomIn|zoomOut|expand)
+            reset_state && drive_inert "${chord[@]}"; rc=$? ;;
+          addNetwork)
+            if [[ "$mods" == text ]]; then reset_state && drive_inert "${chord[@]}"; rc=$?
+            else keycase_addNetwork "${chord[@]}"; rc=$?; fi ;;
+          pageForward) keycase_open "${chord[@]}"; rc=$? ;;
+          *)
+            if declare -F "keycase_$action" >/dev/null; then "keycase_$action" "${chord[@]}"; rc=$?
+            else WHY="missing listing action driver: $action"; fi ;;
+        esac ;;
+      rail) drive_rail_key "$action" "${chord[@]}"; rc=$? ;;
+      menu) drive_menu_key "$action" "${chord[@]}"; rc=$? ;;
+      panel) drive_panel_key "$action" "${chord[@]}"; rc=$? ;;
+      preview|pdf|media) drive_preview_key "$action" "${chord[@]}"; rc=$? ;;
+      editor)
+        if [[ "$action" == escape ]]; then
+          reset_state && seek_row_named a-note.txt && drive_action rename && drive_expect renameEditorLive '. == true' \
+            && k "${chord[@]}" && drive_expect renameEditorLive '. == false'
+          rc=$?
+        else WHY="editor binding lacks an editing/refusal driver"; fi ;;
+    esac
+    fi
+  fi
+  case "$rc" in
+    0)
+      result=PASS
+      case "$action" in
+        viewList|viewColumns|viewGrid|settings|keymapSheet|properties|togglePreview|loadPreview|focusPreview)
+          drive_shot "$action" ;;
+      esac
+      pass key "$DRIVE_ROW_ID $label" ;;
+    2) result=UNDRIVEN; skip key "$DRIVE_ROW_ID $label" "$WHY" ;;
+    *) result=FAIL; bad key "$DRIVE_ROW_ID $label" "${WHY:-native assertion failed; see row log}" ;;
+  esac
+  jq -cn --arg row "$row" --arg status "$result" --arg reason "$WHY" --arg source "$FLEA_SOURCE_SHA" \
+    --arg binary "$FLEA_BINARY_SHA256" --arg ui "$REPO/ui" --arg evidence "$DRIVE_EVIDENCE/$DRIVE_ROW_ID.log" \
+    '{row:$row,status:$status,reason:$reason,source:$source,binarySha256:$binary,ui:$ui,evidence:$evidence}' >> "$DRIVE_EVIDENCE/keys.jsonl"
+}
+
+# ---- the menu ----------------------------------------------------------------------------------------
+
+# Which row of the listing makes an entry appear at all, and what a chosen entry must then do. An
+# action with no row here is reported undriven with the reason, which is the honest answer for the
+# three that need a tailnet peer or a Dropbox tree this battery must not create.
+menu_row_for() {
+  case $1 in
+    open) printf 'sub' ;;
+    extract) printf 'e-bundle.tar.zst' ;;
+    convert) printf 'b-image.png' ;;
+    *) printf 'a-note.txt' ;;
+  esac
+}
+
+# Sample inventory: ["delete", "Delete permanently", "trash", "F", "trash", "deletePermanently"].
+derive_menu_actions() {
+  python3 - "$REPO/ui/js/Menu.js" <<'PY'
+import json, pathlib, re, sys
+# The table carries its own comments, and a // line is not JSON: dropped before the decoder reads it.
+source = re.sub(r'^\s*//.*$', '', pathlib.Path(sys.argv[1]).read_text(), flags=re.M)
+def array(name):
+    start = source.index('var ' + name + ' = ') + len('var ' + name + ' = ')
+    return json.JSONDecoder().raw_decode(source[start:].lstrip())[0]
+seen, output = set(), []
+contexts = {'F': 'file', 'B': 'background', 'P': 'places', 'T': 'trash'}
+for row in array('INVENTORY'):
+    if len(row) not in (5, 6) or row[0] in seen or not row[3]:
+        raise SystemExit('invalid or duplicate Menu.INVENTORY row: ' + repr(row))
+    seen.add(row[0])
+    for context in row[3]:
+        # Rail rows (R) open from the sidebar, which tests/ui.sh's rail cases drive; this matrix drives listing menus.
+        if context == 'R':
+            continue
+        fields = [row[0], row[5] if len(row) == 6 else row[0], row[1], contexts[context]]
+        if any(not value or any(char in value for char in '|\r\n') for value in fields):
+            raise SystemExit('unrepresentable Menu.INVENTORY row: ' + repr(row))
+        output.append('|'.join(fields))
+if not seen:
+    raise SystemExit('empty Menu.INVENTORY')
+for key, label in array('columns'):
+    output.append('|'.join(['col:' + key, 'col:' + key, label, 'header']))
+print('\n'.join(output))
+PY
+}
+
+# The one entry whose label is a ternary rather than a literal, so it needs its own reader.
+# Sample input: '        label: showHidden ? "Hide hidden files" : "Show hidden files",'
+derive_menu_toggle_labels() {
+  sed -n 's/.*label: showHidden ? "\([^"]*\)" : "\([^"]*\)".*/\1\n\2/p' "$REPO/ui/js/Menu.js"
+}
+
+# Steps the menu cursor onto the row carrying one of the given labels and returns its index, using
+# the derived cursorDown chord so the walk is the product's own.
+menu_seek_label() {
+  local wanted=$1 entries i target=-1 idx=0 label
+  entries=$(ipc contextMenuEntries)
+  IFS='|' read -r -a rows <<< "$entries"
+  for idx in "${!rows[@]}"; do
+    case "$wanted" in
+      *"[${rows[$idx]}]"*) target=$idx; break ;;
+    esac
+  done
+  if [ "$target" -lt 0 ]; then
+    WHY="no row of the open menu carries a label this battery derived for it; the menu offers '$entries'"
+    return 1
+  fi
+  mapfile -t downc < <(first_chord cursorDown)
+  for i in $(seq 1 20); do
+    [ "$(ipc contextMenuCursor)" = "$target" ] && { printf '%s' "$target"; return 0; }
+    k "${downc[@]}"
+  done
+  WHY="the menu cursor would not step onto row $target"
+  return 1
+}
+
+# Opens the row menu on the row an action needs and puts the menu cursor on that action's entry.
+menu_open_on() {
+  local action=$1 labels row cx cy
+  row=$(menu_row_for "$action")
+  reset_state || return 1
+  if [[ "${DRIVE_MENU_CONTEXT:-file}" == background ]]; then
+    enter_dir sub || return 1
+    read -r cx cy <<< "$(ipc listingBackgroundCentre)"
+    [[ -n "$cx" && -n "$cy" ]] || { WHY="background menu has no measured native target"; return 1; }
+    click_at "$cx" "$cy" right || return 1
+    drive_expect menuState '.opened and (.hasRow | not)' || return 1
+  else
+    seek_row_named "$row" || return 1
+    mapfile -t menuc < <(first_chord menu)
+    k "${menuc[@]}"; settle
+  fi
+  [ "$(ipc contextMenuVisible)" = true ] || { WHY="the menu did not open on $row"; return 1; }
+  labels=$(menu_labels_for "$action")
+  [ -n "$labels" ] || { WHY="no label for this entry could be derived from ui/js/Menu.js"; return 1; }
+  menu_seek_label "$labels" >/dev/null
+}
+
+# Every label this action's entry could be drawing, each wrapped in brackets so a seek matches a
+# whole label and never a substring of a longer one.
+menu_labels_for() {
+  local action=$1 id act label context out=""
+  while IFS='|' read -r id act label context; do
+    [[ "$act" == "$action" && "$context" == "${DRIVE_MENU_CONTEXT:-file}" ]] || continue
+    out="${out}[$label]"
+  done < <(derive_menu_actions)
+  if [ "$action" = toggleHidden ]; then
+    while IFS= read -r label; do
+      out="${out}[$label]"
+    done < <(derive_menu_toggle_labels)
+  fi
+  printf '%s' "$out"
+}
+
+menu_activate() {
+  mapfile -t openc < <(first_chord open menu)
+  k "${openc[@]}"
+}
+
+# One function per menu action, the same shape the key drivers use: state, before, choose, after.
+
+menucase_open() {
+  local before after
+  menu_open_on open || return 1
+  before=$(ipc path)
+  menu_activate
+  sleep 1
+  after=$(ipc path)
+  changed_to "the open directory" "$before" "$after" "$DRIVE_FIXTURE/sub"
+}
+
+menucase_rename() {
+  local before after
+  menu_open_on rename || return 1
+  before=$(ipc renamingIndex)
+  menu_activate; settle
+  after=$(ipc renamingIndex)
+  [ "$before" = "-1" ] || { WHY="a row was already its own editor, so this check could not fail"; return 1; }
+  [ "$after" != "-1" ] && return 0
+  WHY="no row became its own editor, renamingIndex is still $after"
+  return 1
+}
+
+menucase_duplicate() {
+  local before after
+  menu_open_on duplicate || return 1
+  before=$(ipc total)
+  menu_activate
+  sleep 2
+  after=$(ipc total)
+  changed_to "the row count" "$before" "$after" "$((before + 1))"
+}
+
+menucase_trash() {
+  local before after
+  reset_state || return 1
+  [ -e "$DRIVE_FIXTURE/menu-trash.txt" ] \
+    || { WHY="menu-trash.txt is not there to trash, so the check could not fail"; return 1; }
+  seek_row_named menu-trash.txt || return 1
+  mapfile -t menuc < <(first_chord menu)
+  k "${menuc[@]}"; settle
+  menu_seek_label "$(menu_labels_for trash)" >/dev/null || return 1
+  menu_activate
+  drive_wait_gone "$DRIVE_FIXTURE/menu-trash.txt" \
+    || { WHY="menu-trash.txt is still on disk ${TRANSFER_WAIT_S}s after the entry was chosen"; return 1; }
+  mapfile -t undoc < <(first_chord undo)
+  k "${undoc[@]}"
+  wait_file "$DRIVE_FIXTURE/menu-trash.txt" \
+    || { WHY="undo did not put menu-trash.txt back, so the tree is not restored"; return 1; }
+  return 0
+}
+
+menucase_newFolder() {
+  local before after directory
+  menu_open_on newFolder || return 1
+  directory=$(ipc path)
+  drive_mutation_guard "$directory" || return 1
+  before=$(find "$directory" -mindepth 1 -maxdepth 1 -type d | wc -l)
+  menu_activate
+  sleep 2
+  after=$(find "$directory" -mindepth 1 -maxdepth 1 -type d | wc -l)
+  changed_to "the directory count in the fixture" "$before" "$after" "$((before + 1))"
+}
+
+menucase_toggleHidden() {
+  local before after want
+  menu_open_on toggleHidden || return 1
+  before=$(ipc showHidden)
+  want=true
+  [ "$before" = true ] && want=false
+  menu_activate; settle
+  after=$(ipc showHidden)
+  changed_to "the hidden-file flag" "$before" "$after" "$want"
+}
+
+menucase_convert() {
+  local before after
+  [ "$HAVE_IMAGE" = 1 ] || { WHY="no image fixture, magick is not on this box"; return 2; }
+  [ "$(ipc canConvert)" = true ] || { WHY="the backend found no converter on this box, so the row is not offered"; return 2; }
+  menu_open_on convert || return 1
+  before=$(ipc convertOpen)
+  menu_activate; settle
+  after=$(ipc convertOpen)
+  changed_to "the convert popup" "$before" "$after" true
+}
+
+menucase_extract() {
+  local before after
+  [ "$HAVE_ARCHIVE" = 1 ] || { WHY="no archive fixture, bsdtar is not on this box"; return 2; }
+  menu_open_on extract || return 1
+  before=$(ipc total)
+  menu_activate
+  sleep 3
+  after=$(ipc total)
+  changed_from "the row count" "$before" "$after"
+}
+
+# The one entry with a flyout: choosing it opens the format list the backend probed, and choosing a
+# format there has to write an archive. Both halves are asserted, because a flyout that opens and
+# writes nothing is the defect this row would have.
+menucase_compress() {
+  local formats before after
+  formats=$(ipc archiveFormats)
+  [ -n "$formats" ] || { WHY="the backend probed no archive tool on this box, so the row is not offered"; return 2; }
+  menu_open_on compress || return 1
+  before=$(ipc total)
+  menu_activate; settle
+  [ -n "$(ipc contextMenuSubmenuEntries)" ] || { WHY="the format flyout did not open"; return 1; }
+  menu_activate
+  sleep 4
+  after=$(ipc total)
+  changed_from "the row count" "$before" "$after"
+}
+
+drive_menu_action() {
+  local id action label rc row=$1
+  IFS='|' read -r id action label DRIVE_MENU_CONTEXT <<< "$row"
+  local name="$id/$DRIVE_MENU_CONTEXT/$action"
+  if [[ "$DRIVE_MENU_CONTEXT" == trash || "$DRIVE_MENU_CONTEXT" == header || "$DRIVE_MENU_CONTEXT" == places ]]; then
+    skip menu "$name" "derived $label needs its own $DRIVE_MENU_CONTEXT native fixture and eligibility assertion"
+    return
+  fi
+  case $action in
+    taildrop)
+      skip menu "$name" "the row appears only when a tailnet peer is reachable, and choosing it sends a real file to another machine, which is not this battery's to do"
+      return ;;
+    dropbox)
+      skip menu "$name" "the row needs an authenticated Dropbox tree, and choosing it moves the file into \$HOME/Dropbox, outside the sandbox hard rule 9 allows"
+      return ;;
+    sharelink)
+      skip menu "$name" "the row appears only for a row already inside \$HOME/Dropbox, which this battery must not create"
+      return ;;
+    updateFlea)
+      skip menu "$name" "the row appears only once a check has found a newer Flea, and choosing it opens Omarchy's system update, which is not this battery's to run"
+      return ;;
+  esac
+  if ! declare -F "menucase_$action" >/dev/null; then
+    skip menu "$name" "an entry in ui/js/Menu.js, and this battery has no driver for it yet"
+    return
+  fi
+  WHY=""
+  "menucase_$action"
+  rc=$?
+  case $rc in
+    0) pass menu "$name" "chosen from the open menu" ;;
+    2) skip menu "$name" "$WHY" ;;
+    *) bad menu "$name" "$WHY" ;;
+  esac
+}
+
+# ---- the pointer contract ---------------------------------------------------------------------
+#
+# keys.toml grew a [[pointer]] table, so the click contract derives the way the keys do instead of
+# living unnamed in ui/js/Focus.js where no derivation could see it. Every row below is an item.
+
+# Sample input, one block of keys.toml:
+#   [[pointer]]
+#   where = "listing"
+#   press = "left x2"
+#   row = "any"
+#   does = "open"
+# Emits "<where>|<press>|<row>|<does>", one per block.
+derive_pointer() {
+  local where="" press="" rowkind="" line value intable=0
+  while IFS= read -r line; do
+    case $line in
+      '[[pointer]]') intable=1; where=""; press=""; rowkind="" ;;
+      '['*) intable=0 ;;
+      'where = "'*) value=${line#*\"}; where=${value%\"} ;;
+      'press = "'*) value=${line#*\"}; press=${value%\"} ;;
+      'row = "'*) value=${line#*\"}; rowkind=${value%\"} ;;
+      'does = "'*)
+        [ "$intable" = 1 ] || continue
+        value=${line#*\"}
+        printf '%s|%s|%s|%s\n' "$where" "$press" "$rowkind" "${value%\"}" ;;
+    esac
+  done < "$REPO/keys.toml"
+}
+
+pointer_name() {
+  printf '%s %s on %s' "$1" "$2" "$3"
+}
+
+# A click at a row's own centre, in screen coordinates: rowCentre answers in window space and the
+# compositor wants the screen, the same correction tools/flea-showcase makes for a chrome button.
+click_row() {
+  local index=$1 centre cx cy wx wy landed
+  shift
+  # rowCentre reads the delegate actually on screen, and a ListView instantiates only what is
+  # visible, so a row left scrolled out answers empty. The cursor goes home first to bring the top
+  # of the listing back into view.
+  mapfile -t firstc < <(first_chord cursorFirst)
+  k "${firstc[@]}"
+  settle
+  centre=$(ipc rowCentre "$index")
+  [ -n "$centre" ] || { WHY="row $index has no centre, so it is not on screen to click"; return 1; }
+  read -r cx cy <<< "$centre"
+  local was_at
+  was_at=$(ipc path)
+  click_at "$cx" "$cy" "$@" || return 1
+  # An offset in this transform and a mis-hit in the product look identical from outside, so the
+  # number is reported rather than the symptom. A click that opened a directory is excluded: the
+  # cursor resets to 0 in the new listing, which is the row opening correctly and not a mis-hit.
+  landed=$(ipc cursor)
+  if [ "$landed" != "$index" ] && [ "$(ipc path)" = "$was_at" ]; then
+    printf 'CLICKOFFSET aimed at row %s (centre %s,%s) and the cursor landed on %s\n' \
+      "$index" "$cx" "$cy" "$landed"
+  fi
+}
+
+# Clicks a point already read off the window. Separate from click_row because click_row scrolls the
+# listing home first, and ui/js/Focus.js returns early while a rename editor holds the caret, so that
+# keystroke would be typed into the filename instead of moving the cursor.
+click_at() {
+  local cx=$1 cy=$2 wx wy
+  shift 2
+  read -r wx wy _ww _wh _addr < <(window_geometry)
+  # An empty origin is not "the window is at 0,0", it is "nothing answered", and adding it silently
+  # is what turned every pointer failure into a lie about the product.
+  [ -n "$wx" ] && [ -n "$wy" ] \
+    || { WHY="hyprctl reported no geometry for the Flea window, so a click cannot be aimed at it"; return 1; }
+  omarchy-drive click "$((cx + wx))" "$((cy + wy))" "$@" >/dev/null 2>&1 \
+    || { WHY="the compositor would not accept a click at $((cx + wx)),$((cy + wy))"; return 1; }
+  settle
+}
+
+# Two rows selected by keyboard first, so "drop any other selection" has something to drop and the
+# check cannot pass on a listing that never had one.
+pointercase_listing_left_any() {
+  reset_state || return 1
+  mapfile -t firstc < <(first_chord cursorFirst); k "${firstc[@]}"
+  mapfile -t selc < <(first_chord toggleSelect); k "${selc[@]}"
+  mapfile -t downc < <(first_chord cursorDown); k "${downc[@]}"; k "${selc[@]}"; settle
+  expect_selection 1 "0,1" || return 1
+  click_row 4 || return 1
+  expect_selection 4 ""
+}
+
+pointercase_listing_left_x2_any() {
+  local before after
+  reset_state || return 1
+  seek_row_named sub || return 1
+  before=$(ipc path)
+  click_row "$(ipc cursor)" --double || return 1
+  sleep 1
+  after=$(ipc path)
+  changed_to "the open directory" "$before" "$after" "$DRIVE_FIXTURE/sub"
+}
+
+pointercase_listing_ctrl_left_any() {
+  reset_state || return 1
+  expect_selection "$(ipc cursor)" "" || return 1
+  click_row 3 --mods ctrl || return 1
+  expect_selection 3 "3"
+}
+
+pointercase_listing_shift_left_any() {
+  reset_state || return 1
+  mapfile -t firstc < <(first_chord cursorFirst); k "${firstc[@]}"; settle
+  expect_selection 0 "" || return 1
+  click_row 3 --mods shift || return 1
+  expect_selection 3 "0,1,2,3"
+}
+
+# The whole point of these two rows: a modifier never opens, and only the first tap counts, so a
+# ctrl-held double click must not toggle twice and put the selection back where it started.
+pointercase_listing_ctrl_left_x2_any() {
+  local cursor path_before
+  reset_state || return 1
+  seek_row_named sub || return 1
+  path_before=$(ipc path)
+  cursor=$(ipc cursor)
+  expect_selection "$cursor" "" || return 1
+  click_row "$cursor" --double --mods ctrl || return 1
+  sleep 1
+  [ "$(ipc path)" = "$path_before" ] || { WHY="the pane opened $(ipc path), but a modifier must never open"; return 1; }
+  expect_selection "$cursor" "$cursor"
+}
+
+pointercase_listing_shift_left_x2_any() {
+  local path_before
+  reset_state || return 1
+  mapfile -t firstc < <(first_chord cursorFirst); k "${firstc[@]}"; settle
+  path_before=$(ipc path)
+  expect_selection 0 "" || return 1
+  click_row 3 --double --mods shift || return 1
+  sleep 1
+  [ "$(ipc path)" = "$path_before" ] || { WHY="the pane opened $(ipc path), but a modifier must never open"; return 1; }
+  expect_selection 3 "0,1,2,3"
+}
+
+pointercase_listing_right_any() {
+  local before after
+  reset_state || return 1
+  before=$(ipc contextMenuVisible)
+  click_row 3 right || return 1
+  after=$(ipc contextMenuVisible)
+  changed_to "the context menu" "$before" "$after" true
+}
+
+# Clicking away from a rename commits it, which is one of today's fixes.
+pointercase_listing_left_renaming() {
+  local before after away cx cy
+  reset_state || return 1
+  # The point to click away at is read while the listing is still normal: once the editor is open the
+  # listing must not be scrolled, and rowCentre only answers for a realised delegate anyway.
+  mapfile -t firstc < <(first_chord cursorFirst); k "${firstc[@]}"; settle
+  away=$(ipc rowCentre 1)
+  [ -n "$away" ] || { WHY="row 1 has no centre, so there is nowhere to click away to"; return 1; }
+  read -r cx cy <<< "$away"
+  seek_row_named op-rename-click.txt || return 1
+  mapfile -t renc < <(first_chord rename); k "${renc[@]}"; settle
+  before=$(ipc renamingIndex)
+  [ "$before" != "-1" ] || { WHY="no row became its own editor, so there is no rename to commit"; return 1; }
+  k renamed-by-click
+  settle
+  click_at "$cx" "$cy" || return 1
+  after=$(ipc renamingIndex)
+  [ "$after" = "-1" ] || { WHY="the editor is still open on row $after, so the click did not commit it"; return 1; }
+  wait_file "$DRIVE_FIXTURE/renamed-by-click.txt" \
+    || { WHY="no file called renamed-by-click.txt exists, so the click closed the editor without committing"; return 1; }
+  return 0
+}
+
+drive_pointer() {
+  local line where press rowkind does name fn rc
+  mapfile -t rows < <(derive_pointer)
+  for line in "${rows[@]}"; do
+    IFS='|' read -r where press rowkind does <<< "$line"
+    name=$(pointer_name "$where" "$press" "$rowkind")
+    case $where in
+      neighbour)
+        skip pointer "$name" "does $does; no IPC reader gives a neighbour column row its centre, so there is nothing to aim a click at"
+        continue ;;
+      rail)
+        skip pointer "$name" "does $does; activating a rail row navigates out of the fixture and no IPC route comes back, so driving it would strand every later check"
+        continue ;;
+    esac
+    fn="pointercase_$(printf '%s_%s_%s' "$where" "$press" "$rowkind" | tr ' ' '_')"
+    if ! declare -F "$fn" >/dev/null; then
+      skip pointer "$name" "does $does; declared in keys.toml and this battery has no driver for it yet"
+      continue
+    fi
+    WHY=""
+    "$fn"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      pass pointer "$name" "does $does"
+    else
+      bad pointer "$name" "$WHY"
+    fi
+  done
+}
+
+# ---- Omarchy's own operations, inside Flea -------------------------------------------------------
+#
+# The operator's requirement is that Omarchy's own chords keep working while Flea has focus. The
+# mechanism, read off this box rather than assumed: Hyprland consumes every SUPER bind before any
+# client sees it, and Omarchy's universal clipboard answers SUPER + C by injecting a real CTRL + C
+# into the focused surface. So SUPER + C works in Flea exactly when Flea binds Ctrl+C, and the two
+# instructions (match Finder with Ctrl, keep the supers working) are one chord.
+#
+# The assertion is never Flea's own status line, which a stray Ctrl+C would also set. Each chord is
+# proved by a file that only that chord's sequence could have produced, and each is isolated: the
+# copy chord is paired with Flea's own paste key, and the paste chord with Flea's own copy key, so
+# neither can pass on the other.
+
+OMARCHY_CLIPBOARD_LUA=/usr/share/omarchy/default/hypr/bindings/clipboard.lua
+
+# Sample input, one line of that file:
+#   o.bind("SUPER + C", "Universal copy", universal_clipboard_shortcut("CTRL", "C", "CTRL", "Insert"))
+derive_omarchy_clipboard_binds() {
+  [ -r "$OMARCHY_CLIPBOARD_LUA" ] || return 0
+  sed -n 's/^o\.bind("\(SUPER[^"]*\)", "\([^"]*\)".*/\1|\2/p' "$OMARCHY_CLIPBOARD_LUA"
+}
+
+# "SUPER + CTRL + V" becomes "super_ctrl_v", which names both the driver and the chord's own parts.
+omarchy_slug() {
+  printf '%s' "$1" | tr -d ' ' | tr 'A-Z+' 'a-z_'
+}
+
+# Presses one derived chord as a real key the compositor sees first, which is the only route that
+# fires an Omarchy bind. --global does not focus anything itself, so Flea is focused first: a chord
+# aimed at Flea that lands on another surface proves nothing about Flea.
+omarchy_press() {
+  local slug=$1 mods key identity active
+  key=${slug##*_}
+  mods=${slug%_*}
+  mods=$(printf '%s' "$mods" | tr '_' '+')
+  identity=$(drive_window_identity) || { WHY="Omarchy chord target lost its owned identity"; return 1; }
+  drive_mutation_guard "$(ipc path)" || return 1
+  omarchy-drive focus "$DRIVE_WINDOW_ADDRESS" || { WHY="owned Flea would not take focus before the chord"; return 1; }
+  active=$(hyprctl activewindow -j) || return 1
+  jq -e --argjson owned "$identity" '.address == $owned.address and .pid == $owned.pid' <<< "$active" >/dev/null \
+    || { WHY="Omarchy chord refused: owned Flea does not have focus"; return 1; }
+  omarchy-drive hotkey --global "$mods" "$key" >/dev/null 2>&1 \
+    || { WHY="the compositor would not accept a real $mods+$key press"; return 1; }
+  settle
+}
+
+omarchycase_super_c() {
+  reset_state || return 1
+  [ -e "$DRIVE_FIXTURE/dest/super-copy.txt" ] \
+    && { WHY="dest/super-copy.txt existed beforehand, so the check could not fail"; return 1; }
+  seek_row_named super-copy.txt || return 1
+  omarchy_press super_c || return 1
+  enter_dir dest || return 1
+  mapfile -t pastec < <(first_chord paste)
+  k "${pastec[@]}"
+  wait_file "$DRIVE_FIXTURE/dest/super-copy.txt" \
+    || { WHY="SUPER+C put nothing on Flea's clipboard: nothing landed at dest/super-copy.txt"; leave_dir; return 1; }
+  [ -e "$DRIVE_FIXTURE/super-copy.txt" ] \
+    || { WHY="the source is gone, so SUPER+C reached Flea as a cut rather than a copy"; leave_dir; return 1; }
+  drive_undo_transfer "$DRIVE_FIXTURE/dest/super-copy.txt"
+  leave_dir
+}
+
+omarchycase_super_v() {
+  reset_state || return 1
+  [ -e "$DRIVE_FIXTURE/dest/super-paste.txt" ] \
+    && { WHY="dest/super-paste.txt existed beforehand, so the check could not fail"; return 1; }
+  seek_row_named super-paste.txt || return 1
+  mapfile -t copyc < <(first_chord copy)
+  k "${copyc[@]}"; settle
+  enter_dir dest || return 1
+  omarchy_press super_v || { leave_dir; return 1; }
+  wait_file "$DRIVE_FIXTURE/dest/super-paste.txt" \
+    || { WHY="SUPER+V did not paste: nothing landed at dest/super-paste.txt"; leave_dir; return 1; }
+  drive_undo_transfer "$DRIVE_FIXTURE/dest/super-paste.txt"
+  leave_dir
+}
+
+omarchycase_super_x() {
+  reset_state || return 1
+  [ -e "$DRIVE_FIXTURE/dest/super-cut.txt" ] \
+    && { WHY="dest/super-cut.txt existed beforehand, so the check could not fail"; return 1; }
+  seek_row_named super-cut.txt || return 1
+  omarchy_press super_x || return 1
+  enter_dir dest || return 1
+  mapfile -t pastec < <(first_chord paste)
+  k "${pastec[@]}"
+  wait_file "$DRIVE_FIXTURE/dest/super-cut.txt" \
+    || { WHY="SUPER+X put nothing on Flea's clipboard: nothing landed at dest/super-cut.txt"; leave_dir; return 1; }
+  [ -e "$DRIVE_FIXTURE/super-cut.txt" ] \
+    && { WHY="the source is still there, so SUPER+X reached Flea as a copy rather than a cut"; leave_dir; return 1; }
+  drive_undo_transfer "$DRIVE_FIXTURE/dest/super-cut.txt"
+  leave_dir
+  wait_file "$DRIVE_FIXTURE/super-cut.txt" \
+    || { WHY="undo did not put super-cut.txt back, so the tree is not restored"; return 1; }
+}
+
+# A layer surface is how every Omarchy panel arrives, so one appearing over a focused Flea is the
+# proof that Flea neither swallowed the chord nor stopped the compositor acting on it.
+omarchy_layer_case() {
+  local slug=$1 before after restored
+  reset_state || return 1
+  before=$(omarchy-drive layers 2>/dev/null)
+  omarchy_press "$slug" || return 1
+  sleep 1
+  after=$(omarchy-drive layers 2>/dev/null)
+  if [ "$before" = "$after" ]; then
+    WHY="no layer surface appeared over the focused Flea window, so the chord did not reach the compositor"
+    return 1
+  fi
+  mapfile -t esc < <(chord_args code Escape)
+  k "${esc[@]}"
+  sleep 1
+  restored=$(omarchy-drive layers 2>/dev/null)
+  drive_window_identity >/dev/null && omarchy-drive focus "$DRIVE_WINDOW_ADDRESS" || return 1
+  [ "$(ipc ready)" = true ] || { WHY="Flea stopped answering after the chord"; return 1; }
+  [ "$restored" = "$before" ] && return 0
+  WHY="the surface the chord raised is still on screen after Escape"
+  return 1
+}
+
+omarchycase_super_space()   { omarchy_layer_case super_space; }
+omarchycase_super_ctrl_v()  { omarchy_layer_case super_ctrl_v; }
+
+# Fullscreen is a window state, so it is read back off the compositor and then put back the way it
+# was, which is also what makes the check non-vacuous: it has to move twice.
+omarchycase_super_f() {
+  local before after restored
+  reset_state || return 1
+  before=$(window_json | jq -r '.fullscreen')
+  omarchy_press super_f || return 1
+  sleep 1
+  after=$(window_json | jq -r '.fullscreen')
+  changed_from "the window's fullscreen state" "$before" "$after" || return 1
+  omarchy_press super_f || return 1
+  sleep 1
+  restored=$(window_json | jq -r '.fullscreen')
+  [ "$restored" = "$before" ] || { WHY="the window did not come back to fullscreen=$before, it is at $restored"; return 1; }
+  [ "$(ipc ready)" = true ] || { WHY="Flea stopped answering after the chord"; return 1; }
+  return 0
+}
+
+# A compositor-launched terminal is not owned merely because it appeared after this chord.
+omarchycase_super_return() {
+  local before terminal="" pid address identity end
+  reset_state || return 1
+  before=$(hyprctl clients -j | jq -c 'map(.address)') || return 1
+  omarchy_press super_return || return 1
+  end=$((SECONDS + 15))
+  while (( SECONDS < end )); do
+    terminal=$(hyprctl clients -j | jq -c --argjson before "$before" '[.[] | .address as $address | select($before | index($address) | not)]') || return 1
+    [[ "$terminal" != '[]' ]] && break
+    sleep 0.05
+  done
+  [[ "$(jq length <<< "$terminal")" == 1 ]] \
+    || { WHY="Super+Return did not create one attributable terminal; no new window was touched"; return 2; }
+  pid=$(jq -er '.[0].pid' <<< "$terminal") && address=$(jq -er '.[0].address' <<< "$terminal") || return 1
+  [[ "$(drive_owned_pids "$pid")" == "$pid" ]] \
+    || { WHY="Super+Return created an unowned compositor window at $address, PID $pid; it lacks this run's sandbox identity and was left untouched"; return 2; }
+  command -v foot >/dev/null && [[ "$(readlink -f "/proc/$pid/exe")" == "$(realpath -e "$(command -v foot)")" ]] \
+    || { WHY="Super+Return window is not the owned stock terminal; it was left untouched"; return 2; }
+  identity=$(hyprctl clients -j | jq -c --arg address "$address" '[.[] | select(.address == $address)]') || return 1
+  jq -e --argjson pid "$pid" 'length == 1 and .[0].pid == $pid' <<< "$identity" >/dev/null \
+    && [[ "$(drive_owned_pids "$pid")" == "$pid" ]] \
+    || { WHY="terminal identity changed before close; no window was touched"; return 1; }
+  hyprctl dispatch closewindow "address:$address" || return 1
+  drive_window_identity >/dev/null || return 1
+  omarchy-drive focus "$DRIVE_WINDOW_ADDRESS" || return 1
+  [ "$(ipc ready)" = true ] || { WHY="Flea stopped answering after the chord"; return 1; }
+  return 0
+}
+
+# The three invariants that decide whether any of the above can work at all, each read off the live
+# box rather than off a reading of the config.
+
+omarchy_invariant_consuming() {
+  local total leaky
+  total=$(hyprctl binds -j | jq '[.[] | select((.modmask / 64 | floor) % 2 == 1)] | length')
+  leaky=$(hyprctl binds -j | jq '[.[] | select((.modmask / 64 | floor) % 2 == 1 and .nonConsuming == true)] | length')
+  [ "$total" -gt 0 ] || { WHY="the compositor reports no SUPER binds at all, so this check could not fail"; return 1; }
+  [ "$leaky" = 0 ] && { WHY="$total SUPER binds, none of them non-consuming"; return 0; }
+  WHY="$leaky of $total SUPER binds are non-consuming, so they can leak into a focused client"
+  return 1
+}
+
+omarchy_invariant_no_super() {
+  local n
+  n=$(grep -c '^\[\[super' "$REPO/keys.toml")
+  [ "$n" = 0 ] && { WHY="keys.toml declares no super table, so Flea cannot shadow an Omarchy chord"; return 0; }
+  WHY="keys.toml declares $n super table(s), which would shadow an Omarchy chord"
+  return 1
+}
+
+# clipboard.lua branches on the window's own terminal tag, sending CTRL+Insert instead of CTRL+C to
+# anything carrying it. Flea binds no Insert key at all, so a Flea window that ever picked the tag up
+# would answer SUPER+C with silence. The tag is read off the live window, not off the regex.
+omarchy_invariant_not_terminal() {
+  local tags
+  tags=$(window_json | jq -r '(.tags // []) | join(",")')
+  case ",$tags," in
+    *,terminal,*|*,terminal\*,*)
+      WHY="the Flea window carries the terminal tag, so SUPER+C would send CTRL+Insert, which Flea does not bind"
+      return 1 ;;
+  esac
+  WHY="the live window's tags are '${tags:-none}', so clipboard.lua sends it CTRL+C and not CTRL+Insert"
+  return 0
+}
+
+drive_omarchy() {
+  local line chord desc slug rc binds named
+  # The clipboard chords, derived from Omarchy's own file so a renamed or added one shows up here.
+  # Into an array first, for the same reason the key loop above does it.
+  mapfile -t binds < <(derive_omarchy_clipboard_binds)
+  for line in "${binds[@]}"; do
+    chord=${line%%|*}
+    desc=${line#*|}
+    [ -n "$chord" ] || continue
+    slug=$(omarchy_slug "$chord")
+    if ! declare -F "omarchycase_$slug" >/dev/null; then
+      skip omarchy "$chord" "$desc, and this battery has no driver for it yet"
+      continue
+    fi
+    WHY=""
+    "omarchycase_$slug"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      pass omarchy "$chord" "$desc, driven globally and proved by a landed file"
+    else
+      bad omarchy "$chord" "$WHY"
+    fi
+  done
+
+  # The operator's general case: Omarchy's own operations, not only the clipboard. Each is checked
+  # against the live bind table first, so a chord Omarchy no longer binds reports undriven here
+  # rather than failing as though Flea had broken it.
+  for named in super_space super_f super_return; do
+    omarchy_general_case "$named"
+  done
+
+  omarchy_invariant_case super-binds-consuming omarchy_invariant_consuming
+  omarchy_invariant_case flea-binds-no-super omarchy_invariant_no_super
+  omarchy_invariant_case flea-not-tagged-terminal omarchy_invariant_not_terminal
+}
+
+omarchy_general_case() {
+  local slug=$1 key mods bound rc
+  key=${slug##*_}
+  mods=${slug%_*}
+  bound=$(hyprctl binds -j | jq --arg k "$key" \
+    '[.[] | select((.modmask / 64 | floor) % 2 == 1 and (.key | ascii_downcase) == ($k | ascii_downcase))] | length')
+  if [ "$bound" = 0 ]; then
+    skip omarchy "$mods + $key" "Omarchy binds no such chord on this box, so there is nothing to pass through"
+    return
+  fi
+  WHY=""
+  "omarchycase_$slug"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    pass omarchy "$mods + $key" "fired over a focused Flea window, and Flea still answers"
+  elif [ "$rc" -eq 2 ]; then
+    skip omarchy "$mods + $key" "$WHY"
+  else
+    bad omarchy "$mods + $key" "$WHY"
+  fi
+}
+
+omarchy_invariant_case() {
+  local name=$1 fn=$2
+  WHY=""
+  if "$fn"; then
+    pass omarchy "$name" "$WHY"
+  else
+    bad omarchy "$name" "$WHY"
+  fi
+}
+
+# ---- is the harness itself delivering? ------------------------------------------------------------
+
+# Four harness defects surfaced on this box in one day, every one of which produced a pass over
+# nothing: send_shortcut's keysym lookup is broken for letters and digits alike, a non-global chord
+# never reaches the compositor's bind table, a bare -- form typed nothing, and a showcase beat that
+# had never run at all. So the instrument proves it can deliver before it judges anything.
+#
+# This dies rather than reporting a failed item, and the difference is the whole point: a key that
+# does not arrive is the harness being broken, not the product. Fifty FAIL lines from one dead
+# delivery form would read as a broken file manager and burn the one display slot this box has.
+drive_delivery_probe() {
+  local before after
+  mapfile -t firstc < <(first_chord cursorFirst)
+  # A [[code]] chord, delivered as -k <keysym>.
+  k "${firstc[@]}"; settle
+  before=$(ipc cursor)
+  k -k Down; settle
+  after=$(ipc cursor)
+  [ "$after" != "$before" ] \
+    || die "the harness cannot deliver a -k chord: cursor stayed at $before after -k Down, so every keyed check would fail for a reason that is not the product"
+  # A [[text]] chord, delivered as -- <char>. This is the form that typed nothing elsewhere today.
+  before=$(ipc cursor)
+  k j; settle
+  after=$(ipc cursor)
+  [ "$after" != "$before" ] \
+    || die "the harness cannot deliver a bare text chord: cursor stayed at $before after j, so every printable key would fail for a reason that is not the product"
+  # A modified chord, which is the form the Finder keys and every Omarchy super chord depend on.
+  before=$(ipc selectionCount)
+  k -M ctrl -k a -m ctrl; settle
+  after=$(ipc selectionCount)
+  [ "$after" != "$before" ] \
+    || die "the harness cannot deliver a modified chord: the selection stayed at $before after ctrl+a, so every Finder chord would fail for a reason that is not the product"
+  mapfile -t esc < <(chord_args code Escape)
+  k "${esc[@]}"; settle
+  printf 'harness: -k, bare text and modified chords all deliver\n'
+}
+
+# ---- provenance -------------------------------------------------------------------------------------
+
+# The five files the checklist is derived from. A run against an edited one reports on a tree that
+# will never exist again, which is why the drive refuses it below.
+
+# Printed by every run, driven or not. A result whose inputs nobody wrote down is not a result: this
+# is the line that lets somebody rebuild the tree this tally came from.
+drive_provenance() {
+  local sha binary_sha
+  sha=$(git -C "$REPO" rev-parse HEAD) || die "source identity unavailable"
+  binary_sha=$(sha256sum "$BIN" | cut -d' ' -f1) || die "binary digest unavailable"
+  [[ "${FLEA_SOURCE_SHA:-}" == "$sha" ]] || die "FLEA_SOURCE_SHA must match the recorded build source: $sha"
+  [[ "${FLEA_BINARY_SHA256:-}" == "$binary_sha" ]] || die "FLEA_BINARY_SHA256 must match the recorded build artifact: $BIN"
+  drive_require_clean_sources
+  python3 - "$REPO" "$BIN" "$sha" "$binary_sha" <<'PY' > "$DRIVE_EVIDENCE/provenance.json"
+import hashlib, json, pathlib, subprocess, sys
+repo, binary, source, digest = sys.argv[1:]
+ui = pathlib.Path(repo, 'ui')
+tree = hashlib.sha256()
+for path in sorted(ui.rglob('*')):
+    if path.is_file():
+        tree.update(str(path.relative_to(ui)).encode() + b'\0' + path.read_bytes() + b'\0')
+print(json.dumps({'source':source, 'branch':subprocess.check_output(['git','-C',repo,'branch','--show-current']).decode().strip(),
+    'repository':repo, 'binary':binary, 'binarySha256':digest, 'ui':str(ui), 'uiSha256':tree.hexdigest(),
+    'dirty':subprocess.check_output(['git','-C',repo,'status','--porcelain']).decode()}, sort_keys=True))
+PY
+  [[ "$?" == 0 ]] || die "candidate provenance recording failed"
+  cat "$DRIVE_EVIDENCE/provenance.json"
+}
+
+# The battery's job is to say whether the commit we are about to release works, and what we release
+# is a commit rather than somebody's uncommitted buffer. Driving a tree whose derivation sources are
+# mid-edit measures a state that will be amended or abandoned by morning, so it is refused here
+# rather than left to a habit. Export the commit and drive that:
+#   d=$(mktemp -d); git archive <sha> | tar -x -C "$d"; cp -a target "$d/target"
+#   (cd "$d" && ./tools/flea-acceptance --drive)
+drive_require_clean_sources() {
+  local dirty
+  dirty=$(git -C "$REPO" status --porcelain --untracked-files=no) || die "candidate dirty-state query failed"
+  dirty+=$(git -C "$REPO" ls-files --others --exclude-standard -- ui src tools tests) || die "candidate untracked-source query failed"
+  [ -z "$dirty" ] && return 0
+  printf 'FAIL: the checklist is derived from these, and they are mid-edit:\n%s\n' "$dirty" >&2
+  die "--drive needs a clean derivation source; export the commit and drive that, see drive_require_clean_sources"
+}
+
+# ---- the run --------------------------------------------------------------------------------------
+
+# One invocation drives every key, every menu entry and every Omarchy chord, because the box has one
+# display and four lanes queue for it. There is no exploratory mode on purpose.
+# Which driven groups this invocation runs, empty meaning all of them. A re-run that only needs to
+# confirm one group should not spend forty minutes and a display slot on the other three.
+drive_validate_groups() {
+  local group
+  for group in "$@"; do
+    case "$group" in
+      key|menu|omarchy|pointer) ;;
+      *) printf 'unknown --drive group: %s\n' "$group" >&2; return 2 ;;
+    esac
+  done
+}
+
+drive_wants() {
+  [ -z "${DRIVE_GROUPS:-}" ] && return 0
+  case " $DRIVE_GROUPS " in
+    *" $1 "*) return 0 ;;
+  esac
+  return 1
+}
+
+drive_all() {
+  local a preset row row_id row_preset frontend
+  local -a groups
+  read -r -a groups <<< "${DRIVE_GROUPS:-}"
+  drive_validate_groups "${groups[@]}" || return 2
+  if drive_wants key; then
+    for preset in default vim mac windows; do
+      DRIVE_PRESET=$preset
+      DRIVE_ROW_ID="setup-$preset"
+      drive_fixture_build
+      drive_seed_preset
+      drive_launch
+      drive_delivery_probe
+      for row in "${KEY_ROWS[@]}"; do
+        IFS='|' read -r row_id row_preset frontend _ <<< "$row"
+        [[ "$row_preset" == "$preset" ]] || continue
+        drive_key_row "$row" > "$DRIVE_EVIDENCE/$row_id.log" 2>&1
+        cat "$DRIVE_EVIDENCE/$row_id.log"
+      done
+      drive_teardown || die "candidate processes did not drain before the next preset"
+    done
+  fi
+  if ! drive_wants menu && ! drive_wants omarchy && ! drive_wants pointer; then return; fi
+  DRIVE_PRESET=default
+  DRIVE_ROW_ID=other-groups
+  drive_fixture_build
+  drive_seed_preset
+  drive_launch
+  drive_delivery_probe
+  if drive_wants menu; then
+    echo
+    for a in "${MENU_ACTIONS[@]}"; do
+      drive_menu_action "$a"
+    done
+  fi
+
+  if drive_wants omarchy; then
+    echo
+    drive_omarchy
+  fi
+
+  # Last, because the pointer contract is the one group whose rows can move the pane somewhere the
+  # keyboard cannot bring it back from.
+  if drive_wants pointer; then
+    echo
+    drive_pointer
+  fi
+}
+
+# Every Omarchy item by name and without pressing anything, so a run that took no display still
+# reports the group rather than hiding it. The clipboard half is derived; the other three chords are
+# the operator's general case and are checked against the live bind table before they are driven.
+derive_omarchy_names() {
+  derive_omarchy_clipboard_binds | cut -d'|' -f1
+  printf 'super + space\nsuper + f\nsuper + return\n'
+  printf 'super-binds-consuming\nflea-binds-no-super\nflea-not-tagged-terminal\n'
+}
+
+# Called from the trap on every exit path, including a die inside the drive.
+drive_stop() {
+  local status=${1:-0} pid end journal found
+  if [[ "${DRIVE_LAUNCHED:-0}" == 1 ]]; then drive_teardown || status=1; fi
+  for pid in $(drive_owned_pids); do
+    [[ "$(drive_owned_pids "$pid")" == "$pid" ]] && kill -TERM "$pid" 2>/dev/null
+  done
+  end=$((SECONDS + DRAIN_WAIT_S))
+  while (( SECONDS < end )); do
+    [[ -z "$(drive_owned_pids)" ]] && break
+    sleep 0.05
+  done
+  if [[ -n "$(drive_owned_pids)" ]]; then printf 'FAIL: acceptance-owned processes did not drain\n' >&2; status=1; fi
+  # The operator's own journal entries are allowed; paths from this run are not.
+  journal="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/flea/undo-journal"
+  if [[ -f "$journal" ]]; then
+    found=0
+    grep -qF -- "$SB" "$journal" 2>/dev/null || found=$?
+    case $found in
+      0) printf 'FAIL: run leaked sandbox paths into the operator journal %s from %s\n' "$journal" "$SB" >&2; status=1 ;;
+      1) ;;
+      *) printf 'FAIL: could not read the operator journal %s to check it for sandbox paths from %s\n' "$journal" "$SB" >&2; status=1 ;;
+    esac
+  fi
+  if [[ -n "$DRIVE_BUS_PID" ]] && ! kill -0 "$DRIVE_BUS_PID" 2>/dev/null; then wait "$DRIVE_BUS_PID" 2>/dev/null || true; fi
+  if [[ -f "${BINDINGS:-}" && "${DRIVE:-0}" == 1 ]] && drive_wants key; then
+    python3 - "$BINDINGS" "$DRIVE_EVIDENCE/keys.jsonl" <<'PY' || status=1
+import collections, json, pathlib, sys
+matrix, report = map(pathlib.Path, sys.argv[1:])
+results = [json.loads(line) for line in report.read_text().splitlines()] if report.exists() else []
+seen = {row['row'].split('|')[0] for row in results}
+if len(seen) != len(results):
+    raise SystemExit('duplicate native key row result')
+with report.open('a') as output:
+    for row in matrix.read_text().splitlines():
+        if row.split('|')[0] not in seen:
+            result = {'row':row, 'status':'UNDRIVEN', 'reason':'run stopped before this native row', 'evidence':None}
+            output.write(json.dumps(result) + '\n')
+            results.append(result)
+print('ACCEPTANCE_ROWS ' + json.dumps(dict(collections.Counter(row['status'] for row in results)), sort_keys=True))
+PY
+  fi
+  printf 'ACCEPTANCE_EVIDENCE %s exit=%s\n' "$SB" "$status"
+  return "$status"
+}

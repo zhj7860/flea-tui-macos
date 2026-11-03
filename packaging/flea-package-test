@@ -1,0 +1,181 @@
+#!/bin/bash
+# Proves the package: it builds, it installs exactly the files it declares, and removing it leaves
+# nothing behind. Every write lands inside a sandbox root; the live system is never installed to.
+#   printf '%s\n' "$OMARCHY_SUDO_PASS" | packaging/flea-package-test
+#   packaging/flea-package-test </dev/null      the same, minus the install round trip
+# pacman refuses to run unprivileged even with --root, so the round-trip calls take the password on
+# stdin; with no password the build and field-code passes still run and the round trip is skipped.
+set -u
+
+here=$(cd "$(dirname "$0")" && pwd)
+repo=$(dirname "$here")
+
+# Hard rule 9: the sandbox is a mktemp -d of its own, checked by the shared guard before anything
+# writes or deletes under it. FLEA_FIXTURE_ROOT is what the guard validates, so it is what we set.
+FLEA_FIXTURE_ROOT=$(mktemp -d /tmp/flea-package-test.XXXXXX) || exit 1
+export FLEA_FIXTURE_ROOT
+. "$repo/tools/flea-sandbox-guard"
+sandbox_root_ok
+sandbox_make "$SANDBOX_ROOT/work"
+work="$SANDBOX_ROOT/work"
+fakeroot="$work/root"
+mkdir -p "$work/build" "$work/pkgdest" "$work/srcdest" "$work/hooks" "$fakeroot/var/lib/pacman"
+
+fails=0
+pass() { printf 'ok   %s\n' "$*"; }
+fail() { printf 'FAIL %s\n' "$*"; fails=$((fails + 1)); }
+done_with_sandbox() { sandbox_remove "$work"; rmdir "$SANDBOX_ROOT" 2>/dev/null; }
+trap done_with_sandbox EXIT
+
+IFS= read -r sudo_pass || sudo_pass=""
+as_root() { printf '%s\n' "$sudo_pass" | sudo -S -k -p "" "$@"; }
+
+echo "== sandbox $SANDBOX_ROOT"
+
+echo "== the desktop entry"
+if desktop-file-validate "$here/com.thisisgm.flea.desktop"; then
+  pass "desktop-file-validate is clean"
+else
+  fail "desktop-file-validate rejected the entry"
+fi
+
+# StartupWMClass has to equal the AppId pragma or the window never associates with its launcher entry.
+appid=$(sed -n 's|^//@ pragma AppId ||p' "$repo/ui/boot/shell.qml")
+wmclass=$(sed -n 's/^StartupWMClass=//p' "$here/com.thisisgm.flea.desktop")
+if [ -n "$appid" ] && [ "$appid" = "$wmclass" ]; then
+  pass "StartupWMClass matches the shell.qml AppId ($appid)"
+else
+  fail "StartupWMClass '$wmclass' does not match the shell.qml AppId '$appid'"
+fi
+
+echo "== the icon, at the sizes a launcher asks for"
+for size in 16 32 48 128 256; do
+  if rsvg-convert -w "$size" -h "$size" -o "$work/icon-$size.png" "$here/com.thisisgm.flea.svg" 2>/dev/null; then
+    pass "renders at ${size}px"
+  else
+    fail "does not render at ${size}px"
+  fi
+done
+
+echo "== the package"
+if ( cd "$repo" && BUILDDIR="$work/build" PKGDEST="$work/pkgdest" SRCDEST="$work/srcdest" \
+     makepkg -f >"$work/makepkg.log" 2>&1 ); then
+  pass "makepkg built the package"
+else
+  fail "makepkg failed, see $work/makepkg.log"
+  tail -5 "$work/makepkg.log"
+  exit 1
+fi
+pkg=$(ls "$work"/pkgdest/flea-*.pkg.tar.* 2>/dev/null | head -1)
+[ -n "$pkg" ] || { fail "no package was produced"; exit 1; }
+
+# No .INSTALL means nothing is created outside pacman's own file list, which is the whole of why
+# removing the package can be said to remove everything installing it created.
+if bsdtar -tf "$pkg" | grep -q '^\.INSTALL$'; then
+  fail "the package carries a scriptlet, so its install is no longer only its file list"
+else
+  pass "no scriptlet: the install is exactly the tracked file list"
+fi
+
+# Derived from the archive, not from the PKGBUILD: entries that are not directories, less the three
+# metadata members pacman adds (.PKGINFO, .BUILDINFO, .MTREE).
+declared=$(bsdtar -tf "$pkg" | grep -vc '/$')
+declared=$((declared - 3))
+echo "     the package declares $declared files and links"
+
+if [ -z "$sudo_pass" ]; then
+  echo "== the install and uninstall round trip: SKIPPED, no sudo password on stdin"
+else
+  echo "== the install and uninstall round trip, into $fakeroot"
+  # The guard has already proven this path is inside the sandbox; --root and --dbpath are what keep
+  # pacman there, so both are passed every time and neither is ever derived from an unset variable.
+  sandbox_require "$fakeroot"
+  pacman_sandboxed() {
+    as_root pacman -r "$fakeroot" --dbpath "$fakeroot/var/lib/pacman" --hookdir "$work/hooks" \
+      --noconfirm -dd --noscriptlet "$@"
+  }
+  if pacman_sandboxed -U "$pkg" >"$work/install.log" 2>&1; then
+    pass "pacman installed the package into the fake root"
+  else
+    fail "pacman could not install into the fake root"
+    tail -3 "$work/install.log"
+  fi
+
+  installed=$(find "$fakeroot" -path "$fakeroot/var" -prune -o \( -type f -o -type l \) -print | wc -l)
+  if [ "$installed" = "$declared" ]; then
+    pass "the fake root holds $installed files and links, the $declared the package declares"
+  else
+    fail "the fake root holds $installed files and links, not the $declared the package declares"
+  fi
+  for p in usr/bin/flea usr/share/flea/ui/boot/shell.qml usr/share/flea/ui/boot/picker.qml \
+           usr/share/flea/ui/boot/fleatab.qml usr/share/flea/ui/boot/tabtearoff.qml \
+           usr/share/flea/ui/WindowBody.qml usr/share/flea/ui/PickerWindow.qml \
+           usr/share/flea/ui/Commons usr/share/flea/ui/Ui \
+           usr/share/flea/ui/boot/Commons usr/share/flea/ui/boot/Ui \
+           usr/share/applications/com.thisisgm.flea.desktop \
+           usr/share/icons/hicolor/scalable/apps/com.thisisgm.flea.svg \
+           usr/share/licenses/flea/LICENSE; do
+    if [ -e "$fakeroot/$p" ] || [ -L "$fakeroot/$p" ]; then pass "installed $p"; else fail "missing $p"; fi
+  done
+
+  # The packaged binary, run from the fake root, so the proof is of the thing the package installs.
+  if [ "$("$fakeroot/usr/bin/flea" --print-target --select 'file:///tmp/a/My%20File')" = "/tmp/a /tmp/a/My File" ]; then
+    pass "the packaged binary decodes a file:// reveal target"
+  else
+    fail "the packaged binary did not decode a file:// reveal target"
+  fi
+
+  if pacman_sandboxed -Rns flea >"$work/remove.log" 2>&1; then
+    pass "pacman removed the package"
+  else
+    fail "pacman could not remove the package"
+    tail -3 "$work/remove.log"
+  fi
+  left=$(find "$fakeroot" -path "$fakeroot/var" -prune -o -print | grep -cv "^$fakeroot\$")
+  if [ "$left" = 0 ]; then
+    pass "nothing the install created survives the remove"
+  else
+    fail "$left paths survive the remove"
+    find "$fakeroot" -path "$fakeroot/var" -prune -o -print | grep -v "^$fakeroot\$" | head -5
+  fi
+
+  # pacman wrote its database as root, so the user cannot clear the fake root at exit. Checked
+  # absolute, inside the fixture root and not the root itself before a root rm -rf ever runs.
+  sandbox_require "$fakeroot"
+  as_root rm -rf "$SANDBOX_PATH"
+fi
+
+echo "== the Exec field code, through the real entry"
+# The entry under test, with only the program replaced, so the field code and flags are the shipped ones.
+apps="$work/xdg/applications"
+mkdir -p "$apps" "$work/dir with space"
+log="$work/stub.log"
+# The log path is baked in rather than exported: glib hands the launch to the session bus, so the
+# child's environment is the user manager's and an exported variable never reaches it.
+cat > "$work/stub" <<STUB
+#!/bin/bash
+{ printf ' [%s]' "\$@"; printf '\n'; } >> "$log"
+STUB
+chmod +x "$work/stub"
+sed "s|^Exec=flea |Exec=$work/stub |" "$here/com.thisisgm.flea.desktop" > "$apps/com.thisisgm.flea.desktop"
+expected=" [--gui] [$work/dir with space]"
+for arg in "$work/dir with space" "file://$work/dir%20with%20space"; do
+  : > "$log"
+  gio launch "$apps/com.thisisgm.flea.desktop" "$arg" >/dev/null 2>&1
+  # The child is not this process's to wait on, so the log is polled rather than slept on.
+  for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$log" ] && break; sleep 0.3; done
+  got=$(cat "$log")
+  if [ "$got" = "$expected" ]; then
+    pass "%f gives one decoded path for: $arg"
+  else
+    fail "%f gave '$got' for: $arg"
+  fi
+done
+
+echo
+if [ "$fails" = 0 ]; then
+  echo "PASS"
+else
+  echo "FAILED: $fails"
+fi
+exit "$fails"
