@@ -47,6 +47,9 @@ mod shelfthumb;
 mod shelfundo;
 mod shelfzip;
 mod summon;
+mod sys;
+#[cfg(target_os = "macos")]
+mod macos_compat;
 mod uistore;
 mod update;
 mod userfile;
@@ -353,6 +356,22 @@ fn main() {
         exit(tui::run(open_path.as_deref(), select_path.as_deref()));
     }
 
+    // macOS has no Quickshell and no Wayland: the terminal interface is the whole of Flea there, so
+    // a bare launch on a terminal opens it and --gui says plainly what is missing.
+    #[cfg(target_os = "macos")]
+    {
+        if want_gui {
+            eprintln!("flea: the window needs Quickshell, which runs on Wayland only; run flea --tui");
+            exit(2);
+        }
+        if interactive {
+            exit(tui::run(open_path.as_deref(), select_path.as_deref()));
+        }
+        eprintln!("flea: macOS runs Flea's terminal interface; run flea --tui inside a terminal, or give a path");
+        exit(2);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
     if !paths::has_display() {
         eprintln!("flea: there is no graphical session to open a window in");
         exit(2);
@@ -378,6 +397,7 @@ fn main() {
             eprintln!("{}", paths::missing_ui_message());
             exit(2);
         }
+    }
     }
 }
 

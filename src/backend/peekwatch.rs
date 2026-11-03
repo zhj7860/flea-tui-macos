@@ -11,11 +11,58 @@ use std::thread::{self, JoinHandle};
 const PEEK_WATCH_CAP: usize = 8;
 
 extern "C" {
+    fn close(fd: c_int) -> c_int;
+}
+#[cfg(target_os = "linux")]
+extern "C" {
     fn inotify_init1(flags: c_int) -> c_int;
     fn inotify_rm_watch(fd: c_int, wd: c_int) -> c_int;
     fn eventfd(initval: u32, flags: c_int) -> c_int;
     fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
-    fn close(fd: c_int) -> c_int;
+}
+// Darwin has neither inotify nor eventfd: src/sys.rs answers the watch with kqueue, and the stop
+// with a nonblocking pipe pair.
+#[cfg(target_os = "macos")]
+use crate::sys::{inotify_init1, inotify_rm_watch};
+
+// The wake the pump polls: an eventfd on Linux (one number, both ends), a pipe pair on macOS.
+struct Stop {
+    read: c_int,
+    write: c_int,
+}
+
+impl Stop {
+    fn new() -> Option<Stop> {
+        #[cfg(target_os = "linux")]
+        {
+            let fd = unsafe { eventfd(0, EFD_CLOEXEC) };
+            return (fd >= 0).then_some(Stop { read: fd, write: fd });
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let (read, write) = crate::sys::wake_pair().ok()?;
+            Some(Stop { read, write })
+        }
+    }
+
+    // A ticket nobody drains still wakes the poll; the counter never has to balance.
+    fn signal(&self) {
+        #[cfg(target_os = "linux")]
+        unsafe {
+            write(self.write, (&STOP_TICKET as *const u64).cast(), std::mem::size_of::<u64>());
+        }
+        #[cfg(target_os = "macos")]
+        crate::sys::wake_signal(self.write);
+    }
+
+    fn close(&self) {
+        if self.read >= 0 {
+            unsafe { close(self.read) };
+        }
+        if self.write >= 0 && self.write != self.read {
+            unsafe { close(self.write) };
+        }
+    }
 }
 // IN_CLOEXEC is O_CLOEXEC, so no thumbnailer child inherits this descriptor.
 const IN_CLOEXEC: c_int = 0x0008_0000;
@@ -28,7 +75,7 @@ const STOP_TICKET: u64 = 1;
 pub struct PeekWatch {
     fd: c_int,
     // Written once on drop, so the pump thread wakes from its poll and ends before the descriptor closes.
-    stop: c_int,
+    stop: Option<Stop>,
     pumper: Option<JoinHandle<()>>,
     held: VecDeque<(c_int, PathBuf)>,
     // The column directories the client draws now, once it has said; None until its first keep.
@@ -39,15 +86,16 @@ impl PeekWatch {
     // A box with no inotify keeps its neighbour columns as live as before, and the listed folder already said so once.
     pub fn start(tx: Sender<Event>) -> PeekWatch {
         let fd = unsafe { inotify_init1(IN_CLOEXEC) };
-        let stop = if fd >= 0 { unsafe { eventfd(0, EFD_CLOEXEC) } } else { -1 };
-        if fd >= 0 && stop < 0 {
+        let stop = if fd >= 0 { Stop::new() } else { None };
+        if fd >= 0 && stop.is_none() {
             unsafe { close(fd) };
         }
-        if stop < 0 {
-            return PeekWatch { fd: -1, stop: -1, pumper: None, held: VecDeque::new(), shown: None };
-        }
-        let pumper = Some(thread::spawn(move || pump(fd, tx, stop)));
-        PeekWatch { fd, stop, pumper, held: VecDeque::new(), shown: None }
+        let Some(stop) = stop else {
+            return PeekWatch { fd: -1, stop: None, pumper: None, held: VecDeque::new(), shown: None };
+        };
+        let polled = stop.read;
+        let pumper = Some(thread::spawn(move || pump(fd, tx, polled)));
+        PeekWatch { fd, stop: Some(stop), pumper, held: VecDeque::new(), shown: None }
     }
 
     // The peek worker arms with this descriptor, so a dead mount never blocks the loop.
@@ -101,13 +149,16 @@ impl PeekWatch {
 impl Drop for PeekWatch {
     fn drop(&mut self) {
         if let Some(pumper) = self.pumper.take() {
-            unsafe { write(self.stop, (&STOP_TICKET as *const u64).cast(), std::mem::size_of::<u64>()) };
+            if let Some(stop) = &self.stop {
+                stop.signal();
+            }
             let _ = pumper.join();
         }
-        for fd in [self.fd, self.stop] {
-            if fd >= 0 {
-                unsafe { close(fd) };
-            }
+        if self.fd >= 0 {
+            unsafe { close(self.fd) };
+        }
+        if let Some(stop) = &self.stop {
+            stop.close();
         }
     }
 }

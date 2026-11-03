@@ -29,7 +29,8 @@ pub fn give_back() {
     let _ = unsafe { malloc_trim(0) };
 }
 
-#[cfg(test)]
+// Every probe here reads /proc and glibc's allocator, so the suite is Linux's own.
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 

@@ -93,7 +93,6 @@ pub unsafe extern "C" fn eventfd(_value: u32, _flags: c_int) -> c_int {
 }
 
 /// The Linux process-exit descriptor; `crate::sys` provides the kqueue equivalent.
-#[cfg(not(test))]
 #[no_mangle]
 pub unsafe extern "C" fn pidfd_open(pid: c_int, flags: u32) -> c_int {
     crate::sys::pidfd_open(pid, flags)
@@ -205,19 +204,16 @@ pub unsafe extern "C" fn lremovexattr(path: *const c_char, name: *const c_char) 
 /// The inotify names the watch and peek layers use on Linux; on macOS they use
 /// `crate::sys::dirwatch` directly, but keeping the symbols makes any remaining
 /// direct declaration resolve to the same kqueue implementation.
-#[cfg(not(test))]
 #[no_mangle]
 pub unsafe extern "C" fn inotify_init1(flags: c_int) -> c_int {
     crate::sys::inotify_init1(flags)
 }
 
-#[cfg(not(test))]
 #[no_mangle]
 pub unsafe extern "C" fn inotify_add_watch(fd: c_int, path: *const c_char, mask: u32) -> c_int {
     crate::sys::inotify_add_watch(fd, path, mask)
 }
 
-#[cfg(not(test))]
 #[no_mangle]
 pub unsafe extern "C" fn inotify_rm_watch(fd: c_int, wd: c_int) -> c_int {
     crate::sys::inotify_rm_watch(fd, wd)

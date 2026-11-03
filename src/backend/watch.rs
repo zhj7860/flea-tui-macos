@@ -39,12 +39,18 @@ pub(crate) const COALESCE: Duration = Duration::from_millis(100);
 // A batch size and not a limit: the kernel's own drop is at max_queued_events, which this misses.
 pub(crate) const BUF: usize = 8192;
 
+#[cfg(target_os = "linux")]
 extern "C" {
     fn inotify_init1(flags: c_int) -> c_int;
     fn inotify_add_watch(fd: c_int, path: *const c_char, mask: u32) -> c_int;
     fn inotify_rm_watch(fd: c_int, wd: c_int) -> c_int;
     fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize;
 }
+// A kqueue descriptor is waited on by kevent, never read(2); src/sys.rs answers the same names and bytes.
+#[cfg(target_os = "macos")]
+use crate::sys::{
+    inotify_add_watch, inotify_init1, inotify_rm_watch, watch_read as read,
+};
 
 // One directory at a time plus the one a scan is reading; a negative descriptor is nothing watched.
 pub struct Watch {

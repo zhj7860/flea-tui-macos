@@ -44,6 +44,7 @@ const MAGIC: &[(i64, &str)] = &[
 
 // struct statfs on linux, byte-identical on x86-64 and aarch64 (120 bytes, f_bavail at 32): the
 // fields this needs are f_type, f_bsize and f_bavail, and the rest is padding this never reads.
+#[cfg(target_os = "linux")]
 #[repr(C)]
 struct StatFs {
     f_type: i64,
@@ -58,6 +59,30 @@ struct StatFs {
     f_frsize: i64,
     f_flags: i64,
     f_spare: [i64; 4],
+}
+
+// Darwin's struct statfs is 2168 bytes and names the type instead of carrying a magic, so the
+// Linux-shaped buffer above would be written far past its end. Every field here is read by name.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct StatFs {
+    f_bsize: u32,
+    f_iosize: i32,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_bavail: u64,
+    f_files: u64,
+    f_ffree: u64,
+    f_fsid: [i32; 2],
+    f_owner: u32,
+    f_type: u32,
+    f_flags: u32,
+    f_fssubtype: u32,
+    f_fstypename: [c_char; 16],
+    f_mntonname: [c_char; 1024],
+    f_mntfromname: [c_char; 1024],
+    f_flags_ext: u32,
+    f_reserved: [u32; 7],
 }
 
 extern "C" {
@@ -90,8 +115,18 @@ pub fn read_with_magic(path: &Path) -> (Option<Info>, Option<i64>) {
     if unsafe { statfs(c.as_ptr(), &mut buf) } != 0 {
         return (None, None);
     }
-    let info = Info { name: name_for(buf.f_type), free: buf.f_bavail.saturating_mul(buf.f_bsize.max(0) as u64), blocks: buf.f_blocks };
-    (Some(info), Some(buf.f_type))
+    #[cfg(target_os = "linux")]
+    {
+        let info = Info { name: name_for(buf.f_type), free: buf.f_bavail.saturating_mul(buf.f_bsize.max(0) as u64), blocks: buf.f_blocks };
+        return (Some(info), Some(buf.f_type));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let fstype = fstype_name(&buf.f_fstypename);
+        let magic = magic_from_fstype(&fstype);
+        let info = Info { name: fstype, free: buf.f_bavail.saturating_mul(u64::from(buf.f_bsize)), blocks: buf.f_blocks };
+        (Some(info), Some(magic))
+    }
 }
 
 #[cfg(test)]
@@ -109,6 +144,33 @@ pub fn test_reset_statfs() {
 #[cfg(test)]
 pub fn statfs_calls() -> usize {
     STATFS_CALLS.with(|n| n.get())
+}
+
+// The mount's own type name, NUL-trimmed; Darwin stores it where Linux stores a magic number.
+#[cfg(target_os = "macos")]
+fn fstype_name(raw: &[c_char; 16]) -> String {
+    let bytes: Vec<u8> = raw.iter().take_while(|c| **c != 0).map(|c| *c as u8).collect();
+    let name = String::from_utf8_lossy(&bytes).into_owned();
+    match name.as_str() {
+        "msdos" => "vfat".to_string(),
+        _ => name,
+    }
+}
+
+// The Linux magic of the same filesystem, so FAT durability and network rules read one dialect. An
+// unknown type answers 0, which every caller already treats as unknown rather than guessing local.
+#[cfg(target_os = "macos")]
+fn magic_from_fstype(name: &str) -> i64 {
+    match name {
+        "apfs" => 0x1A5F_5F00,
+        "hfs" => 0x482B,
+        "exfat" => 0x2011_BAB0,
+        "vfat" => 0x4D44,
+        "smbfs" => 0xFF53_4D42,
+        "nfs" => 0x6969,
+        "cd9660" => 0x9660,
+        _ => 0,
+    }
 }
 
 // Raw f_type for the class decision to catch a network mount under an fstype name fstype_is_network does not know.

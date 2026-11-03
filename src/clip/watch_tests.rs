@@ -328,5 +328,7 @@ fn a_primary_selection_retires_only_its_offer_and_keeps_the_clipboard() {
 #[path = "watch_loss_tests.rs"]
 mod loss;
 
+// Signs a pidfd the way Linux does; the Darwin owner wait is a kqueue, not a signalable pidfd.
+#[cfg(target_os = "linux")]
 #[path = "watch_end_tests.rs"]
 mod end;

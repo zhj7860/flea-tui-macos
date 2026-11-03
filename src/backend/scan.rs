@@ -101,7 +101,10 @@ fn finish_raw(code: c_int, path: &str) -> Result<(), FleaError> {
     Ok(())
 }
 
-// dirent as the kernel lays it: ino, off, reclen, type, then the NUL-terminated name.
+// dirent as the kernel lays it: ino, off, reclen, type, then the NUL-terminated name. Darwin's
+// 64-bit inode form is d_ino, d_seekoff, d_reclen, d_namlen, d_type, then a 1024 byte name, so the
+// Linux layout would read d_type out of the middle of the name.
+#[cfg(target_os = "linux")]
 #[repr(C)]
 struct Dirent {
     ino: u64,
@@ -109,6 +112,16 @@ struct Dirent {
     reclen: u16,
     dtype: u8,
     name: [c_char; 256],
+}
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct Dirent {
+    ino: u64,
+    seekoff: u64,
+    reclen: u16,
+    namlen: u16,
+    dtype: u8,
+    name: [c_char; 1024],
 }
 
 extern "C" {
@@ -121,7 +134,8 @@ extern "C" {
 }
 
 // Sample input: raw bytes "f.txt" under an open dir fd answer Some(0o100644); vanished answers None.
-fn stat_mode_at(fd: c_int, raw: &[u8]) -> Option<u32> {
+#[cfg(target_os = "linux")]
+fn stat_mode_at(fd: c_int, _dir: &str, raw: &[u8]) -> Option<u32> {
     if fd < 0 {
         return None;
     }
@@ -131,6 +145,16 @@ fn stat_mode_at(fd: c_int, raw: &[u8]) -> Option<u32> {
         return None;
     }
     Some(u32::from_ne_bytes([buf[ST_MODE_OFF], buf[ST_MODE_OFF + 1], buf[ST_MODE_OFF + 2], buf[ST_MODE_OFF + 3]]))
+}
+
+// Darwin's struct stat differs per architecture, so this fallback stats the name through std; APFS
+// reports d_type, so only a filesystem that answers DT_UNKNOWN ever reaches it.
+#[cfg(target_os = "macos")]
+fn stat_mode_at(_fd: c_int, dir: &str, raw: &[u8]) -> Option<u32> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    let name = std::ffi::OsStr::from_bytes(raw);
+    std::fs::symlink_metadata(std::path::Path::new(dir).join(name)).ok().map(|meta| meta.mode())
 }
 
 // Raw getdents with an fstatat fallback for typeless entries only, so xfs ftype=0 resolves before any order.
@@ -164,7 +188,7 @@ fn scan_raw(path: &str, hidden: bool, l: &mut Listing) -> Result<(), FleaError> 
         }
         // corner: typeless entries resolve by fstatat on the open dir fd, so the order is built on true types.
         let (is_dir, is_link) = if dtype == DT_UNKNOWN {
-            dir_from_dtype_resolved(dtype, stat_mode_at(fd, &bytes))
+            dir_from_dtype_resolved(dtype, stat_mode_at(fd, path, &bytes))
         } else {
             dir_from_dtype(dtype)
         };
@@ -304,14 +328,16 @@ mod tests {
         assert!(!dir.is_null(), "fixture must open");
         let fd = unsafe { dirfd(dir) };
         assert!(fd >= 0, "an open dir has a descriptor");
-        let file_mode = stat_mode_at(fd, b"f.txt");
-        let dir_mode = stat_mode_at(fd, b"sub");
-        let gone_mode = stat_mode_at(fd, b"never-here.txt");
+        let dir_path = d.path().to_str().unwrap().to_string();
+        let file_mode = stat_mode_at(fd, &dir_path, b"f.txt");
+        let dir_mode = stat_mode_at(fd, &dir_path, b"sub");
+        let gone_mode = stat_mode_at(fd, &dir_path, b"never-here.txt");
         unsafe { closedir(dir) };
         assert_eq!(file_mode.map(|m| m & S_IFMT), Some(0o100000), "a file stats as a regular file");
         assert_eq!(dir_mode.map(|m| m & S_IFMT), Some(S_IFDIR), "a folder stats as a directory");
         assert_eq!(gone_mode, None, "a vanished name stats as nothing");
-        assert_eq!(stat_mode_at(-1, b"f.txt"), None, "a dead descriptor stats as nothing");
+        #[cfg(target_os = "linux")]
+        assert_eq!(stat_mode_at(-1, &dir_path, b"f.txt"), None, "a dead descriptor stats as nothing");
     }
 
     #[test]

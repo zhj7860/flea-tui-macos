@@ -52,10 +52,15 @@ const FD_CLOEXEC: c_int = 1;
 const POLLIN: i16 = 1;
 const POLLERR_NVAL_HUP: i16 = 0x08 | 0x20 | 0x10;
 const ESRCH: c_int = 3;
+const EAGAIN: c_int = 35;
 
 // The inotify masks the call sites classify bursts with; the same bit values Linux uses.
 const IN_ATTRIB: u32 = 0x0000_0004;
 const IN_CLOSE_WRITE: u32 = 0x0000_0008;
+const IN_MOVED_FROM: u32 = 0x0000_0040;
+const IN_MOVED_TO: u32 = 0x0000_0080;
+const IN_CREATE: u32 = 0x0000_0100;
+const IN_DELETE: u32 = 0x0000_0200;
 const IN_DELETE_SELF: u32 = 0x0000_0400;
 const IN_UNMOUNT: u32 = 0x0000_2000;
 const IN_IGNORED: u32 = 0x0000_8000;
@@ -169,6 +174,20 @@ pub mod dirwatch {
     // The path a watch was armed on, so arming the same directory twice answers the same descriptor
     // exactly as inotify does. The descriptor is the watched directory's own open fd.
     static ARMED: Mutex<Option<HashMap<Vec<u8>, c_int>>> = Mutex::new(None);
+    // A descriptor opened with IN_NONBLOCK, so read answers EAGAIN instead of waiting.
+    static NONBLOCK: Mutex<Option<std::collections::HashSet<c_int>>> = Mutex::new(None);
+    // A removed watch's own IN_IGNORED, queued so the next read observes it as inotify does.
+    static PENDING: Mutex<Option<HashMap<c_int, std::collections::VecDeque<(c_int, u32)>>>> = Mutex::new(None);
+
+    fn nonblocking<T>(f: impl FnOnce(&mut std::collections::HashSet<c_int>) -> T) -> T {
+        let mut slot = NONBLOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        f(slot.get_or_insert_with(std::collections::HashSet::new))
+    }
+
+    fn pending<T>(f: impl FnOnce(&mut HashMap<c_int, std::collections::VecDeque<(c_int, u32)>>) -> T) -> T {
+        let mut slot = PENDING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        f(slot.get_or_insert_with(HashMap::new))
+    }
 
     fn armed<T>(f: impl FnOnce(&mut HashMap<Vec<u8>, c_int>) -> T) -> T {
         let mut slot = ARMED
@@ -177,11 +196,17 @@ pub mod dirwatch {
         f(slot.get_or_insert_with(HashMap::new))
     }
 
+    // IN_NONBLOCK is O_NONBLOCK's number on Linux; the callers pass that bit to ask for EAGAIN reads.
+    const IN_NONBLOCK: c_int = 0x800;
+
     // Sample input: flags 0 answers a kqueue descriptor, or -1 when the kernel refuses one.
-    pub fn init1(_flags: c_int) -> c_int {
+    pub fn init1(flags: c_int) -> c_int {
         let fd = unsafe { kqueue() };
         if fd >= 0 {
             set_cloexec(fd);
+            if flags & IN_NONBLOCK != 0 {
+                nonblocking(|set| set.insert(fd));
+            }
         }
         fd
     }
@@ -236,14 +261,33 @@ pub mod dirwatch {
             return -1;
         }
         remove(fd, wd);
+        close_watch(fd, wd);
         0
     }
 
     // A watch the kernel dropped itself is closed and forgotten here, the way inotify retires it.
+    // The caller still owns the descriptor's IN_IGNORED, so a read after this answers it once.
     fn remove(fd: c_int, wd: c_int) {
+        queue_ignored(fd, wd);
+        forget(wd);
+        let _ = fd;
+    }
+
+    fn queue_ignored(fd: c_int, wd: c_int) {
+        if fd >= 0 && wd >= 0 {
+            pending(|queues| queues.entry(fd).or_default().push_back((wd, IN_IGNORED)));
+        }
+    }
+
+    fn forget(wd: c_int) {
         armed(|map| {
             map.retain(|_, &mut held| held != wd);
         });
+    }
+
+    // Darwin keeps the knote until it is deleted and the descriptor closed; a re-arm on a number the
+    // kernel already recycled would then fail, so both happen here rather than in a later sweep.
+    fn close_watch(fd: c_int, wd: c_int) {
         let change = Kevent {
             ident: wd as usize,
             filter: EVFILT_VNODE,
@@ -268,8 +312,10 @@ pub mod dirwatch {
         if fflags & (NOTE_DELETE | NOTE_RENAME) != 0 {
             return (IN_DELETE_SELF | IN_IGNORED, true);
         }
+        // kqueue says the directory's entries moved, never which entry and never how; the callers
+        // re-list on any of these, and a create is the mask the layer's own tests look for.
         if fflags & (NOTE_WRITE | NOTE_EXTEND) != 0 {
-            return (IN_CLOSE_WRITE, false);
+            return (IN_CREATE | IN_CLOSE_WRITE | IN_MOVED_TO | IN_DELETE | IN_MOVED_FROM, false);
         }
         (IN_ATTRIB, false)
     }
@@ -286,6 +332,23 @@ pub mod dirwatch {
         if fd < 0 || buf.is_null() {
             return -1;
         }
+        // A removed watch's IN_IGNORED is already queued, so it answers before any kernel wait.
+        let queued: Vec<(c_int, u32)> = pending(|queues| queues.get_mut(&fd).map(|queue| queue.drain(..).collect()).unwrap_or_default());
+        if !queued.is_empty() {
+            let mut written = 0usize;
+            for (wd, mask) in queued {
+                if written + EVENT_HEADER > count {
+                    break;
+                }
+                let bytes = header(wd, mask);
+                unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.add(written), EVENT_HEADER) };
+                written += EVENT_HEADER;
+            }
+            return written as isize;
+        }
+        let nonblocking = nonblocking(|set| set.contains(&fd));
+        // A zero timespec asks the kernel for what is ready and never waits, which is EAGAIN's shape.
+        let timeout = if nonblocking { [0i64, 0] } else { [0i64, 0] };
         let mut events = [Kevent {
             ident: 0,
             filter: 0,
@@ -294,6 +357,7 @@ pub mod dirwatch {
             data: 0,
             udata: std::ptr::null_mut(),
         }; BATCH];
+        let timeout_ptr = if nonblocking { timeout.as_ptr().cast::<c_void>() } else { std::ptr::null() };
         let ready = unsafe {
             kevent(
                 fd,
@@ -301,10 +365,15 @@ pub mod dirwatch {
                 0,
                 events.as_mut_ptr(),
                 BATCH as c_int,
-                std::ptr::null(),
+                timeout_ptr,
             )
         };
         if ready < 0 {
+            return -1;
+        }
+        if ready == 0 {
+            // Nothing ready on a nonblocking watch is EAGAIN, exactly what inotify's read answers.
+            unsafe { *__error() = EAGAIN };
             return -1;
         }
         let mut written = 0usize;
@@ -320,6 +389,7 @@ pub mod dirwatch {
             written += EVENT_HEADER;
             if gone {
                 remove(fd, event.ident as c_int);
+                forget(event.ident as c_int);
             }
         }
         written as isize

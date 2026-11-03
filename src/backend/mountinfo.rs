@@ -44,10 +44,18 @@ fn modes_for_mount(fstype: &str, options: &str) -> bool {
 }
 
 // Sample dev: makedev(8,17) is 0x811 and answers "8:17"; the glibc major/minor packing, see sys/sysmacros.h.
+#[cfg(target_os = "linux")]
 pub(crate) fn dev_majmin(dev: u64) -> String {
     let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & 0xffff_f000);
     let minor = (dev & 0xff) | ((dev >> 12) & 0xffff_ff00);
     format!("{major}:{minor}")
+}
+
+// Darwin packs dev_t as 8 bits of major over 24 of minor, see sys/types.h. Both sides of every
+// comparison are computed here, so only self-consistency matters, but it must be the same packing.
+#[cfg(target_os = "macos")]
+pub(crate) fn dev_majmin(dev: u64) -> String {
+    format!("{}:{}", (dev >> 24) & 0xff, dev & 0x00ff_ffff)
 }
 
 // Sample input: dev 0x811 against a line carrying "8:17 ... - vfat ..." answers Some("vfat").
@@ -174,7 +182,85 @@ pub(crate) fn enclosing<'a>(path: &Path, mounts: &'a [(PathBuf, String)]) -> Opt
 pub(crate) fn read_body() -> String {
     #[cfg(test)]
     READS.with(|reads| reads.set(reads.get() + 1));
-    std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default()
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos_body()
+    }
+}
+
+// Darwin has no mount table file, so `mount`'s one-line-per-mount text is turned into the same
+// mountinfo shape the parser above reads; every consumer stays one dialect.
+#[cfg(target_os = "macos")]
+fn macos_body() -> String {
+    let out = std::process::Command::new("/sbin/mount").output().ok();
+    let text = out.map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    let mut body = String::new();
+    for (n, line) in text.lines().enumerate() {
+        if let Some(entry) = macos_mount_entry(line) {
+            body.push_str(&entry.to_line(n + 1));
+            body.push('\n');
+        }
+    }
+    body
+}
+
+// One line of `mount`: `/dev/disk3s5 on /System/Volumes/Data (apfs, local, journaled, root data)`.
+#[cfg(target_os = "macos")]
+struct MacMount {
+    source: String,
+    mount: String,
+    fstype: String,
+    options: Vec<String>,
+}
+
+#[cfg(target_os = "macos")]
+impl MacMount {
+    fn to_line(&self, id: usize) -> String {
+        let majmin = std::fs::metadata(&self.mount).map(|m| {
+            use std::os::unix::fs::MetadataExt;
+            dev_majmin(m.dev())
+        }).unwrap_or_else(|_| "0:0".to_string());
+        let options = if self.options.is_empty() { "rw".to_string() } else { self.options.join(",") };
+        format!(
+            "{id} 0 {majmin} / {} {} - {} {} {}",
+            escape_field(&self.mount),
+            options,
+            self.fstype,
+            escape_field(&self.source),
+            options
+        )
+    }
+}
+
+// Sample input: "/dev/disk3s1s1 on / (apfs, sealed, local)" answers source, "/", "apfs", [sealed, local].
+#[cfg(target_os = "macos")]
+fn macos_mount_entry(line: &str) -> Option<MacMount> {
+    let open = line.rfind(" (")?;
+    let tail = line.get(open + 2..)?.strip_suffix(')')?;
+    let head = &line[..open];
+    let (source, mount) = head.rsplit_once(" on ")?;
+    let mut parts = tail.split(',').map(|part| part.trim().to_string()).filter(|part| !part.is_empty());
+    let fstype = parts.next()?;
+    Some(MacMount { source: source.to_string(), mount: mount.to_string(), fstype, options: parts.collect() })
+}
+
+// The octal escapes mountinfo itself uses, so a space in a volume name survives one field.
+#[cfg(target_os = "macos")]
+fn escape_field(value: &str) -> String {
+    let mut out = Vec::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b' ' => out.extend_from_slice(b"\\040"),
+            b'\t' => out.extend_from_slice(b"\\011"),
+            b'\\' => out.extend_from_slice(b"\\134"),
+            _ => out.push(byte),
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 // Thread-local, so parallel suites never see each other's reads; tests reset it with test_reset.
@@ -273,6 +359,8 @@ mod tests {
         );
     }
 
+    // makedev's packing and this box's mountinfo numbers are Linux's; Darwin's dev_t packs differently.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_device_lookup_names_the_fstype_for_the_slow_pass_gate() {
         let info = "1 0 8:1 / / rw - ext4 /dev/a rw\n\
@@ -394,5 +482,19 @@ mod tests {
             let stacked = format!("{body}4 1 0:33 / /share/unix rw - {fstype} //server/fixed rw\n");
             assert!(!modes_are_real(Path::new("/share/unix/file"), &stacked), "the later mount wins the same depth");
         }
+    }
+
+    // `mount` prints one line per volume with a real space in a name, which must still be one field here.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_darwin_mount_line_becomes_the_same_table() {
+        let entry = macos_mount_entry("/dev/disk3s5 on /Volumes/My Disk (apfs, local, journaled)").expect("a mount line");
+        assert_eq!(entry.source, "/dev/disk3s5");
+        assert_eq!(entry.mount, "/Volumes/My Disk");
+        assert_eq!(entry.fstype, "apfs");
+        assert_eq!(entry.options, vec!["local".to_string(), "journaled".to_string()]);
+        let body = entry.to_line(1);
+        assert_eq!(mount_type_in(Path::new("/Volumes/My Disk/photo.jpg"), &body).as_deref(), Some("apfs"));
+        assert!(mount_entry_in(Path::new("/Volumes/My Disk"), &body).is_some(), "the volume's own root is inside it");
     }
 }

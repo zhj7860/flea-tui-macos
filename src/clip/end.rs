@@ -270,6 +270,7 @@ fn owner_args(args: &[&[u8]]) -> bool {
     false
 }
 
-#[cfg(test)]
+// The owner-end fault fixture stands in for Linux pidfd and eventfd symbols, so its checks are Linux's.
+#[cfg(all(test, target_os = "linux"))]
 #[path = "end_tests.rs"]
 mod tests;

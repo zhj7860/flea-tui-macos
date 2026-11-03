@@ -26,8 +26,12 @@ const SKIPPED: c_int = -1;
 
 extern "C" {
     fn poll(fds: *mut PollFd, nfds: usize, timeout: c_int) -> c_int;
+    #[cfg(target_os = "linux")]
     fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize;
 }
+// A kqueue descriptor is read through kevent; src/sys.rs answers the same inotify bytes.
+#[cfg(target_os = "macos")]
+use crate::sys::watch_read as read;
 
 // What a wait ended for: the watch has events, its owner asked it to stop, or the pause ran out.
 #[derive(PartialEq)]
