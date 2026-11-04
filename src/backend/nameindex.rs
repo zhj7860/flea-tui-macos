@@ -137,11 +137,6 @@ pub fn prepare() {
     let _ = spawned;
 }
 
-// True once the snapshot can answer a query.
-pub fn is_ready() -> bool {
-    ready().is_some()
-}
-
 // One ranked answer: the head's rows as absolute paths, every match, and the indexed population.
 // None means the snapshot is not built yet, and the caller falls back to a live walk.
 pub fn query(text: &str, hidden: bool, limit: usize) -> Option<(Vec<(String, bool)>, usize, usize)> {

@@ -46,7 +46,8 @@ struct Range {
     length: u64,
 }
 
-// $XDG_CACHE_HOME/flea/prefetch, or None when there is no home to put it in.
+// $XDG_CACHE_HOME/flea/prefetch, or None when there is no home to put it in; the GUI launcher's alone.
+#[cfg(not(target_os = "macos"))]
 pub fn list_path() -> Option<PathBuf> {
     let cache = match crate::userfile::env_dir("XDG_CACHE_HOME") {
         Some(dir) => dir,

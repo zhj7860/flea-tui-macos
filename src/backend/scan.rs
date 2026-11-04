@@ -58,6 +58,7 @@ const DT_UNKNOWN: u8 = 0;
 const DT_DIR: u8 = 4;
 const DT_LNK: u8 = 10;
 // fstatat flag asking for the link itself, so a symlink never resolves to its target here.
+#[cfg(target_os = "linux")]
 const AT_SYMLINK_NOFOLLOW: c_int = 0x100;
 // st_mode file-type mask, the two types a typeless entry can resolve to, and the regular file a gvfs row's mode names.
 pub(crate) const S_IFMT: u32 = 0o170000;
@@ -65,9 +66,9 @@ pub(crate) const S_IFREG: u32 = 0o100000;
 const S_IFDIR: u32 = 0o040000;
 const S_IFLNK: u32 = 0o120000;
 // st_mode offset inside struct stat: 24 on x86_64, 16 on aarch64; buffer oversized so neither arch overflows.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const ST_MODE_OFF: usize = 24;
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(all(target_os = "linux", not(target_arch = "x86_64")))]
 const ST_MODE_OFF: usize = 16;
 
 // Sample dirent: d_type 4 with name "sub", d_type 0 with name "xfs-file"; unknown stays a dir.
@@ -129,6 +130,7 @@ extern "C" {
     fn readdir(dir: *mut std::ffi::c_void) -> *mut Dirent;
     fn closedir(dir: *mut std::ffi::c_void) -> c_int;
     fn dirfd(dir: *mut std::ffi::c_void) -> c_int;
+    #[cfg(target_os = "linux")]
     fn fstatat(dirfd: c_int, path: *const c_char, buf: *mut std::ffi::c_void, flags: c_int) -> c_int;
     fn __errno_location() -> *mut c_int;
 }

@@ -51,6 +51,7 @@ impl Wake {
     }
 }
 
+#[cfg(target_os = "linux")]
 const CLOEXEC_NONBLOCK: c_int = 0o2000000 | 0o4000;
 const POLLIN: i16 = 1;
 const ESRCH: i32 = 3;
@@ -263,6 +264,7 @@ fn is_owner(pid: u32) -> bool {
     owner_args(&args)
 }
 
+#[cfg(target_os = "linux")]
 fn owner_args(args: &[&[u8]]) -> bool {
     if matches!(args, [_, b"--clip-own"]) { return true; }
     #[cfg(test)]

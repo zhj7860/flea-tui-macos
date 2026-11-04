@@ -55,6 +55,8 @@ impl<'a> Iterator for Wrapped<'a> {
         Some(text)
     }
 }
+// The layout without the parent rule, kept for the tests that pin the shared arithmetic.
+#[cfg(test)]
 pub fn panes(columns: usize, preview: bool) -> (usize, usize, usize) {
     panes_for(columns, preview, true)
 }

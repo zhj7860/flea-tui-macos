@@ -69,8 +69,10 @@ impl Stop {
 // IN_CLOEXEC is O_CLOEXEC, so no thumbnailer child inherits this descriptor.
 const IN_CLOEXEC: c_int = 0x0008_0000;
 // EFD_CLOEXEC is the same bit, and an eventfd read by poll alone never needs the counter drained.
+#[cfg(target_os = "linux")]
 const EFD_CLOEXEC: c_int = 0x0008_0000;
 // An eventfd is written an 8 byte counter, and any nonzero one makes it readable.
+#[cfg(target_os = "linux")]
 const STOP_TICKET: u64 = 1;
 
 // Its own inotify descriptor, so a descriptor removed here can never be the listed directory's own watch.

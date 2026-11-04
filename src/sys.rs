@@ -6,16 +6,9 @@
 // `#[cfg(target_os = "macos")]`; the Linux build compiles the original code and never this file.
 #![cfg(target_os = "macos")]
 
-use std::ffi::{c_char, c_int, c_void, CString};
+use std::ffi::{c_char, c_int, c_void};
 use std::os::fd::RawFd;
 use std::sync::Mutex;
-
-#[repr(C)]
-struct PollFd {
-    fd: c_int,
-    events: i16,
-    revents: i16,
-}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -51,8 +44,6 @@ const O_NONBLOCK: c_int = 0x0004;
 const F_SETFD: c_int = 2;
 const F_SETFL: c_int = 4;
 const FD_CLOEXEC: c_int = 1;
-const POLLIN: i16 = 1;
-const POLLERR_NVAL_HUP: i16 = 0x08 | 0x20 | 0x10;
 const ESRCH: c_int = 3;
 const EAGAIN: c_int = 35;
 
@@ -87,18 +78,7 @@ extern "C" {
     fn close(fd: c_int) -> c_int;
     fn pipe(fds: *mut c_int) -> c_int;
     fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
-    fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize;
-    fn poll(fds: *mut PollFd, nfds: u32, timeout: c_int) -> c_int;
-    fn getdtablesize() -> c_int;
     fn kill(pid: c_int, sig: c_int) -> c_int;
-    fn rename(from: *const c_char, to: *const c_char) -> c_int;
-    fn renamex_np(from: *const c_char, to: *const c_char, flags: u32) -> c_int;
-}
-
-// std::io::Error::last_os_error reads errno through its own hidden declaration; a caller that wants
-// the raw number asks here, and the pointer is what scan.rs clears before readdir.
-pub fn errno_location() -> *mut c_int {
-    unsafe { __error() }
 }
 
 pub fn set_cloexec(fd: c_int) -> c_int {
@@ -159,13 +139,6 @@ pub fn wake_signal(writer: RawFd) {
     }
 }
 
-pub fn wake_drain(reader: RawFd) {
-    if reader < 0 {
-        return;
-    }
-    let mut bytes = [0u8; 8];
-    while unsafe { read(reader, bytes.as_mut_ptr().cast(), bytes.len()) } > 0 {}
-}
 
 // An inotify-compatible descriptor backed by kqueue: init creates it, add/rm arm a vnode watch, and
 // read answers the same 16 byte events the Linux parser walks. Only directories are watched here.
@@ -178,7 +151,6 @@ pub mod dirwatch {
     struct Armed {
         kq: c_int,
         dir: c_int,
-        path: Vec<u8>,
     }
 
     // The path a watch was armed on, per kqueue, so arming the same directory twice on one watch
@@ -296,7 +268,7 @@ pub mod dirwatch {
             return -1;
         }
         let wd = next_wd();
-        watches(|map| map.insert(wd, Armed { kq, dir, path: key.clone() }));
+        watches(|map| map.insert(wd, Armed { kq, dir }));
         by_dir(|map| map.insert((kq, dir), wd));
         armed(|map| map.insert((kq, key), wd));
         wd
@@ -491,127 +463,4 @@ pub unsafe fn pidfd_open(pid: c_int, _flags: u32) -> c_int {
         return -1;
     }
     fd
-}
-
-// close_range(CLOEXEC) is missing; this is the same loop its own fallback runs, over the real table size.
-pub fn close_inherited() {
-    let top = unsafe { getdtablesize() };
-    let mut fd: c_int = 3;
-    while fd < top {
-        unsafe { fcntl(fd, F_SETFD, FD_CLOEXEC) };
-        fd += 1;
-    }
-}
-
-// Struct pollfd plus the event wrapper clip/end.rs and peekwatch.rs already keep; a kqueue descriptor
-// and a pipe end both poll the way the Linux descriptors did.
-pub fn poll_in(fd: RawFd, timeout: c_int) -> i32 {
-    let mut fds = [PollFd {
-        fd,
-        events: POLLIN,
-        revents: 0,
-    }];
-    let ready = unsafe { poll(fds.as_mut_ptr(), 1, timeout) };
-    if ready <= 0 {
-        return ready;
-    }
-    if fds[0].revents & POLLERR_NVAL_HUP != 0 {
-        return -1;
-    }
-    i32::from(fds[0].revents & POLLIN != 0)
-}
-
-// Two poll legs for clip/end.rs's owner wait: the wake pipe and the exit descriptor at once.
-pub fn poll_two(first: RawFd, second: RawFd, timeout: c_int) -> (bool, bool) {
-    let mut fds = [
-        PollFd {
-            fd: first,
-            events: POLLIN,
-            revents: 0,
-        },
-        PollFd {
-            fd: second,
-            events: POLLIN,
-            revents: 0,
-        },
-    ];
-    let ready = unsafe { poll(fds.as_mut_ptr(), 2, timeout) };
-    if ready < 0 {
-        return (false, false);
-    }
-    let seen = |index: usize| fds[index].revents & (POLLIN | POLLERR_NVAL_HUP) != 0;
-    (ready > 0 && seen(0), ready > 0 && seen(1))
-}
-
-// A directory name's C string for the callers that build one; None on an interior NUL, as CString::new.
-pub fn c_path(path: &std::path::Path) -> Option<CString> {
-    use std::os::unix::ffi::OsStrExt;
-    CString::new(path.as_os_str().as_bytes()).ok()
-}
-
-// pipe2(fds, flags) is Linux-only. The flags the callers pass are O_CLOEXEC, so both ends are marked
-// here; the array is written only on success, as pipe2 does.
-pub unsafe fn pipe2(fds: *mut c_int, _flags: c_int) -> c_int {
-    let mut pair = [0 as c_int; 2];
-    if pipe(pair.as_mut_ptr()) != 0 {
-        return -1;
-    }
-    if set_cloexec(pair[0]) != 0 || set_cloexec(pair[1]) != 0 {
-        let failure = *__error();
-        close(pair[0]);
-        close(pair[1]);
-        *__error() = failure;
-        return -1;
-    }
-    std::ptr::copy_nonoverlapping(pair.as_ptr(), fds, 2);
-    0
-}
-
-// renameat2(.., RENAME_NOREPLACE) is Linux's atomic no-clobber rename; Darwin spells the same
-// guarantee renamex_np with RENAME_EXCL, and both callers pass absolute paths so the dirfds are unused.
-pub unsafe fn renameat2(
-    _olddirfd: c_int,
-    oldpath: *const c_char,
-    _newdirfd: c_int,
-    newpath: *const c_char,
-    flags: u32,
-) -> c_int {
-    const RENAME_EXCL: u32 = 0x0000_0004;
-    if flags & 1 != 0 {
-        return renamex_np(oldpath, newpath, RENAME_EXCL);
-    }
-    rename(oldpath, newpath)
-}
-
-// posix_fadvise(WILLNEED) has no Darwin equivalent; nothing is lost but the read-ahead hint.
-pub unsafe fn posix_fadvise(_fd: c_int, _offset: i64, _len: i64, _advice: c_int) -> c_int {
-    0
-}
-
-// sync_file_range's write leg only starts writeback, so Darwin's no-op is the right shape. The
-// confirming leg asks the drive with F_FULLFSYNC, the guarantee the Linux call's WAIT flags give.
-pub unsafe fn sync_file_range(fd: c_int, _offset: i64, _len: i64, flags: u32) -> c_int {
-    const SYNC_FILE_RANGE_WRITE: u32 = 2;
-    if flags & SYNC_FILE_RANGE_WRITE != 0 && flags == SYNC_FILE_RANGE_WRITE {
-        return 0;
-    }
-    full_fsync(fd)
-}
-
-// The batch confirm: one drive flush on this descriptor, which is what syncfs promises a whole mount.
-pub unsafe fn syncfs(fd: c_int) -> c_int {
-    full_fsync(fd)
-}
-
-// F_FULLFSYNC asks the device to flush its cache; where the filesystem refuses it, fsync is the
-// weaker fallback Linux's own close would have left the caller with.
-unsafe fn full_fsync(fd: c_int) -> c_int {
-    const F_FULLFSYNC: c_int = 51;
-    if fcntl(fd, F_FULLFSYNC) == 0 {
-        return 0;
-    }
-    extern "C" {
-        fn fsync(fd: c_int) -> c_int;
-    }
-    fsync(fd)
 }

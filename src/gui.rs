@@ -12,7 +12,9 @@ extern "C" {
     fn fork() -> i32;
 }
 
-// exec rather than spawn, so the shell replaces this process and no pid is orphaned.
+// exec rather than spawn, so the shell replaces this process and no pid is orphaned. Darwin has no
+// Quickshell, so this launcher is compiled out there rather than left as dead code.
+#[cfg(not(target_os = "macos"))]
 pub fn exec_qs(ui: &Path, start: Option<&str>, select: Option<&str>) -> i32 {
     // Quickshell keeps dead entries forever, so Flea prunes only its own shells before qs starts.
     crate::qsregistry::prune_dead(&[crate::paths::SHELL_ID, crate::paths::PICKER_SHELL_ID]);

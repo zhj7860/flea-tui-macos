@@ -35,9 +35,3 @@ pub const O_NONBLOCK: i32 = 0o4000;
 compile_error!("O_NONBLOCK needs a verified value for this architecture");
 #[cfg(target_os = "macos")]
 pub const O_NONBLOCK: i32 = 0x0004;
-
-// O_CLOEXEC, which pipe2 and socketpair callers pass; Darwin spells it 0x01000000 rather than 0o2000000.
-#[cfg(target_os = "linux")]
-pub const O_CLOEXEC: i32 = 0o2_000_000;
-#[cfg(target_os = "macos")]
-pub const O_CLOEXEC: i32 = 0x0100_0000;

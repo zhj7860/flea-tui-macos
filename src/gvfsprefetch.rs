@@ -114,6 +114,7 @@ fn sweep_dir(dir: &Path, now: SystemTime) {
 }
 
 // The launcher's side: our dir, last leftovers gone, this launch's file named.
+#[cfg(not(target_os = "macos"))]
 pub fn prepare(path: &str) -> Option<(PathBuf, u64)> {
     prepare_for(path, runtime_dir())
 }

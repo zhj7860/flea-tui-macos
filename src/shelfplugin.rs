@@ -123,6 +123,7 @@ pub fn sync(enabled: bool) -> Result<(), String> {
 
 // Startup, where the copy is refreshed after an upgrade shipped a new plugin under an old switch.
 // A switch that is off owns no copy, so there is nothing to carry forward.
+#[cfg(not(target_os = "macos"))]
 pub fn refresh(enabled: bool) -> Result<(), String> {
     if !enabled {
         return Ok(());
