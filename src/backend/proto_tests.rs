@@ -62,10 +62,18 @@ fn parses_each_request_shape() {
         _ => panic!("expected Sort"),
     }
     match parse_request(r#"{"c":"search","path":"/home/gm","query":"bench","hidden":true}"#) {
-        Request::Search { path, query, hidden } => {
+        Request::Search { path, query, hidden, locate } => {
             assert_eq!(path, "/home/gm");
             assert_eq!(query, "bench");
             assert!(hidden);
+            assert!(!locate, "an older client asks for no whole-Mac index");
+        }
+        _ => panic!("expected Search"),
+    }
+    match parse_request(r#"{"c":"search","path":"/","query":"Cargo.toml","locate":true}"#) {
+        Request::Search { path, locate, .. } => {
+            assert_eq!(path, "/");
+            assert!(locate, "the whole-Mac scope names the index");
         }
         _ => panic!("expected Search"),
     }

@@ -482,10 +482,10 @@ pub fn draw(
         } else if editor.kind == "search" {
             format!(
                 " · in {} · Tab changes scope",
-                if m.search_here {
-                    path.clone()
-                } else {
-                    "Home".into()
+                match m.search_scope {
+                    0 => path.clone(),
+                    1 => "Home".into(),
+                    _ => "This Mac".into(),
                 }
             )
         } else {

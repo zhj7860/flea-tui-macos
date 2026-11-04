@@ -58,6 +58,30 @@ without AppleScript automation permission, which this port does not request.
 - Volume table rebuilt from `/sbin/mount`, so per-mount rules (FAT/exFAT durability,
   network classes, noexec) read the same shape the Linux parser does.
 
+## Whole-Mac search, indexed by Flea itself
+
+`f` opens the search line; **Tab** cycles its scope: **Here** (the folder on screen), **Home**,
+and **This Mac**. Enter on a result opens a file or walks into a folder, exactly like a
+listing row. No Spotlight and no Everything: Flea builds and keeps its own name index, and it
+is also the answer on a box where Spotlight is switched off (measured here: `mdutil -s /` says
+"Indexing disabled").
+
+- The snapshot covers `$HOME`, `/Applications` and every mounted volume. Caches, Trash, `.git`,
+  `node_modules`, `target`, `DerivedData`, `.cache`, `.Spotlight-V100` and `.fseventsd` are
+  listed but never descended, and the index stops at 1.5 million entries.
+- It lives in `~/Library/Caches/flea/locate.idx` (or `$XDG_CACHE_HOME/flea/locate.idx`), is
+  read on the first whole-Mac search of a process and rebuilt behind the answer once it is 12
+  hours old.
+- **The first whole-Mac search of a fresh install** walks the home tree instead (measured 1.0
+  to 1.5 s to the first answer on this box) and starts the snapshot in the background; the build
+  takes about 5 to 10 s and writes roughly 170 MB. Every later launch answers from the file:
+  measured **0.05 s** from a cold process to a ranked answer over **675,493 indexed entries**.
+- One answer carries at most 20,000 ranked rows, kept in the listing so copy, trash, preview
+  and the columns view work on results unchanged; the status line reports the rows it holds and
+  the population it looked through. Narrow the query to see past the head.
+- Ranking is the same subsequence score the folder search uses: an exact name leads, a match in
+  the file's own name beats one in a parent directory, and shorter paths win ties.
+
 ## What is Linux-only here
 
 These paths need kernel features with no Darwin equivalent, and refuse cleanly rather

@@ -11,7 +11,8 @@ pub enum Request {
     Window { start: usize, count: usize },
     // ordering::request reads desc from the raw line, so this parsed copy is read by tests alone; anchor is the cursor's row.
     Sort { by: String, #[cfg_attr(not(test), allow(dead_code))] desc: bool, anchor: Option<String> },
-    Search { path: String, query: String, hidden: bool },
+    // locate answers from the whole-Mac name index instead of walking the path, when that index is built.
+    Search { path: String, query: String, hidden: bool, locate: bool },
     // Unlike thumbcancel there is no rows form: one walk runs at a time, so a cancel can only mean that one.
     SearchCancel,
     // A live session: the scope walks once, each query answers from the index with its own generation.
@@ -159,6 +160,7 @@ pub fn parse_request(line: &str) -> Request {
             path: field_str(line, "path").unwrap_or_default(),
             query: field_str(line, "query").unwrap_or_default(),
             hidden: field_bool(line, "hidden"),
+            locate: field_bool(line, "locate"),
         },
         Some("searchcancel") => Request::SearchCancel,
         Some("searchopen") => Request::SearchOpen {

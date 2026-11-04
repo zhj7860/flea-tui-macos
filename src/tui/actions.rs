@@ -1000,7 +1000,11 @@ fn edit(m: &mut Model, key: &Key, w: &mut Wire) -> io::Result<()> {
                     m.search_from = Some(m.path.clone());
                 }
                 let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
-                if !m.search_here && home.is_absolute() && m.path.starts_with(&home) {
+                let locate = m.search_scope == 2;
+                if locate {
+                    // The index answers with absolute paths, so the listing base is the root itself.
+                    m.path = PathBuf::from("/");
+                } else if m.search_scope == 1 && home.is_absolute() && m.path.starts_with(&home) {
                     m.path = home;
                 }
                 m.invalidate_rows();
@@ -1016,6 +1020,7 @@ fn edit(m: &mut Model, key: &Key, w: &mut Wire) -> io::Result<()> {
                     ("path", word(&m.path.to_string_lossy())),
                     ("query", word(value)),
                     ("hidden", Json::Bool(m.hidden)),
+                    ("locate", Json::Bool(locate)),
                 ])?;
             }
             "rename" => {
@@ -1044,7 +1049,7 @@ fn edit(m: &mut Model, key: &Key, w: &mut Wire) -> io::Result<()> {
             editor.replace(m.completion.clone());
         }
     } else if key.name == "Tab" && kind == "search" {
-        m.search_here = !m.search_here;
+        m.search_scope = (m.search_scope + 1) % 3;
     } else {
         editor.update(key);
     }

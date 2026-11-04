@@ -361,7 +361,7 @@ fn handle_line(
             }
             out.flush().ok();
         }
-        Request::Search { path, query, hidden } => {
+        Request::Search { path, query, hidden, locate } => {
             close_search_session(st);
             if finish_search(out, st, true) {
                 forget_rows(st, pool);
@@ -374,14 +374,45 @@ fn handle_line(
             watch.stop();
             poller.clear();
             forget_rows(st, pool);
-            // The client is told at once that its old rows are gone, then the count grows as matches arrive.
-            match search_root_info(&st.base) {
-                // A root that answers nothing starts no walk, so no terminal line can strand it.
-                Err(e) => { writeln!(out, "{}", error_line(&e)).ok(); }
-                Ok((dev, writable)) => {
-                    writeln!(out, "{}", listed_line(0, 0.0, 0.0, dev, &st.base.to_string_lossy(), writable)).ok();
-                    st.search = Some(Search::new(&path, &query, hidden));
+            // A whole-Mac search answers from the name index at once; until that index exists the
+            // same request walks the home tree, so a first search is still useful while it builds.
+            let indexed = if locate {
+                // The first whole-Mac search starts the loader or builder and walks home meanwhile.
+                let answer = crate::backend::nameindex::query(&query, hidden, 20_000);
+                if answer.is_none() {
+                    crate::backend::nameindex::prepare();
+                }
+                answer
+            } else {
+                None
+            };
+            if let Some((rows, _matched, population)) = indexed {
+                st.base = PathBuf::from("/");
+                for (name, is_dir) in &rows {
+                    st.listing.push(name, *is_dir);
+                }
+                writeln!(out, "{}", listed_line(st.listing.len(), 0.0, 0.0, 0, "/", false)).ok();
+                writeln!(out, "{}", crate::backend::proto::searched_line(st.listing.len(), population, 0.0, false)).ok();
+            } else if locate {
+                // The index is still building: walk the home tree meanwhile, answering with whole
+                // paths under the root so a result opens while the snapshot finishes.
+                st.base = PathBuf::from("/");
+                let home = std::env::var_os("HOME").map(PathBuf::from).filter(|home| home.is_absolute()).unwrap_or_default();
+                writeln!(out, "{}", listed_line(0, 0.0, 0.0, 0, "/", false)).ok();
+                if home.is_absolute() {
+                    st.search = Some(Search::new_absolute(&home.to_string_lossy(), &query, hidden));
                     st.search_reported = Instant::now();
+                }
+            } else {
+                // The client is told at once that its old rows are gone, then the count grows as matches arrive.
+                match search_root_info(&st.base) {
+                    // A root that answers nothing starts no walk, so no terminal line can strand it.
+                    Err(e) => { writeln!(out, "{}", error_line(&e)).ok(); }
+                    Ok((dev, writable)) => {
+                        writeln!(out, "{}", listed_line(0, 0.0, 0.0, dev, &st.base.to_string_lossy(), writable)).ok();
+                        st.search = Some(Search::new(&st.base.to_string_lossy(), &query, hidden));
+                        st.search_reported = Instant::now();
+                    }
                 }
             }
             out.flush().ok();

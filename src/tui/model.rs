@@ -88,7 +88,8 @@ pub struct Model {
     pub search_query: String,
     pub searching: bool,
     pub search_from: Option<PathBuf>,
-    pub search_here: bool,
+    // Which tree a committed search walks: 0 the folder on screen, 1 home, 2 the whole Mac's index.
+    pub search_scope: u8,
     pub transfer: String,
     pub pending_clipboard: bool,
     pub clipboard: Vec<String>,
@@ -217,7 +218,7 @@ impl Model {
             search_query: String::new(),
             searching: false,
             search_from: None,
-            search_here: false,
+            search_scope: 0,
             transfer: String::new(),
             pending_clipboard: false,
             clipboard: Vec::new(),

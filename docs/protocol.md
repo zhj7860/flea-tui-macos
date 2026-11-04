@@ -382,6 +382,21 @@ that carry the Red tag and fuzzy-match `holiday`. The name matches case-insensit
 Flea or foreign name is accepted. Every named tag must be present. The attribute is read only on
 files the walk visits, one `getxattr` each, never swept ahead of it.
 
+**`"locate":true` answers from Flea's own whole-Mac name index instead of walking.** The
+index is built by Flea itself (no Spotlight and no external indexer): the home tree,
+`/Applications` and every mounted volume, with caches, trash, VCS objects, build products
+and `target` directories listed but never descended, up to 1.5 million entries. The answer
+is one `listed` with the match count, the ranked head as the listing's rows under base `/`
+(whole paths, so every per-row facility keeps working), and one `searched` whose `scanned`
+is the indexed population and whose `n` is the rows this answer holds, at most 20,000;
+narrow the query to see more. A distinct `searching` line is never sent, because nothing
+walks. Until the first snapshot exists the same request walks the home tree with whole
+paths and starts the background build, so the first whole-Mac search is useful before the
+index is ready; later launches answer in tens of milliseconds. The snapshot lives in
+`$XDG_CACHE_HOME/flea/locate.idx` (`~/Library/Caches/flea/locate.idx` on a Mac), is read on
+the first whole-Mac search of a process and rebuilt behind that answer once it is 12 hours
+old. `path` is ignored apart from being echoed as the base by an older client's request.
+
 ### searchcancel
 
 `{"c":"searchcancel"}`

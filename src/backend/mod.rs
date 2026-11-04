@@ -29,6 +29,7 @@ pub mod dirsizereq;
 pub mod listpaths;
 // Issue 144: a remote list scans off the event loop; see src/backend/listwork.rs.
 pub mod listwork;
+pub mod nameindex;
 pub mod unmount;
 pub mod events;
 pub mod scan;

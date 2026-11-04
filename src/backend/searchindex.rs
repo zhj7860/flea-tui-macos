@@ -9,6 +9,8 @@ use std::path::Path;
 
 // Past this many rows the walk stops adding; 200k at the measured 172 bytes each is about 34 MiB worst case, handed back on close.
 pub(crate) const SESSION_MAX_ENTRIES: usize = 200_000;
+// The locate snapshot covers a whole Mac, so it takes a larger bound: about 250 MiB of arena at this cap.
+pub(crate) const LOCATE_MAX_ENTRIES: usize = 1_500_000;
 // One worker per core up to four; a cold 100k tree is seeker-hostile past that on spinning disks.
 pub(crate) const WALK_THREADS: usize = 4;
 // Below this many candidates scoring stays serial; a thread per keystroke costs more than it saves.
@@ -37,6 +39,8 @@ pub(crate) struct Index {
     wide: Vec<u32>,
     rows: Vec<Row>,
     pub capped: bool,
+    // How many rows this index takes before it stops adding; the live walk's cap, or the locate index's larger one.
+    cap: usize,
     // How the last patch moved rows: the old row ids it kept in order (None when it kept all) and how many old rows survived; every row past that count is new.
     kept: Option<Vec<usize>>,
     survivors: usize,
@@ -81,6 +85,7 @@ impl Index {
             wide: Vec::new(),
             rows: Vec::new(),
             capped: false,
+            cap: SESSION_MAX_ENTRIES,
             kept: None,
             survivors: 0,
             #[cfg(test)]
@@ -88,6 +93,11 @@ impl Index {
             #[cfg(test)]
             scanned: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    // The locate index holds a whole Mac's names, so it gets its own bound rather than the walk's.
+    pub(crate) fn with_cap(cap: usize) -> Index {
+        Index { cap, ..Index::new() }
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -134,7 +144,7 @@ impl Index {
 
     // Adds one row unless the cap is reached; past it the walk stops adding and the count stands.
     pub(crate) fn push(&mut self, path: impl AsRef<OsStr>, is_dir: bool) {
-        if self.rows.len() >= SESSION_MAX_ENTRIES {
+        if self.rows.len() >= self.cap {
             self.capped = true;
             return;
         }
@@ -274,6 +284,89 @@ impl Index {
         true
     }
 
+    // The whole snapshot as one file, so a later launch answers from disk instead of walking again.
+    pub(crate) fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.paths.len() + self.ascii.len() + self.wide.len() * 4 + self.rows.len() * 17 + 64);
+        out.extend_from_slice(MAGIC);
+        put_u32(&mut out, self.cap as u32);
+        put_u64(&mut out, self.paths.len() as u64);
+        out.extend_from_slice(self.paths.as_bytes());
+        put_u64(&mut out, self.raw.len() as u64);
+        for path in &self.raw {
+            put_u32(&mut out, path.path_off);
+            put_u64(&mut out, path.bytes.len() as u64);
+            out.extend_from_slice(&path.bytes);
+        }
+        put_u64(&mut out, self.ascii.len() as u64);
+        out.extend_from_slice(&self.ascii);
+        put_u64(&mut out, self.wide.len() as u64);
+        for word in &self.wide {
+            out.extend_from_slice(&word.to_le_bytes());
+        }
+        put_u64(&mut out, self.rows.len() as u64);
+        for row in &self.rows {
+            put_u32(&mut out, row.path_off);
+            put_u32(&mut out, row.path_len);
+            put_u32(&mut out, row.fold_off);
+            put_u32(&mut out, row.fold_len);
+            out.push(row.flags);
+        }
+        out.push(u8::from(self.capped));
+        out
+    }
+
+    // None for anything this build did not write: a wrong magic, a newer layout or a truncated read.
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Option<Index> {
+        let mut at = 0usize;
+        if take(bytes, &mut at, MAGIC.len())? != MAGIC {
+            return None;
+        }
+        let cap = get_u32(bytes, &mut at)? as usize;
+        let plen = get_u64(bytes, &mut at)? as usize;
+        let paths = String::from_utf8(take(bytes, &mut at, plen)?.to_vec()).ok()?;
+        let raw_count = get_u64(bytes, &mut at)? as usize;
+        let mut raw = Vec::with_capacity(raw_count);
+        for _ in 0..raw_count {
+            let path_off = get_u32(bytes, &mut at)?;
+            let len = get_u64(bytes, &mut at)? as usize;
+            raw.push(RawPath { path_off, bytes: take(bytes, &mut at, len)?.into() });
+        }
+        let alen = get_u64(bytes, &mut at)? as usize;
+        let ascii = take(bytes, &mut at, alen)?.to_vec();
+        let wcount = get_u64(bytes, &mut at)? as usize;
+        let words = take(bytes, &mut at, wcount.checked_mul(4)?)?;
+        let mut wide = Vec::with_capacity(wcount);
+        for chunk in words.chunks_exact(4) {
+            wide.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+        let rcount = get_u64(bytes, &mut at)? as usize;
+        let mut rows = Vec::with_capacity(rcount);
+        for _ in 0..rcount {
+            rows.push(Row {
+                path_off: get_u32(bytes, &mut at)?,
+                path_len: get_u32(bytes, &mut at)?,
+                fold_off: get_u32(bytes, &mut at)?,
+                fold_len: get_u32(bytes, &mut at)?,
+                flags: *bytes.get(at)?,
+            });
+            at += 1;
+        }
+        let capped = *bytes.get(at)? != 0;
+        // Every offset has to land inside the arena it names, or a query would slice out of bounds.
+        let fits = |off: u32, len: u32, total: usize| (off as usize).checked_add(len as usize).is_some_and(|end| end <= total);
+        if !rows.iter().all(|row| fits(row.path_off, row.path_len, paths.len())) {
+            return None;
+        }
+        if !rows.iter().all(|row| {
+            if row.is_wide() { fits(row.fold_off, row.fold_len, wide.len()) } else { fits(row.fold_off, row.fold_len, ascii.len()) }
+        }) {
+            return None;
+        }
+        Some(Index { paths, raw, ascii, wide, rows, capped, cap, kept: None, survivors: 0,
+            #[cfg(test)] compactions: 0,
+            #[cfg(test)] scanned: std::sync::atomic::AtomicUsize::new(0) })
+    }
+
     // Walks newly added directories in, so a moved tree lands whole; rows already under them are read once.
     fn fill_subtrees(&mut self, root: &Path, added: &[Vec<u8>], hidden: bool, body: &str) {
         let prefixes: Vec<Vec<u8>> = added.iter().map(|dir| [dir.as_slice(), b"/"].concat()).collect();
@@ -306,6 +399,34 @@ impl Index {
             }
         }
     }
+}
+
+// The locate snapshot's own file magic; a build that changes the layout changes this byte too.
+const MAGIC: &[u8] = b"FLEAIDX2\0";
+
+fn put_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn put_u64(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn take<'a>(bytes: &'a [u8], at: &mut usize, len: usize) -> Option<&'a [u8]> {
+    let end = at.checked_add(len)?;
+    let slice = bytes.get(*at..end)?;
+    *at = end;
+    Some(slice)
+}
+
+fn get_u32(bytes: &[u8], at: &mut usize) -> Option<u32> {
+    let raw = take(bytes, at, 4)?;
+    Some(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
+}
+
+fn get_u64(bytes: &[u8], at: &mut usize) -> Option<u64> {
+    let raw = take(bytes, at, 8)?;
+    Some(u64::from_le_bytes([raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7]]))
 }
 
 // One directory as (name, is_dir) pairs, or None when it cannot be read; d_type answers is_dir with no stat.

@@ -20,6 +20,8 @@ pub struct Search {
     scores: Vec<i32>,
     pub scanned: usize,
     pub started: Instant,
+    // Push whole paths rather than scope-relative ones, for a search whose base is the root itself.
+    absolute: bool,
 }
 
 impl Search {
@@ -34,7 +36,14 @@ impl Search {
             scores: Vec::new(),
             scanned: 0,
             started: Instant::now(),
+            absolute: false,
         }
+    }
+
+    // The whole-Mac fallback walks home but answers with paths the root base can join, so a result
+    // still opens while the name index is being built.
+    pub fn new_absolute(root: &str, query: &str, hidden: bool) -> Search {
+        Search { absolute: true, ..Search::new(root, query, hidden) }
     }
 
     // Returns true when the walk is finished; the caller then writes the terminal line.
@@ -75,6 +84,7 @@ impl Search {
             }
             // The candidate is the whole relative path, not the base name, so one query can span a
             // separator: "dwnhelp" reaches "downloads/helper.txt", see docs/protocol.md "search".
+            let text = if self.absolute { std::borrow::Cow::Owned(self.root.join(&child).to_string_lossy().into_owned()) } else { text };
             if let Some(score) = self.fuzzy.score(&text) {
                 // The row's name is its path relative to the root; a name that is not UTF-8 rows as lossy text, like every row on the wire, so base.join(name) reaches only a UTF-8 name.
                 listing.push(&text, is_dir);

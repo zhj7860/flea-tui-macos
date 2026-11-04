@@ -91,6 +91,68 @@ fn walk_local(out: &Mutex<Index>, root: &Path, hidden: bool, probes: &WalkProbes
     dirs.load(Ordering::Relaxed)
 }
 
+// The locate index's walk: several absolute roots at once, storing each path as it is reached. No
+// root ordering is needed, because the caller ranks by name and path and never by walk order.
+pub(crate) fn fill_roots(out: &Mutex<Index>, roots: &[PathBuf], probes: &WalkProbes) -> usize {
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).clamp(1, WALK_THREADS);
+    let work: Mutex<(VecDeque<PathBuf>, usize)> = Mutex::new((VecDeque::from(roots.to_vec()), 0));
+    let ready = Condvar::new();
+    let dirs = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                while let Some(dir) = next_dir(&work, &ready, &probes.cancel) {
+                    let subdirs = open_absolute(out, &dir, probes);
+                    if subdirs.is_some() {
+                        dirs.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let mut state = work.lock().unwrap();
+                    state.0.extend(subdirs.unwrap_or_default());
+                    state.1 -= 1;
+                    drop(state);
+                    ready.notify_all();
+                }
+            });
+        }
+    });
+    dirs.load(Ordering::Relaxed)
+}
+
+// Trees no one searches and every walk spends most of its time in: caches, trash, VCS objects and
+// build products. A directory of one of these names is still listed, only never descended.
+fn locate_skip(name: &std::ffi::OsStr) -> bool {
+    matches!(
+        name.to_string_lossy().as_ref(),
+        "Caches" | ".Trash" | ".cache" | ".git" | "node_modules" | ".Spotlight-V100" | ".fseventsd" | "DerivedData" | "target"
+    )
+}
+
+fn open_absolute(out: &Mutex<Index>, dir: &Path, probes: &WalkProbes) -> Option<Vec<PathBuf>> {
+    if probes.cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+    probes.opened.fetch_add(1, Ordering::Relaxed);
+    let mut subdirs = Vec::new();
+    {
+        let mut index = out.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Past the cap there is nothing left to store, so the walk stops instead of reading more.
+        if index.capped {
+            return Some(Vec::new());
+        }
+        for (name, is_dir) in read_entries(dir) {
+            let child = dir.join(&name);
+            index.push(&child, is_dir);
+            if is_dir && !locate_skip(&name) {
+                subdirs.push(child);
+            }
+        }
+    }
+    if probes.cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+    Some(subdirs)
+}
+
 // Pops the next directory, waiting while a thread that holds one may still queue more.
 fn next_dir(work: &Mutex<(VecDeque<PathBuf>, usize)>, ready: &Condvar, cancel: &AtomicBool) -> Option<PathBuf> {
     let mut state = work.lock().unwrap();
