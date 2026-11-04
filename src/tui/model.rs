@@ -64,6 +64,8 @@ pub struct Model {
     pub held: bool,
     pub rows: BTreeMap<usize, Row>,
     pub parents: Vec<Row>,
+    // The parent peek answered that the directory could not be read, so the column says so.
+    pub parents_failed: bool,
     peek_sent: Option<PathBuf>,
     pub total: usize,
     pub cursor: usize,
@@ -179,6 +181,7 @@ impl Model {
             held: false,
             rows: BTreeMap::new(),
             parents: Vec::new(),
+            parents_failed: false,
             peek_sent: None,
             total: 0,
             cursor: 0,
@@ -603,9 +606,11 @@ impl Model {
                 match self.path.parent().map(PathBuf::from) {
                     None => {
                         self.parents.clear();
+                        self.parents_failed = false;
                         self.peek_sent = None;
                     }
                     Some(parent) => {
+                        self.parents_failed = false;
                         wire.send(vec![
                             ("c", word("peek")),
                             ("path", word(&parent.to_string_lossy())),
@@ -783,6 +788,7 @@ impl Model {
                         .iter()
                         .map(|r| Row::parse(r, &[]))
                         .collect();
+                    self.parents_failed = self.parents.is_empty() && flag(&value, "failed");
                 }
             }
             "changed" => {
@@ -1136,6 +1142,27 @@ mod tests {
         assert_eq!(bulk_done_line(1, false), "Renamed 1 item · Undo reverts one");
         crate::tui::wire::finish(wire, reader);
     }
+    // A parent that refuses the peek is a sentence in the parent column, not a silent blank pane.
+    #[test]
+    fn a_refused_parent_peek_is_recorded_for_the_column() {
+        let (mut wire, reader) = crate::tui::wire::echo_wire();
+        let mut model = Model::new(PathBuf::from("/listing/child"), &Json::Null);
+        model.receive(
+            crate::jsondoc::parse(r#"{"t":"peeked","path":"/listing","n":0,"failed":true,"rows":[]}"#).unwrap(),
+            &mut wire,
+        )
+        .unwrap();
+        assert!(model.parents_failed, "the column can say it could not read the parent");
+        assert!(model.parents.is_empty());
+        model.receive(
+            crate::jsondoc::parse(r#"{"t":"peeked","path":"/listing","n":1,"rows":[{"n":"p"}]}"#).unwrap(),
+            &mut wire,
+        )
+        .unwrap();
+        assert!(!model.parents_failed, "a later answer clears the sentence");
+        crate::tui::wire::finish(wire, reader);
+    }
+
     #[test]
     fn counted_lines_read_plural_for_many() {
         let (mut wire, reader) = crate::tui::wire::echo_wire();

@@ -158,7 +158,8 @@ pub fn run(path: Option<&str>, select: Option<&str>) -> i32 {
             let is_pdf = model.rows.get(&model.cursor).is_some_and(model::Row::is_pdf);
             let reserved = PREVIEW_RESERVED_ROWS + model.preview_metadata.len().min(3)
                 + usize::from(is_pdf);
-            let (preview_start, preview_width) = render::preview_area(size.0, model.quicklook);
+            let (preview_start, preview_width) =
+                render::preview_area_for(size.0, model.quicklook, model.path.parent().is_some());
             let geometry = (preview_width, model.height.saturating_sub(reserved), preview_start + 1, render::BODY_ROW + 2);
             let cell_pixels = terminal::cell_pixels();
             let pixels = cell_pixels

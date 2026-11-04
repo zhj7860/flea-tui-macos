@@ -742,7 +742,8 @@ fn pointer_key(
         return Ok(());
     }
     if pointer.motion && pointer.button == 3 { return Ok(()); }
-    let (left, middle, _) = super::render::panes(m.columns, m.preview_visible);
+    let has_parent = m.path.parent().is_some();
+    let (left, middle, _) = super::render::panes_for(m.columns, m.preview_visible, has_parent);
     if !m.quicklook && pointer.y == 1 && pointer.button == 0 && !pointer.motion {
         let mut x = 2;
         for (i, label) in super::render::tab_layout(m, m.columns.saturating_sub(2)) {
@@ -767,7 +768,7 @@ fn pointer_key(
                 w,
             );
         }
-        let (start, columns) = super::render::preview_area(m.columns, m.quicklook);
+        let (start, columns) = super::render::preview_area_for(m.columns, m.quicklook, has_parent);
         if pointer.button == 0 && pointer.y == super::render::BODY_ROW + m.height.saturating_sub(2)
             && pointer.x > start && pointer.x <= start + columns
         {

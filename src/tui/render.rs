@@ -56,6 +56,11 @@ impl<'a> Iterator for Wrapped<'a> {
     }
 }
 pub fn panes(columns: usize, preview: bool) -> (usize, usize, usize) {
+    panes_for(columns, preview, true)
+}
+// A path with no parent (the root) has no parent pane to draw, so the current column takes its
+// width and its separator instead of leaving an empty first column on screen.
+pub fn panes_for(columns: usize, preview: bool, has_parent: bool) -> (usize, usize, usize) {
     // Tui.html uses border-box widths: each separator belongs to the pane on its left.
     let left = (columns * 22 / 100).saturating_sub(1);
     let middle = if preview {
@@ -63,15 +68,16 @@ pub fn panes(columns: usize, preview: bool) -> (usize, usize, usize) {
     } else {
         columns.saturating_sub(left + 1)
     };
-    (
-        left,
-        middle,
-        if preview {
-            columns.saturating_sub(left + middle + 2)
-        } else {
-            0
-        },
-    )
+    let right = if preview {
+        columns.saturating_sub(left + middle + 2)
+    } else {
+        0
+    };
+    if has_parent {
+        (left, middle, right)
+    } else {
+        (0, middle + left + 1, right)
+    }
 }
 pub const BODY_ROW: usize = 3;
 pub const CHROME_ROWS: usize = 4;
@@ -83,7 +89,10 @@ pub fn pane_padding(columns: usize) -> usize {
     (columns.saturating_sub(MIN_CONTENT) / 2).min(1)
 }
 pub fn preview_area(columns: usize, quicklook: bool) -> (usize, usize) {
-    let (left, middle, right) = panes(columns, true);
+    preview_area_for(columns, quicklook, true)
+}
+pub fn preview_area_for(columns: usize, quicklook: bool, has_parent: bool) -> (usize, usize) {
+    let (left, middle, right) = panes_for(columns, true, has_parent);
     let (start, width) = if quicklook { (0, columns) } else { (left + middle + 2, right) };
     let padding = pane_padding(width);
     (start + padding, width - padding * 2)
@@ -277,11 +286,12 @@ pub fn draw(
         io::stdout().flush()?;
         return Ok(true);
     }
-    let (left, middle, right) = panes(columns, m.preview_visible);
+    let has_parent = m.path.parent().is_some();
+    let (left, middle, right) = panes_for(columns, m.preview_visible, has_parent);
     let left_padding = pane_padding(left);
     let middle_padding = pane_padding(middle);
     let preview_padding = pane_padding(if m.quicklook { columns } else { right });
-    let (_, preview_width) = preview_area(columns, m.quicklook);
+    let (_, preview_width) = preview_area_for(columns, m.quicklook, has_parent);
     let filtered = (!m.filter.is_empty()).then(|| m.shown());
     let body = body_height(lines);
     let graphical = m.player.is_some() || m.pdf.is_some() || m.image_file.is_some();
@@ -335,28 +345,36 @@ pub fn draw(
             out.push_str(&" ".repeat(preview_padding));
             continue;
         }
-        if let Some(parent) = m.parents.get(y) {
-            if m.path
-                .file_name()
-                .is_some_and(|name| name == parent.name.as_str())
-            {
-                out.push_str(&theme.selected);
+        // At the root there is no parent pane at all, so the current column starts the row.
+        if left > 0 {
+            if m.parents.is_empty() && m.parents_failed && y == 0 {
+                out.push_str(&theme.muted);
+                out.push_str(&" ".repeat(left_padding));
+                out.push_str(&fit("Could not read", left - left_padding * 2));
+                out.push_str(&" ".repeat(left_padding));
+            } else if let Some(parent) = m.parents.get(y) {
+                if m.path
+                    .file_name()
+                    .is_some_and(|name| name == parent.name.as_str())
+                {
+                    out.push_str(&theme.selected);
+                }
+                let label = format!(
+                    "{} {}",
+                    if parent.directory { "›" } else { "□" },
+                    parent.name
+                );
+                out.push_str(&" ".repeat(left_padding));
+                out.push_str(&fit(&label, left - left_padding * 2));
+                out.push_str(&" ".repeat(left_padding));
+            } else {
+                out.push_str(&" ".repeat(left));
             }
-            let label = format!(
-                "{} {}",
-                if parent.directory { "›" } else { "□" },
-                parent.name
-            );
-            out.push_str(&" ".repeat(left_padding));
-            out.push_str(&fit(&label, left - left_padding * 2));
-            out.push_str(&" ".repeat(left_padding));
-        } else {
-            out.push_str(&" ".repeat(left));
+            out.push_str(&base);
+            out.push_str(&theme.border);
+            out.push('│');
+            out.push_str(&base);
         }
-        out.push_str(&base);
-        out.push_str(&theme.border);
-        out.push('│');
-        out.push_str(&base);
         let index = filtered.as_ref().map_or(m.top + y, |rows| rows.get(y).copied().unwrap_or(usize::MAX));
         if let Some(entry) = m.rows.get(&index) {
             let row_color = if index == m.cursor {
@@ -725,6 +743,17 @@ mod tests {
             }
         }
     }
+    // At / there is no parent pane, so the current column takes its width instead of leaving it blank.
+    #[test]
+    fn the_root_draws_no_empty_parent_pane() {
+        assert_eq!(panes_for(100, true, false), (0, 61, 38));
+        assert_eq!(panes_for(100, false, false), (0, 100, 0));
+        // The preview column keeps its width and starts where the drawing puts it.
+        assert_eq!(preview_area_for(100, false, false).1, preview_area(100, false).1);
+        let (start, width) = preview_area_for(100, false, false);
+        assert_eq!(start + width, 100, "the preview pane still ends at the last column");
+    }
+
     #[test]
     fn scrolled_root_menu_renders_the_selected_action() {
         let mut model = Model::new(std::path::PathBuf::from("/"), &crate::jsondoc::Json::Null);
