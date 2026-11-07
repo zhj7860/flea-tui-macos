@@ -25,7 +25,10 @@ pub(crate) fn backend_command(exe: &std::path::Path, prefetch: Option<&crate::gv
 }
 impl Wire {
     pub fn start(prefetch: Option<&crate::gvfsprefetch::Prefetch>) -> io::Result<Self> {
+        // The TUI searches every disk, so its backend warms the name snapshot at launch and the
+        // first search answers from memory. The window and every script never set this.
         let mut child = backend_command(&std::env::current_exe()?, prefetch)
+            .env(crate::backend::nameindex::WARM_ENV, "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -163,6 +166,11 @@ mod trash_tests;
 #[cfg(test)]
 #[path = "tabmove_tests.rs"]
 mod tabmove_tests;
+
+// The tab strip's own menu, which drives the same key path and echo wire.
+#[cfg(test)]
+#[path = "tabmenu_tests.rs"]
+mod tabmenu_tests;
 
 // The model's status lines and faults, which also need the echo wire.
 #[cfg(test)]

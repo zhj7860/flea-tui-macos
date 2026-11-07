@@ -58,6 +58,13 @@ enum Control {
 pub fn run() -> i32 {
     // Before the first listing, because a threshold glibc has already ratcheted strands the next arena on the heap.
     heap::pin_mmap_threshold();
+    // A front end that searches every disk warms the snapshot at launch, Everything-style, so its
+    // first search answers from memory. No file and no request means nothing is read and nothing built.
+    if std::env::var_os(super::nameindex::WARM_ENV).is_some_and(|value| !value.is_empty())
+        && super::nameindex::cache_path().is_some_and(|path| path.is_file())
+    {
+        super::nameindex::prepare();
+    }
     // Recorded when the first rows go out, the next launch's prefetch list; see src/prefetch.rs.
     crate::prefetch::record_after_first_rows();
     let mut out = BufWriter::new(io::stdout());
@@ -361,7 +368,7 @@ fn handle_line(
             }
             out.flush().ok();
         }
-        Request::Search { path, query, hidden, locate } => {
+        Request::Search { path, query, hidden, locate, under } => {
             close_search_session(st);
             if finish_search(out, st, true) {
                 forget_rows(st, pool);
@@ -376,32 +383,51 @@ fn handle_line(
             forget_rows(st, pool);
             // A whole-Mac search answers from the name index at once; until that index exists the
             // same request walks the home tree, so a first search is still useful while it builds.
-            let indexed = if locate {
-                // The first whole-Mac search starts the loader or builder and walks home meanwhile.
-                let answer = crate::backend::nameindex::query(&query, hidden, 20_000);
-                if answer.is_none() {
-                    crate::backend::nameindex::prepare();
-                }
-                answer
-            } else {
-                None
-            };
-            if let Some((rows, _matched, population)) = indexed {
-                st.base = PathBuf::from("/");
-                for (name, is_dir) in &rows {
-                    st.listing.push(name, *is_dir);
-                }
-                writeln!(out, "{}", listed_line(st.listing.len(), 0.0, 0.0, 0, "/", false)).ok();
-                writeln!(out, "{}", crate::backend::proto::searched_line(st.listing.len(), population, 0.0, false)).ok();
-            } else if locate {
-                // The index is still building: walk the home tree meanwhile, answering with whole
-                // paths under the root so a result opens while the snapshot finishes.
-                st.base = PathBuf::from("/");
-                let home = std::env::var_os("HOME").map(PathBuf::from).filter(|home| home.is_absolute()).unwrap_or_default();
-                writeln!(out, "{}", listed_line(0, 0.0, 0.0, 0, "/", false)).ok();
-                if home.is_absolute() {
-                    st.search = Some(Search::new_absolute(&home.to_string_lossy(), &query, hidden));
-                    st.search_reported = Instant::now();
+            let index_under = if locate && !under.is_empty() { Some(under.as_str()) } else { None };
+            if locate {
+                let parsed = crate::backend::searchsyntax::parse(&query);
+                match parsed {
+                    Ok(parsed) => {
+                        // The first whole-Mac search starts the loader or builder and walks meanwhile.
+                        let indexed = crate::backend::nameindex::query(&parsed, hidden, index_under, 20_000);
+                        // The snapshot is a point in time, and a file written after it was built is
+                        // exactly what it cannot know: an empty answer falls to the same home walk
+                        // the missing-index case runs, so a search never says "no files" for a file
+                        // that exists. A hit still answers from memory in microseconds.
+                        let indexed = indexed.filter(|(rows, _, _)| !rows.is_empty());
+                        if indexed.is_none() {
+                            crate::backend::nameindex::prepare();
+                        }
+                        if let Some((rows, _matched, population)) = indexed {
+                            st.base = PathBuf::from("/");
+                            for (name, is_dir) in &rows {
+                                st.listing.push(name, *is_dir);
+                            }
+                            writeln!(out, "{}", listed_line(st.listing.len(), 0.0, 0.0, 0, "/", false)).ok();
+                            writeln!(out, "{}", crate::backend::proto::searched_line(st.listing.len(), population, 0.0, false)).ok();
+                        } else {
+                            // The index is still building: walk from the filter's folder, or home,
+                            // meanwhile, answering with whole paths under the root so a result opens
+                            // while the snapshot finishes.
+                            st.base = PathBuf::from("/");
+                            let root = index_under
+                                .map(PathBuf::from)
+                                .unwrap_or_else(|| std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default());
+                            writeln!(out, "{}", listed_line(0, 0.0, 0.0, 0, "/", false)).ok();
+                            if root.is_absolute() {
+                                st.search = Some(Search::new_absolute(&root.to_string_lossy(), parsed, hidden));
+                                st.search_reported = Instant::now();
+                            }
+                        }
+                    }
+                    Err(sentence) => {
+                        // A function this index cannot answer is said in one sentence, and the listing
+                        // settles at nothing so the pane does not wait on a search that never ran.
+                        let refusal = FleaError { where_: "search".into(), path: path.clone(), msg: sentence };
+                        writeln!(out, "{}", error_line(&refusal)).ok();
+                        writeln!(out, "{}", listed_line(0, 0.0, 0.0, 0, "/", false)).ok();
+                        writeln!(out, "{}", crate::backend::proto::searched_line(0, 0, 0.0, false)).ok();
+                    }
                 }
             } else {
                 // The client is told at once that its old rows are gone, then the count grows as matches arrive.

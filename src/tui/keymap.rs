@@ -70,12 +70,16 @@ impl Map {
         if preset == "mac" && key.mods == "ctrl" && key.name == "X" {
             return String::new();
         }
+        // A terminal on the kitty keyboard protocol reports Shift+s as the base letter with the shift
+        // modifier (text "s", mods "shift"), where a legacy one sends "S" with no modifier. A capital
+        // binding is the same binding either way, so a shifted text is folded up before it is matched.
+        let text = if key.mods == "shift" { key.text.to_uppercase() } else { key.text.clone() };
         for name in [preset, "all"] {
             for (kind, block) in &self.blocks {
                 let here = get(block, "context");
                 let mods = get(block, "mods");
                 let key_matches = if mods == "text" {
-                    matches!(key.mods.as_str(), "" | "shift") && get(block, "key") == key.text
+                    matches!(key.mods.as_str(), "" | "shift") && get(block, "key") == text
                 } else {
                     (if mods == "none" { "" } else { mods }) == key.mods
                         && get(block, "key") == key.name
@@ -97,6 +101,11 @@ impl Map {
         for (kind, block) in &self.blocks {
             let matches = if key.mods.is_empty() {
                 (kind == "text" && get(block, "char") == key.text && !key.text.is_empty())
+                    || (kind == "code" && get(block, "key") == key.name)
+            } else if key.mods == "shift" {
+                // Shift reaches a text row as a modifier on a protocol terminal, and as the capital
+                // byte on a legacy one; both name the same capital row.
+                (kind == "text" && get(block, "char") == text && !text.is_empty())
                     || (kind == "code" && get(block, "key") == key.name)
             } else {
                 kind == &key.mods && get(block, "key") == key.name

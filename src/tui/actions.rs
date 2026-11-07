@@ -34,18 +34,41 @@ pub fn key(model: &mut Model, key: &Key, map: &Map, wire: &mut Wire) -> io::Resu
         }
         return Ok(());
     }
+    if model.tab_menu {
+        let count = super::render::tab_menu_rows().len();
+        let action = map.in_context(key, &model.preset, "menu");
+        match action.as_str() {
+            "escape" | "parent" => model.tab_menu = false,
+            "cursorDown" | "cursorUp" | "focusNext" | "focusPrevious" => {
+                for _ in 0..count {
+                    model.tab_menu_cursor = (model.tab_menu_cursor
+                        + if matches!(action.as_str(), "cursorDown" | "focusNext") { 1 } else { count - 1 })
+                        % count;
+                    if model.tab_menu_enabled(model.tab_menu_cursor) { break; }
+                }
+            }
+            "open" | "preview" | "menuRight" => {
+                let row = model.tab_menu_cursor;
+                if model.tab_menu_enabled(row) {
+                    return tab_menu_act(model, row, wire);
+                }
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
     if model.menu {
         let count = if model.taildrop.submenu {
             model.taildrop.peers.len().max(1)
         } else {
-            3
+            6
         };
         let action = map.in_context(key, &model.preset, "menu");
         match action.as_str() {
             "escape" | "parent" => {
                 if model.taildrop.submenu {
                     model.taildrop.submenu = false;
-                    model.menu_cursor = 2;
+                    model.menu_cursor = 5;
                     model.menu_top = 0;
                 } else {
                     model.menu = false;
@@ -76,7 +99,7 @@ pub fn key(model: &mut Model, key: &Key, map: &Map, wire: &mut Wire) -> io::Resu
                     }
                     return Ok(());
                 }
-                if model.menu_cursor == 2 {
+                if model.menu_cursor == 5 {
                     if model.taildrop.peers.is_empty() {
                         model.fail(if model.taildrop.loading() {
                             "Taildrop is still loading".into()
@@ -96,12 +119,19 @@ pub fn key(model: &mut Model, key: &Key, map: &Map, wire: &mut Wire) -> io::Resu
                     return Ok(());
                 }
                 model.menu = false;
-                if model.menu_cursor == 0 {
-                    model.menu_action = "open".into();
-                    return wire.send(vec![("c", word("menuaction")), ("op", word("validate")), ("id", super::wire::number(model.action_id)), ("action", word("open"))]);
+                match model.menu_cursor {
+                    0 => {
+                        model.menu_action = "open".into();
+                        return wire.send(vec![("c", word("menuaction")), ("op", word("validate")), ("id", super::wire::number(model.action_id)), ("action", word("open"))]);
+                    }
+                    1 => return open_path(model),
+                    2 => return copy_path(model),
+                    3 => return act(model, "trash", wire),
+                    _ => {
+                        model.menu_action.clear();
+                        return act(model, "toggleHidden", wire);
+                    }
                 }
-                model.menu_action.clear();
-                return act(model, "toggleHidden", wire);
             }
             _ => {}
         }
@@ -342,7 +372,9 @@ fn act(m: &mut Model, action: &str, w: &mut Wire) -> io::Result<()> {
         "historyForward" => history(m, true, w)?,
         "open" => {
             if let Some(path) = m.current_path() {
-                if m.rows.get(&m.cursor).is_some_and(|r| r.directory) {
+                // A .app is a directory to the filesystem and an application to the desktop: Enter
+                // launches it with LaunchServices instead of browsing its Contents.
+                if m.rows.get(&m.cursor).is_some_and(|r| r.directory) && !crate::open::is_app_bundle(&path) {
                     navigate(m, path, w)?;
                 } else if crate::open::open(&path.to_string_lossy()) != 0 {
                     m.fail("Could not open selected file".into());
@@ -364,14 +396,28 @@ fn act(m: &mut Model, action: &str, w: &mut Wire) -> io::Result<()> {
         "toggleHidden" => {
             m.hidden = !m.hidden;
             save("hidden", Json::Bool(m.hidden), m);
-            m.open(m.path.clone(), w)?;
+            // A search answers the hidden toggle itself, so the page is refreshed rather than replaced.
+            m.refresh(w)?;
         }
         "pathBar" => {
             m.editor = Some(Editor::new("path", String::new(), m.path.clone()));
             m.completion = m.completer.request("", &m.path);
         }
         "filter" => m.editor = Some(Editor::new("filter", m.filter.clone(), m.path.clone())),
-        "search" => m.editor = Some(Editor::new("search", String::new(), m.path.clone())),
+        "search" => {
+            // The search page: a view of its own, blank the first time and editing the running query
+            // after that. The folder it is opened from is where the page's folder filter begins.
+            m.search_page = true;
+            m.live_pending = false;
+            if m.path != std::path::Path::new("/") && m.search_from.is_none() {
+                m.search_from = Some(m.path.clone());
+            }
+            if m.search_query.is_empty() {
+                m.search_folder = false;
+                m.clear_search();
+            }
+            m.editor = Some(Editor::new("search", m.search_query.clone(), m.path.clone()));
+        }
         "rename" => {
             if m.selected.len() > 1 {
                 m.action_id = m.action_id.wrapping_add(1).max(1);
@@ -390,7 +436,7 @@ fn act(m: &mut Model, action: &str, w: &mut Wire) -> io::Result<()> {
                 m.fail("Selected item is unavailable; select it again to rename".into());
             }
         }
-        "newFolder" => m.editor = Some(Editor::new("mkdir", "New Folder".into(), m.path.clone())),
+        "newFolder" => m.editor = Some(Editor::new("mkdir", "New Folder".into(), m.write_dir())),
         "copy" | "cut" => {
             if m.pending_clipboard || m.taildrop_target.is_some() {
                 return Ok(());
@@ -400,6 +446,16 @@ fn act(m: &mut Model, action: &str, w: &mut Wire) -> io::Result<()> {
             w.send(vec![("c", word("paths")), ("rows", m.indices())])?;
         }
         "paste" | "movePaste" => {
+            // The pasteboard is the clipboard every application can write: a copy made here and one
+            // made in Finder are both files there. A cut is this session's own, so a file list that
+            // is not the cut's is pasted as a copy.
+            let foreign = super::clipboard::read_files();
+            if !foreign.is_empty() {
+                if foreign != m.clipboard {
+                    m.cut = false;
+                }
+                m.clipboard = foreign;
+            }
             if m.clipboard.is_empty() {
                 m.say("Nothing to paste".into());
             } else {
@@ -417,7 +473,7 @@ fn act(m: &mut Model, action: &str, w: &mut Wire) -> io::Result<()> {
                         "paths",
                         Json::Arr(m.clipboard.iter().map(|p| word(p)).collect()),
                     ),
-                    ("dest", word(&m.path.to_string_lossy())),
+                    ("dest", word(&m.write_dir().to_string_lossy())),
                 ])?;
             }
         }
@@ -453,7 +509,7 @@ fn act(m: &mut Model, action: &str, w: &mut Wire) -> io::Result<()> {
         }
         "newFile" => {
             m.action_id = m.action_id.wrapping_add(1).max(1);
-            m.editor = Some(Editor::new("newfile", "New File".into(), m.path.clone()));
+            m.editor = Some(Editor::new("newfile", "New File".into(), m.write_dir()));
         }
         "sortNext" | "sortReverse" => {
             // The cursor's logical row: the loaded row, or in a listed/rows gap the anchor still waited for.
@@ -511,19 +567,7 @@ fn act(m: &mut Model, action: &str, w: &mut Wire) -> io::Result<()> {
             let child = super::terminal::launch(&m.path, action == "windowNew")?;
             m.launches.push((if action == "windowNew" { "New Flea window" } else { "Terminal" }.into(), child));
         }
-        "tabClose" => {
-            if m.tabs.len() == 1 {
-                m.quit = true;
-            } else {
-                m.tabs.remove(m.tab);
-                m.tab = m.tab.min(m.tabs.len() - 1);
-                m.restore_cursor = Some(m.tabs[m.tab].cursor);
-                m.back = m.tabs[m.tab].back.clone();
-                m.forward = m.tabs[m.tab].forward.clone();
-                let p = m.tabs[m.tab].path.clone();
-                m.open(p, w)?;
-            }
-        }
+        "tabClose" => return close_tab(m, m.tab, w),
         "preview" => {
             m.quicklook = true;
             super::preview::load(m, true);
@@ -552,7 +596,9 @@ fn act(m: &mut Model, action: &str, w: &mut Wire) -> io::Result<()> {
         }
         "menu" => {
             m.menu = true;
-            m.menu_cursor = if m.rows.contains_key(&m.cursor) { 0 } else { 1 };
+            // Without a row under the cursor the first two rows are dead, so the cursor starts on
+            // the hidden-files toggle rather than on Open.
+            m.menu_cursor = if m.rows.contains_key(&m.cursor) { 0 } else { 4 };
             m.menu_top = 0;
             m.taildrop.submenu = false;
             m.taildrop.refresh();
@@ -617,11 +663,12 @@ fn act(m: &mut Model, action: &str, w: &mut Wire) -> io::Result<()> {
                 m.dismiss_error();
             } else if !m.filter.is_empty() {
                 m.apply_filter(String::new());
-            } else if m.searching {
-                w.send(vec![("c", word("searchcancel"))])?;
-            } else if !m.search.is_empty() {
-                let path = m.search_from.clone().unwrap_or_else(|| m.path.clone());
-                m.open(path, w)?;
+            } else if m.search_page || m.searching || !m.search.is_empty() {
+                // Leaving the page: stop the walk that is still out, then put the folder back.
+                if m.searching {
+                    w.send(vec![("c", word("searchcancel"))])?;
+                }
+                return m.leave_search(w);
             } else if m.transfer_id > 0 {
                 w.send(vec![
                     ("c", word("transfercancel")),
@@ -696,6 +743,25 @@ fn pointer_key(
     w: &mut Wire,
 ) -> io::Result<()> {
     if pointer.released {
+        if m.preview_selecting {
+            m.preview_selecting = false;
+            if m.preview_is_text() {
+                let (start, columns) = super::render::preview_area_for(
+                    m.columns,
+                    m.quicklook,
+                    m.path.parent().is_some(),
+                );
+                if let Some(cell) = preview_cell(m, pointer, start, columns) {
+                    if let Some((anchor, _)) = m.preview_select {
+                        m.preview_select = Some((anchor, cell));
+                    }
+                }
+                copy_preview_selection(m);
+            }
+            if m.preview_select.is_some_and(|(anchor, head)| anchor == head) {
+                m.preview_select = None;
+            }
+        }
         m.drag_anchor = None;
         return Ok(());
     }
@@ -707,8 +773,10 @@ fn pointer_key(
     if m.editor.is_some() {
         return Ok(());
     }
-    if m.sheet || m.menu {
-        let rows = if m.sheet {
+    if m.sheet || m.menu || m.tab_menu {
+        let rows = if m.tab_menu {
+            super::render::tab_menu_rows()
+        } else if m.sheet {
             super::render::panel_rows(m, map).into_iter().skip(m.sheet_top).collect()
         } else {
             super::render::menu_rows(m)
@@ -726,10 +794,11 @@ fn pointer_key(
             && pointer.x <= x + width + 1
             && pointer.y > y + 1
             && pointer.y <= y + count + 1;
-        if inside && m.menu {
-            let index = m.menu_top + pointer.y - y - 2;
-            if m.menu_enabled(index) && (pointer.motion || pointer.button == 0) {
-                m.menu_cursor = index;
+        if inside && (m.menu || m.tab_menu) {
+            let index = if m.tab_menu { pointer.y - y - 2 } else { m.menu_top + pointer.y - y - 2 };
+            let enabled = if m.tab_menu { m.tab_menu_enabled(index) } else { m.menu_enabled(index) };
+            if enabled && (pointer.motion || pointer.button == 0) {
+                if m.tab_menu { m.tab_menu_cursor = index; } else { m.menu_cursor = index; }
                 if !pointer.motion {
                     return self::key(m, &Key::named("Return", ""), map, w);
                 }
@@ -738,18 +807,29 @@ fn pointer_key(
             m.menu = false;
             m.menu_action.clear();
             m.sheet = false;
+            m.tab_menu = false;
         }
         return Ok(());
     }
     if pointer.motion && pointer.button == 3 { return Ok(()); }
     let has_parent = m.path.parent().is_some();
     let (left, middle, _) = super::render::panes_for(m.columns, m.preview_visible, has_parent);
-    if !m.quicklook && pointer.y == 1 && pointer.button == 0 && !pointer.motion {
+    if !m.quicklook && pointer.y == 1 && !pointer.motion && !pointer.released {
         let mut x = 2;
         for (i, label) in super::render::tab_layout(m, m.columns.saturating_sub(2)) {
             let width = super::render::text_width(&label);
             if pointer.x >= x && pointer.x < x + width {
-                return tab(m, i, w);
+                if pointer.button == 0 {
+                    return tab(m, i, w);
+                }
+                if pointer.button == 2 {
+                    m.menu = false;
+                    m.menu_action.clear();
+                    m.tab_menu = true;
+                    m.tab_menu_target = i;
+                    m.tab_menu_cursor = 0;
+                }
+                return Ok(());
             }
             x += width;
         }
@@ -759,6 +839,14 @@ fn pointer_key(
         return Ok(());
     }
     if m.quicklook || (m.preview_visible && pointer.x > left + middle + 2) {
+        // Only a preview with more lines than fit, or a page stack, scrolls. A folder's metadata, a
+        // short text file, a picture, a media frame and the empty state have nothing to move, so the
+        // wheel is the listing's there rather than a no-op.
+        let scrollable = m.pdf.is_some() || m.preview_line_count > m.height;
+        if scroll != 0 && !scrollable && !m.quicklook {
+            m.preview_focus = false;
+            return m.move_by(scroll, false, w);
+        }
         m.preview_focus = true;
         if scroll != 0 {
             return self::key(
@@ -787,6 +875,22 @@ fn pointer_key(
                 }
                 player.control = 1;
                 return player.seek_at(cell, columns);
+            }
+        }
+        if m.preview_is_text() {
+            // A drag over the text selects it, read-only; the release copies the cells it covers.
+            if pointer.button == 0 && !pointer.motion {
+                m.preview_select = preview_cell(m, pointer, start, columns).map(|cell| (cell, cell));
+                m.preview_selecting = m.preview_select.is_some();
+                return Ok(());
+            }
+            if pointer.motion && (pointer.button & 3) == 0 && m.preview_selecting {
+                if let Some(cell) = preview_cell(m, pointer, start, columns) {
+                    if let Some((anchor, _)) = m.preview_select {
+                        m.preview_select = Some((anchor, cell));
+                    }
+                }
+                return Ok(());
             }
         }
         return Ok(());
@@ -893,6 +997,13 @@ pub(super) fn navigate(m: &mut Model, path: PathBuf, w: &mut Wire) -> io::Result
     if m.pending.is_some() {
         return Ok(());
     }
+    // A jump made from the search page leaves it, and the place it leaves is the folder the page
+    // began in: Back from a result's folder lands there, not on the search's root base.
+    if m.search_page || !m.search.is_empty() {
+        if let Some(origin) = m.drop_search().filter(|origin| origin.is_absolute()) {
+            m.path = origin;
+        }
+    }
     m.navigation_before = Some((m.back.clone(), m.forward.clone(), m.tab));
     m.back.push(m.path.clone());
     m.forward.clear();
@@ -919,6 +1030,122 @@ fn history(m: &mut Model, forward: bool, w: &mut Wire) -> io::Result<()> {
     Ok(())
 }
 // Both front ends cap the strip at nine, so a tenth tab is refused with the same words; the status line takes no final period.
+// Closes one tab; the last tab closes Flea, the same act `w` and the menu's Close Tab take.
+fn close_tab(m: &mut Model, index: usize, w: &mut Wire) -> io::Result<()> {
+    if index >= m.tabs.len() {
+        return Ok(());
+    }
+    if m.tabs.len() == 1 {
+        m.quit = true;
+        return Ok(());
+    }
+    m.tabs.remove(index);
+    if index < m.tab {
+        m.tab -= 1;
+    } else if index == m.tab {
+        m.tab = m.tab.min(m.tabs.len() - 1);
+        m.restore_cursor = Some(m.tabs[m.tab].cursor);
+        m.back = m.tabs[m.tab].back.clone();
+        m.forward = m.tabs[m.tab].forward.clone();
+        let p = m.tabs[m.tab].path.clone();
+        return m.open(p, w);
+    }
+    Ok(())
+}
+
+// One row of the tab strip's menu, run against the tab the right click landed on; the current tab
+// stays current unless that tab is the one removed.
+fn tab_menu_act(m: &mut Model, row: usize, w: &mut Wire) -> io::Result<()> {
+    let target = m.tab_menu_target.min(m.tabs.len().saturating_sub(1));
+    m.tab_menu = false;
+    match row {
+        0 => close_tab(m, target, w),
+        1 => {
+            if m.tabs.len() <= 1 {
+                return Ok(());
+            }
+            let kept = m.tabs.remove(target);
+            m.tabs.clear();
+            m.tabs.push(kept);
+            m.tab = 0;
+            m.restore_cursor = Some(m.tabs[0].cursor);
+            m.back = m.tabs[0].back.clone();
+            m.forward = m.tabs[0].forward.clone();
+            let p = m.tabs[0].path.clone();
+            m.open(p, w)
+        }
+        _ => {
+            if m.tabs.len() >= crate::uischema::MAX_LAST_TABS {
+                m.say("Nine tabs is the most".into());
+                return Ok(());
+            }
+            push_tab(m, m.path.clone(), w)
+        }
+    }
+}
+// The menu's Copy path: the cursor row's whole address, as text, on the system clipboard.
+// Open path: the item's own folder is opened where the desktop keeps it, Finder selecting the item
+// on Darwin, so the row's location is one keypress away instead of a walk up the tree.
+fn open_path(m: &mut Model) -> io::Result<()> {
+    let path = m.menu_path.clone();
+    if path.as_os_str().is_empty() {
+        return Ok(());
+    }
+    if crate::open::reveal(&path.to_string_lossy()) == 0 {
+        m.say(format!("Opened {}", path.display()));
+    } else {
+        m.fail("Could not open that path".into());
+    }
+    Ok(())
+}
+fn copy_path(m: &mut Model) -> io::Result<()> {
+    let path = m.menu_path.clone();
+    if path.as_os_str().is_empty() {
+        return Ok(());
+    }
+    match super::clipboard::copy_text(&path.to_string_lossy()) {
+        Ok(()) => m.say(format!("Copied {}", path.display())),
+        Err(e) => m.fail(format!("Could not copy the path: {e}")),
+    }
+    Ok(())
+}
+// The preview cell under a pointer: the content grid of the pane, (row, cell), clamped to its edge.
+fn preview_cell(
+    m: &Model,
+    pointer: &super::input::Pointer,
+    start: usize,
+    columns: usize,
+) -> Option<(usize, usize)> {
+    let row = pointer.y.checked_sub(super::render::BODY_ROW)?;
+    if row >= m.height {
+        return None;
+    }
+    let x = pointer.x.checked_sub(1)?;
+    let cell = x.checked_sub(start)?;
+    if cell > columns {
+        return None;
+    }
+    Some((row, cell))
+}
+// Read-only: a finished selection goes to the system clipboard as plain text.
+fn copy_preview_selection(m: &mut Model) {
+    let Some((anchor, head)) = m.preview_select else { return };
+    if anchor == head {
+        return;
+    }
+    let text = super::render::preview_selection_text(&m.preview_display, anchor, head, m.preview_width);
+    if text.is_empty() {
+        return;
+    }
+    let count = text.chars().count();
+    match super::clipboard::copy_text(&text) {
+        Ok(()) => {
+            let noun = super::render::word(count, "character", "characters");
+            m.say(format!("Copied {count} {noun}"));
+        }
+        Err(e) => m.fail(format!("Could not copy the selection: {e}")),
+    }
+}
 fn tab_full(m: &mut Model) -> bool {
     if m.tabs.len() >= crate::uischema::MAX_LAST_TABS {
         m.say("Nine tabs is the most".into());
@@ -969,6 +1196,7 @@ fn save_preview_column(m: &mut Model) {
 fn edit(m: &mut Model, key: &Key, w: &mut Wire) -> io::Result<()> {
     let mut editor = m.editor.take().unwrap();
     let kind = editor.kind;
+    let before = editor.value.clone();
     if editor.pending {
         m.editor = Some(editor);
         return Ok(());
@@ -976,6 +1204,10 @@ fn edit(m: &mut Model, key: &Key, w: &mut Wire) -> io::Result<()> {
     if key.name == "Escape" {
         if kind == "filter" {
             m.apply_filter(String::new());
+        }
+        if kind == "search" {
+            m.live_pending = false;
+            return m.leave_search(w);
         }
         return Ok(());
     }
@@ -992,37 +1224,7 @@ fn edit(m: &mut Model, key: &Key, w: &mut Wire) -> io::Result<()> {
                 navigate(m, p, w)?;
             }
             "filter" => m.apply_filter(value.clone()),
-            "search" => {
-                if value.is_empty() {
-                    return Ok(());
-                }
-                if m.search_from.is_none() {
-                    m.search_from = Some(m.path.clone());
-                }
-                let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
-                let locate = m.search_scope == 2;
-                if locate {
-                    // The index answers with absolute paths, so the listing base is the root itself.
-                    m.path = PathBuf::from("/");
-                } else if m.search_scope == 1 && home.is_absolute() && m.path.starts_with(&home) {
-                    m.path = home;
-                }
-                m.invalidate_rows();
-                m.cursor = 0;
-                m.top = 0;
-                m.total = 0;
-                m.searching = true;
-                m.search_query = value.clone();
-                m.search = "Search: starting".into();
-                m.sort_anchor = None;
-                w.send(vec![
-                    ("c", word("search")),
-                    ("path", word(&m.path.to_string_lossy())),
-                    ("query", word(value)),
-                    ("hidden", Json::Bool(m.hidden)),
-                    ("locate", Json::Bool(locate)),
-                ])?;
-            }
+            "search" => m.commit_search(value.clone(), w)?,
             "rename" => {
                 w.send(vec![
                     ("c", word("rename")),
@@ -1049,7 +1251,17 @@ fn edit(m: &mut Model, key: &Key, w: &mut Wire) -> io::Result<()> {
             editor.replace(m.completion.clone());
         }
     } else if key.name == "Tab" && kind == "search" {
-        m.search_scope = (m.search_scope + 1) % 3;
+        m.search_folder = !m.search_folder;
+        // The scope is part of the query, so a flip answers like a typed letter would.
+        m.live_pending = true;
+    } else if kind == "search" && matches!(key.name.as_str(), "Up" | "Down" | "PageUp" | "PageDown") {
+        // The results answer while the line is open, so the arrows walk them without closing it; the
+        // view follows the cursor as it would in the listing. Home and End stay the field's own.
+        let page = key.name == "PageUp" || key.name == "PageDown";
+        let step = if page { m.height.max(1) as isize } else { 1 };
+        let delta = if key.name == "Up" || key.name == "PageUp" { -step } else { step };
+        m.editor = Some(editor);
+        return m.move_by(delta, false, w);
     } else {
         editor.update(key);
     }
@@ -1058,6 +1270,19 @@ fn edit(m: &mut Model, key: &Key, w: &mut Wire) -> io::Result<()> {
     }
     if kind == "path" {
         m.completion = m.completer.request(&editor.value, &editor.path);
+    }
+    if kind == "search" {
+        if editor.value.is_empty() {
+            // Backspaced to nothing: the page keeps its header and the results go.
+            if !before.is_empty() {
+                m.live_pending = false;
+                m.editor = Some(editor);
+                m.clear_search();
+                return Ok(());
+            }
+        } else if editor.value != before {
+            m.live_pending = true;
+        }
     }
     m.editor = Some(editor);
     Ok(())

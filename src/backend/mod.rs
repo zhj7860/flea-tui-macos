@@ -41,6 +41,7 @@ pub mod jump;
 pub mod devsreq;
 pub mod search;
 pub mod searchindex;
+pub mod searchsyntax;
 pub mod searchsession;
 pub mod searchtags;
 pub mod searchwalk;

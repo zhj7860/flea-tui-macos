@@ -51,7 +51,21 @@ fn run_child_with(var: &str, value: &std::ffi::OsStr, path: OsString, env: &[(&s
         .expect("the opener runs")
 }
 
-// A FIFO takes the OpenNormally route with no snapshot: open_ask answers 5 through a stub gio, and would block forever with no writer if it opened one.
+// A bundle is a directory to the filesystem and one program to the person: it is the only folder
+// shape that reaches the launcher, and every other folder still asks its caller to navigate.
+#[test]
+fn an_application_bundle_is_never_the_directory_answer() {
+    for (name, bundle) in [("Safari.app", true), ("Safari.APP", true), ("Applications", false), ("notes.app.txt", false), (".app", false)] {
+        let path = Path::new("/Applications").join(name);
+        assert_eq!(super::is_app_bundle(&path), bundle && cfg!(target_os = "macos"), "{name}");
+    }
+    let dir = crate::backend::testdir::TestDir::new("open-bundle-gate");
+    let plain = dir.path().join("Plain");
+    std::fs::create_dir(&plain).expect("the folder is made");
+    assert_eq!(super::open(&plain.to_string_lossy()), super::IS_DIRECTORY, "a folder is still the navigate answer");
+}
+
+// A FIFO takes the OpenNormally route with no snapshot// A FIFO takes the OpenNormally route with no snapshot: open_ask answers 5 through a stub gio, and would block forever with no writer if it opened one.
 #[test]
 fn a_fifo_opens_normally_without_a_snapshot() {
     let dir = crate::backend::testdir::TestDir::new("open-fifo");

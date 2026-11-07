@@ -64,16 +64,24 @@ pub fn panes(columns: usize, preview: bool) -> (usize, usize, usize) {
 // width and its separator instead of leaving an empty first column on screen.
 pub fn panes_for(columns: usize, preview: bool, has_parent: bool) -> (usize, usize, usize) {
     // Tui.html uses border-box widths: each separator belongs to the pane on its left.
-    let left = (columns * 22 / 100).saturating_sub(1);
-    let middle = if preview {
-        (columns * 40 / 100).saturating_sub(1)
-    } else {
-        columns.saturating_sub(left + 1)
-    };
+    //
+    // The first column carries only the levels above the folder on screen, so it is pinned to the
+    // smallest width that still draws a mark and a name: 12 columns once the window is wide enough,
+    // and a quarter of the window below that. The third column keeps half of the 38% the older
+    // split gave it, and the listing takes everything the two give up.
+    const LEFT_MIN: usize = 12;
+    const PREVIEW_SHARE: usize = 19; // was 38%
+    const PREVIEW_FLOOR: usize = 7; // the PDF controls and their arrows keep five columns of content
+    let left = (columns / 8).min(LEFT_MIN);
     let right = if preview {
-        columns.saturating_sub(left + middle + 2)
+        (columns * PREVIEW_SHARE / 100).max(PREVIEW_FLOOR)
     } else {
         0
+    };
+    let middle = if preview {
+        columns.saturating_sub(left + right + 2)
+    } else {
+        columns.saturating_sub(left + 1)
     };
     if has_parent {
         (left, middle, right)
@@ -120,6 +128,13 @@ fn display_path(m: &Model) -> String {
     } else { m.path.to_string_lossy().into_owned() }
 }
 fn header_title(m: &Model) -> String {
+    if m.search_page {
+        return match (m.search_query.is_empty(), m.searching) {
+            (true, _) => "Search · every disk".into(),
+            (false, true) => "Search · searching".into(),
+            (false, false) => format!("Search · {} {}", grouped(m.total), word(m.total, "match", "matches")),
+        };
+    }
     format!("{} · {} {}", display_path(m), m.sort, if m.reverse { "▾" } else { "▴" })
 }
 pub fn tab_layout(m: &Model, columns: usize) -> Vec<(usize, String)> {
@@ -224,6 +239,73 @@ pub fn modified(mtime: i64) -> String {
         String::new()
     }
 }
+// The byte range of `text` covering drawn cells [from, to), a cell being a character's width.
+fn cells_span(text: &str, from: usize, to: usize, columns: usize) -> (usize, usize) {
+    if to <= from {
+        return (text.len(), text.len());
+    }
+    let mut cell = 0;
+    let mut start = text.len();
+    let mut end = text.len();
+    for (i, c) in text.char_indices() {
+        let w = width(c);
+        let next = cell + w;
+        if cell >= columns {
+            end = i;
+            break;
+        }
+        if next > from && start == text.len() {
+            start = i;
+        }
+        if next >= to {
+            end = i + c.len_utf8();
+            break;
+        }
+        cell = next;
+    }
+    (start.min(end), end)
+}
+// The text a preview selection covers: the anchor and head are (row, cell) in the pane's drawn
+// grid, and the covered pieces of each row are joined with newlines.
+pub fn preview_selection_text(lines: &[String], anchor: (usize, usize), head: (usize, usize), columns: usize) -> String {
+    let (start, end) = if anchor <= head { (anchor, head) } else { (head, anchor) };
+    if start == end {
+        return String::new();
+    }
+    let mut out = String::new();
+    for row in start.0..=end.0 {
+        let Some(line) = lines.get(row) else { break };
+        let from = if row == start.0 { start.1 } else { 0 };
+        let to = if row == end.0 { end.1 } else { columns };
+        let (a, b) = cells_span(line, from, to, columns);
+        if row > start.0 {
+            out.push('\n');
+        }
+        out.push_str(&line[a..b]);
+    }
+    out
+}
+// One preview line with the selected cells reversed; read-only, as a terminal's own selection is.
+fn selected_preview(line: &str, row: usize, m: &Model, columns: usize, theme: &Theme) -> String {
+    let Some(sel) = m.preview_select else { return fit(line, columns) };
+    let (start, end) = if sel.0 <= sel.1 { (sel.0, sel.1) } else { (sel.1, sel.0) };
+    if row < start.0 || row > end.0 || start == end {
+        return fit(line, columns);
+    }
+    let from = if row == start.0 { start.1 } else { 0 };
+    let to = if row == end.0 { end.1 } else { columns };
+    let text = clean(line);
+    let (a, b) = cells_span(&text, from, to, columns);
+    let mut out = String::from(&text[..a]);
+    if a < b {
+        out.push_str("\x1b[7m");
+        out.push_str(&text[a..b]);
+        out.push_str(&format!("\x1b[0m{}{}", theme.background, theme.foreground));
+    }
+    let used = text_width(&text[..b]);
+    out.push_str(&fit(&text[b..], columns.saturating_sub(used)));
+    out
+}
 fn match_range(text: &str, query: &str) -> Option<(usize, usize)> {
     if query.is_empty() { return None; }
     let query = query.to_lowercase();
@@ -273,6 +355,84 @@ fn row(row: &Row, columns: usize) -> (String, String) {
         (fit(&label, columns), String::new())
     }
 }
+// The search page's last column: "12 min", "3 h", "Nov 30"; eight columns hold the longest.
+const DATE_WIDTH: usize = 8;
+// The page's three columns, shared by its heading line and its rows: the mark and its space, the
+// file's own name, a gap, the folder holding it, a gap, and the modification time.
+fn search_page_widths(columns: usize) -> (usize, usize) {
+    let room = columns.saturating_sub(2 + 1 + 1 + DATE_WIDTH);
+    let name = if room < 16 { room } else { (room * 2 / 5).clamp(8, room - 8) };
+    (name, room - name)
+}
+fn search_page_row(row: &Row, columns: usize) -> (String, String) {
+    let (name_w, path_w) = search_page_widths(columns);
+    let (parent, leaf) = row.name.rsplit_once('/').unwrap_or(("", row.name.as_str()));
+    let name = elide_end(leaf, name_w);
+    let path = if parent.is_empty() || path_w == 0 {
+        String::new()
+    } else {
+        elide_start(parent.trim_end_matches('/'), path_w)
+    };
+    let label = format!(
+        "{} {}{} {}{}",
+        mark(row),
+        name,
+        " ".repeat(name_w.saturating_sub(text_width(&name))),
+        path,
+        " ".repeat(path_w.saturating_sub(text_width(&path)))
+    );
+    (label, format!(" {}", fit(&modified(row.modified), DATE_WIDTH)))
+}
+fn search_page_header(columns: usize) -> String {
+    let (name_w, path_w) = search_page_widths(columns);
+    let line = format!(
+        "  Name{}{}Path{}{}Modified",
+        " ".repeat(name_w.saturating_sub(4)),
+        " ",
+        " ".repeat(path_w.saturating_sub(4)),
+        " "
+    );
+    fit(&line, columns)
+}
+// Fits text to `limit` columns, marking a cut with a trailing ellipsis.
+fn elide_end(text: &str, limit: usize) -> String {
+    if text_width(text) <= limit {
+        return clean(text);
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for c in clean(text).chars() {
+        let n = width(c);
+        if used + n + 1 > limit {
+            break;
+        }
+        out.push(c);
+        used += n;
+    }
+    out.push('…');
+    out
+}
+// Fits text to `limit` columns from its end, marking a cut with a leading ellipsis: a folder's
+// tail is the part that says where the file is.
+fn elide_start(text: &str, limit: usize) -> String {
+    if text_width(text) <= limit {
+        return clean(text);
+    }
+    let chars: Vec<char> = clean(text).chars().collect();
+    let mut cut = chars.len();
+    let mut used = 0;
+    while cut > 0 {
+        let n = width(chars[cut - 1]);
+        if used + n + 1 > limit {
+            break;
+        }
+        used += n;
+        cut -= 1;
+    }
+    let mut out = String::from("…");
+    out.extend(&chars[cut..]);
+    out
+}
 pub fn draw(
     m: &Model,
     theme: &Theme,
@@ -288,7 +448,9 @@ pub fn draw(
         io::stdout().flush()?;
         return Ok(true);
     }
-    let has_parent = m.path.parent().is_some();
+    // The search page has no parent column: it is not a place in the tree, and its first, blank
+    // frame would otherwise draw the folder's parent and then lose it on the first query.
+    let has_parent = !m.search_page && m.path.parent().is_some();
     let (left, middle, right) = panes_for(columns, m.preview_visible, has_parent);
     let left_padding = pane_padding(left);
     let middle_padding = pane_padding(middle);
@@ -301,7 +463,6 @@ pub fn draw(
     let details_start = body.saturating_sub(2 + details + usize::from(m.pdf.is_some()));
     let base = format!("\x1b[0m{}{}", theme.background, theme.foreground);
     let mut out = format!("\x1b[H{}", base);
-    let path = display_path(m);
     let title = header_title(m);
     let header_width = columns.saturating_sub(2);
     let title_width = text_width(&title).min(header_width / 2);
@@ -321,7 +482,18 @@ pub fn draw(
     out.push_str(&" ".repeat(header_width.saturating_sub(used + title_width)));
     out.push_str(&fit(&title, title_width));
     out.push(' ');
-    out.push_str(&format!("\x1b[2;1H{}{}{}", theme.border, "─".repeat(columns), base));
+    if m.search_page {
+        out.push_str(&format!("\x1b[2;1H{}{}", base, theme.muted));
+        out.push_str(&" ".repeat(middle_padding));
+        out.push_str(&search_page_header(middle.saturating_sub(middle_padding * 2)));
+        out.push_str(&" ".repeat(middle_padding));
+        if m.preview_visible {
+            out.push_str(&format!("{}│{}", theme.border, base));
+        }
+        out.push_str(&base);
+    } else {
+        out.push_str(&format!("\x1b[2;1H{}{}{}", theme.border, "─".repeat(columns), base));
+    }
     for y in 0..body {
         out.push_str(&format!("\x1b[{};1H{}", y + BODY_ROW, base));
         if m.quicklook {
@@ -395,7 +567,11 @@ pub fn draw(
                 out.push_str(&base);
                 out.push_str(&editor.line(&format!("{} ", mark(entry)), "", content_width, &base, &theme.muted, &theme.accent));
             } else {
-                let (label, metadata) = row(entry, content_width);
+                let (label, metadata) = if m.search_page {
+                    search_page_row(entry, content_width)
+                } else {
+                    row(entry, content_width)
+                };
                 if let Some((start, end)) = (index != m.cursor).then(|| match_range(&label, &m.filter)).flatten() {
                     out.push_str(&label[..start]);
                     out.push_str(&theme.accent);
@@ -409,7 +585,20 @@ pub fn draw(
             out.push_str(&" ".repeat(middle_padding));
             out.push_str(&base);
         } else if m.total == 0 {
-            if m.pending.is_some() {
+            if m.search_page {
+                // One line, centred in the pane: the sentence is the page's state, not a row.
+                let sentence = if y != body / 2 {
+                    ""
+                } else if m.search_query.is_empty() {
+                    "Type a name to search every disk"
+                } else if m.searching {
+                    "Searching…"
+                } else {
+                    "No files match that name"
+                };
+                let pad = middle.saturating_sub(text_width(sentence)) / 2;
+                out.push_str(&fit(&format!("{}{}", " ".repeat(pad), sentence), middle));
+            } else if m.pending.is_some() {
                 out.push_str(&fit(if y == body / 2 { "Loading…" } else { "" }, middle));
             } else {
                 out.push_str(&super::empty::line(y, body, middle, cell_pixels, elapsed));
@@ -430,6 +619,7 @@ pub fn draw(
         out.push_str(&theme.border);
         out.push('│');
         out.push_str(&base);
+        let mut text_row = false;
         let preview = if y == body.saturating_sub(2) && (m.player.is_some() || m.pdf.is_some()) {
             m.player
                 .as_ref()
@@ -445,6 +635,7 @@ pub fn draw(
         } else if graphical && y >= 2 {
             String::new()
         } else if m.preview_visible || m.quicklook {
+            text_row = true;
             m.preview_display.get(y).cloned().unwrap_or_default()
         } else {
             String::new()
@@ -455,7 +646,11 @@ pub fn draw(
             &theme.foreground
         });
         out.push_str(&" ".repeat(preview_padding));
-        out.push_str(&fit(&preview, preview_width));
+        if text_row {
+            out.push_str(&selected_preview(&preview, y, m, preview_width, theme));
+        } else {
+            out.push_str(&fit(&preview, preview_width));
+        }
         out.push_str(&" ".repeat(preview_padding));
         out.push_str(&base);
     }
@@ -482,14 +677,24 @@ pub fn draw(
                 .unwrap_or("")
                 .into()
         } else if editor.kind == "search" {
-            format!(
-                " · in {} · Tab changes scope",
-                match m.search_scope {
-                    0 => path.clone(),
-                    1 => "Home".into(),
-                    _ => "This Mac".into(),
-                }
-            )
+            // The whole disk is the scope; this small chip is the only filter, and it narrows the
+            // answer to the folder the search began in so a result never leaves what is on screen.
+            let origin = m.search_from.clone().unwrap_or_else(|| editor.path.clone());
+            let name = origin
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| origin.display().to_string());
+            let mut suffix = if m.search_folder {
+                format!(" [in {name}] · Tab: all disks")
+            } else {
+                " [all disks] · Tab: this folder".into()
+            };
+            // The answer follows the typing, so its count belongs on the line that asked for it.
+            if !m.searching && !m.search_query.is_empty() && m.search_query == editor.value {
+                suffix.push_str(&format!(" · {} {}", grouped(m.total), word(m.total, "match", "matches")));
+            }
+            suffix
         } else {
             String::new()
         };
@@ -527,6 +732,20 @@ pub fn draw(
             } else {
                 "open"
             },
+            Some((&theme.muted, &disabled)),
+        );
+    }
+    if m.tab_menu {
+        let rows = tab_menu_rows();
+        let disabled: Vec<usize> = (0..rows.len()).filter(|index| !m.tab_menu_enabled(*index)).collect();
+        overlay(
+            &mut out,
+            &rows,
+            columns,
+            lines,
+            &base,
+            Some(m.tab_menu_cursor),
+            "tab",
             Some((&theme.muted, &disabled)),
         );
     }
@@ -596,10 +815,14 @@ fn footer(m: &Model, theme: &Theme, columns: usize, elapsed: std::time::Duration
         const FRAME_MILLIS: u128 = 200;
         parts.push((theme.foreground.as_str(), format!("{} {}", m.transfer, FRAMES[(elapsed.as_millis() / FRAME_MILLIS) as usize % FRAMES.len()])));
     }
-    if !m.search.is_empty() { parts.push((theme.foreground.as_str(), m.search.clone())); }
-    if m.error.is_empty() && m.transfer.is_empty() && m.search.is_empty() && !m.message.is_empty() {
-        parts.push((theme.foreground.as_str(), m.message.clone()));
-    }
+    // A fresh notice outranks the search line it would otherwise sit behind, so a copy made over a
+    // result says so; the search state comes back when the notice expires.
+    let noticed = !m.message.is_empty()
+        && m.error.is_empty()
+        && m.transfer.is_empty()
+        && (m.search.is_empty() || m.message_at.elapsed() < super::MESSAGE_TIME);
+    if !m.search.is_empty() && !noticed { parts.push((theme.foreground.as_str(), m.search.clone())); }
+    if noticed { parts.push((theme.foreground.as_str(), m.message.clone())); }
     if !m.filter.is_empty() {
         let shown = m.shown().len();
         parts.push((theme.foreground.as_str(), format!("Filter {} · {} {} in {} {}", m.filter, grouped(shown), word(shown, "match", "matches"), grouped(m.rows.len()), word(m.rows.len(), "loaded row", "loaded rows"))));
@@ -655,13 +878,17 @@ fn selection_line(m: &Model, y: usize, columns: usize) -> String {
     }
     String::new()
 }
+// The tab strip's menu, drawn over the window when a tab is right-clicked.
+pub fn tab_menu_rows() -> Vec<String> {
+    ["Close Tab", "Close Other Tabs", "New Tab"].map(String::from).to_vec()
+}
 pub fn menu_rows(m: &Model) -> Vec<String> {
     if m.taildrop.submenu {
         return m.taildrop.peers.iter().skip(m.menu_top).map(|p| p.label.clone()).collect();
     }
     let reason = m.taildrop.reason();
     let taildrop = if reason.is_empty() { "taildrop  ▶".into() } else { format!("taildrop · {}", reason) };
-    vec!["open".into(), if m.hidden { "hide hidden".into() } else { "show hidden".into() }, taildrop]
+    vec!["open".into(), "open path".into(), "copy path".into(), "remove".into(), if m.hidden { "hide hidden".into() } else { "show hidden".into() }, taildrop]
         .into_iter().skip(m.menu_top).collect()
 }
 pub fn panel_rows(m: &Model, map: &Map) -> Vec<String> {
@@ -734,7 +961,7 @@ mod tests {
     fn chrome_and_pane_insets_preserve_body_and_minimum_pdf_space() {
         assert_eq!(body_height(67), 63);
         assert_eq!(BODY_ROW + body_height(67), 66);
-        assert_eq!(preview_area(277, false), (171, 105));
+        assert_eq!(preview_area(277, false), (226, 50));
         assert_eq!(preview_area(277, true), (1, 275));
         for columns in 12..=277 {
             for quicklook in [false, true] {
@@ -748,7 +975,10 @@ mod tests {
     // At / there is no parent pane, so the current column takes its width instead of leaving it blank.
     #[test]
     fn the_root_draws_no_empty_parent_pane() {
-        assert_eq!(panes_for(100, true, false), (0, 61, 38));
+        assert_eq!(panes_for(100, true, false), (0, 80, 19));
+        // The parent column is as narrow as a mark and a name allow, and the preview is half its
+        // former 38%: the listing takes the rest.
+        assert_eq!(panes_for(186, true, true), (12, 137, 35));
         assert_eq!(panes_for(100, false, false), (0, 100, 0));
         // The preview column keeps its width and starts where the drawing puts it.
         assert_eq!(preview_area_for(100, false, false).1, preview_area(100, false).1);
@@ -762,20 +992,83 @@ mod tests {
         model.columns = 80;
         model.height = 4;
         model.menu_top = 1;
-        model.menu_cursor = 2;
+        model.menu_cursor = 4;
         let rows = menu_rows(&model);
-        assert_eq!(rows, ["show hidden", "taildrop  ▶"]);
-        assert_eq!(overlay_rect(&rows, model.columns, model.height + CHROME_ROWS).3, 2);
+        assert_eq!(rows, ["open path", "copy path", "remove", "show hidden", "taildrop  ▶"]);
+        assert_eq!(overlay_rect(&rows, model.columns, model.height + CHROME_ROWS).3, 4);
         let mut output = String::new();
         overlay(&mut output, &rows, model.columns, model.height + CHROME_ROWS, "",
             Some(model.menu_cursor - model.menu_top), "open", None);
-        assert!(output.contains("\x1b[7m taildrop  ▶ │"));
-        assert!(!output.contains("\x1b[7m show hidden"));
-        assert!(output.contains("│ show hidden │"));
+        assert!(output.contains("\x1b[7m show hidden │"));
+        assert!(!output.contains("\x1b[7m taildrop"));
+        assert!(output.contains("copy path"));
         model.hidden = true;
-        assert_eq!(menu_rows(&model), ["hide hidden", "taildrop  ▶"]);
+        assert_eq!(menu_rows(&model), ["open path", "copy path", "remove", "hide hidden", "taildrop  ▶"]);
         model.taildrop.error = "signed out".into();
-        assert_eq!(menu_rows(&model), ["hide hidden", "taildrop · signed out"]);
+        assert_eq!(menu_rows(&model), ["open path", "copy path", "remove", "hide hidden", "taildrop · signed out"]);
+    }
+
+    // A preview selection reads the drawn cells it covers, across lines and in either direction.
+    #[test]
+    fn a_preview_selection_reads_its_cells_across_lines() {
+        let lines = vec![
+            "alpha beta gamma".to_string(),
+            "second line here".to_string(),
+            "third".to_string(),
+        ];
+        assert_eq!(preview_selection_text(&lines, (0, 6), (0, 10), 40), "beta");
+        assert_eq!(preview_selection_text(&lines, (0, 6), (1, 6), 40), "beta gamma\nsecond");
+        assert_eq!(preview_selection_text(&lines, (1, 6), (0, 6), 40), "beta gamma\nsecond");
+        assert!(preview_selection_text(&lines, (0, 6), (0, 6), 40).is_empty(), "a click selects nothing");
+        assert_eq!(preview_selection_text(&lines, (2, 2), (3, 5), 40), "ird");
+        assert_eq!(preview_selection_text(&lines, (0, 40), (1, 40), 40), "\nsecond line here");
+    }
+
+    // The search page draws three columns: the file's own name, the folder holding it, and its age.
+    #[test]
+    fn the_search_page_draws_name_path_and_modified_time() {
+        let entry = Row {
+            name: "/Users/gm/Projects/Rust/Cargo.toml".into(),
+            mode: 0o100_644,
+            size: 1013,
+            modified: 1_700_000_000,
+            directory: false,
+            link: String::new(),
+            kind: String::new(),
+            thumbnail: false,
+            icon: String::new(),
+        };
+        let (label, metadata) = search_page_row(&entry, 100);
+        assert_eq!(text_width(&label) + text_width(&metadata), 100);
+        assert!(label.starts_with("□ Cargo.toml "), "got {label:?}");
+        assert!(label.contains("/Users/gm/Projects/Rust"), "got {label:?}");
+        assert!(metadata.starts_with(' '), "the date is its own column, got {metadata:?}");
+        // A folder wider than its share is cut from the front; the name keeps its start.
+        let deep = Row { name: format!("/Users/gm/{}/deep.txt", "a".repeat(200)), ..entry.clone() };
+        let (label, metadata) = search_page_row(&deep, 100);
+        assert!(label.starts_with("□ deep.txt "), "got {label:?}");
+        assert!(label.contains('…'), "got {label:?}");
+        assert_eq!(text_width(&label) + text_width(&metadata), 100);
+        // The headings sit exactly over the columns they name.
+        let header = search_page_header(100);
+        assert_eq!(text_width(&header), 100);
+        assert!(header.starts_with("  Name"));
+        let (name_w, _) = search_page_widths(100);
+        assert_eq!(header.find("Path").unwrap(), 2 + name_w + 1);
+        assert!(header.ends_with("Modified"));
+        assert_eq!(100 - header.find("Modified").unwrap(), DATE_WIDTH);
+    }
+
+    // Open, Open path, Copy path and Remove are offered exactly when a row sits under the cursor,
+    // so the four share one condition; the hidden-files toggle is always live.
+    #[test]
+    fn the_row_actions_are_offered_together_and_never_alone() {
+        let mut model = Model::new(std::path::PathBuf::from("/"), &crate::jsondoc::Json::Null);
+        assert!(!model.menu_enabled(0) && !model.menu_enabled(1) && !model.menu_enabled(2) && !model.menu_enabled(3));
+        assert!(model.menu_enabled(4), "the hidden-files toggle is always live");
+        model.menu_ready = true;
+        model.menu_path = std::path::PathBuf::from("/tmp/a.txt");
+        assert!(model.menu_enabled(0) && model.menu_enabled(1) && model.menu_enabled(2) && model.menu_enabled(3));
     }
     #[test]
     fn counted_lines_read_singular_for_one_and_plural_for_many() {
@@ -929,8 +1222,8 @@ action = "keymapSheet"
         );
         assert_eq!(Wrapped::new("", 2).collect::<Vec<_>>(), vec![""]);
         assert!(Wrapped::new("abc", 0).next().is_none());
-        assert_eq!(panes(100, true), (21, 39, 38));
-        assert_eq!(panes(100, false), (21, 78, 0));
+        assert_eq!(panes(100, true), (12, 67, 19));
+        assert_eq!(panes(100, false), (12, 87, 0));
         assert_eq!(bytes(999), "999 B");
         assert_eq!(bytes(1000), "1.0 kB");
         assert_eq!(bytes(1_200_000_000), "1.2 GB");

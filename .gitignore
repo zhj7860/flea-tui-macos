@@ -24,3 +24,6 @@ docs/pending/
 
 # Python bytecode from importing extensionless helpers, never shipped.
 __pycache__/
+
+# Built macOS app bundle
+/dist

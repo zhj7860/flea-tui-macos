@@ -37,7 +37,10 @@
 
 **macOS.** This tree also builds Flea's terminal interface for macOS, with `Ctrl+T` opening
 Terminal.app in the folder on screen. Build, limits and the Darwin port notes are in
-[MACOS.md](MACOS.md); the windowed GUI needs Quickshell and stays Linux-only.
+[MACOS.md](MACOS.md), and `packaging/macos/build-app.sh /Applications` builds a double-clickable
+`Flea.app` whose Finder entry opens the TUI in Terminal; `packaging/macos/build-tui-app.sh` gives
+any other terminal tool the same entry. The windowed GUI needs Quickshell and
+stays Linux-only.
 
 ## Install
 
@@ -225,11 +228,11 @@ Press **?** for the full keymap, or **,** to change settings.
 | Rename / trash / undo / redo | `r` or `F2` / `dd` or `Delete` / `z` / `Ctrl+Shift+Z` |
 | Tag the selection | `T`, then `1` to `7` |
 | New folder | `Ctrl+Shift+N` |
-| Search / filter the list | `f` / `/` |
+| Search every disk / filter the list | `f` / `/` |
 | Enter a path, or jump to a folder by name | `:` or `Ctrl+L`, then a path or a name |
 | List / columns / grid / two panes | `Ctrl+1` / `Ctrl+2` / `Ctrl+3` / `Ctrl+4` |
 | Next / previous area | `Tab` / `Shift+Tab` |
-| New tab / close tab / switch tab | `t` / `w` / `1` to `9` |
+| New tab / close tab / switch tab | `t` / `w` / `1` to `9`; right-click a tab for Close Tab, Close Other Tabs and New Tab |
 | Open terminal / context menu | `Ctrl+T` / `m` |
 | Show hidden files | `.` |
 | Zoom an image in Quick Look / fit | `+` `-` / `0` |

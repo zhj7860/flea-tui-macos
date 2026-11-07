@@ -88,8 +88,16 @@ pub struct Model {
     pub search_query: String,
     pub searching: bool,
     pub search_from: Option<PathBuf>,
-    // Which tree a committed search walks: 0 the folder on screen, 1 home, 2 the whole Mac's index.
-    pub search_scope: u8,
+    // Whether the next whole-disk search is narrowed to the folder it began in; off means every disk.
+    pub search_folder: bool,
+    // The search page is a view of its own: `f` opens it, Escape leaves it for the folder it was
+    // opened from, and its results are three columns rather than the listing's one.
+    pub search_page: bool,
+    // The query line answers as it is typed: an edit arms the next loop tick (the loop polls every
+    // 100 ms), and the text and scope the index was last asked keep a tick from repeating itself.
+    pub live_pending: bool,
+    pub live_query: String,
+    pub live_scope: bool,
     pub transfer: String,
     pub pending_clipboard: bool,
     pub clipboard: Vec<String>,
@@ -116,6 +124,11 @@ pub struct Model {
     pub menu: bool,
     pub menu_cursor: usize,
     pub menu_top: usize,
+    // The tab strip's own menu: the tab the right click landed on and its cursor, kept apart from
+    // the listing's menu because the two never stand at once and their rows mean different things.
+    pub tab_menu: bool,
+    pub tab_menu_target: usize,
+    pub tab_menu_cursor: usize,
     pub menu_ready: bool,
     pub menu_action: String,
     pub menu_path: PathBuf,
@@ -127,6 +140,10 @@ pub struct Model {
     pub player: Option<super::media::Player>,
     pub pdf: Option<super::pdf::Pdf>,
     pub preview_scroll: usize,
+    // A read-only text selection in the preview pane, in the drawn grid of its content: the anchor
+    // and the head are (row, cell) pairs. Dragging sets it; releasing copies it.
+    pub preview_select: Option<((usize, usize), (usize, usize))>,
+    pub preview_selecting: bool,
     pub image_file: Option<PathBuf>,
     // The cursor row's probed width, height and length in ms, once its meta answer lands.
     pub media_probe: Option<(usize, usize, usize)>,
@@ -218,7 +235,11 @@ impl Model {
             search_query: String::new(),
             searching: false,
             search_from: None,
-            search_scope: 0,
+            search_folder: false,
+            search_page: false,
+            live_pending: false,
+            live_query: String::new(),
+            live_scope: false,
             transfer: String::new(),
             pending_clipboard: false,
             clipboard: Vec::new(),
@@ -248,6 +269,9 @@ impl Model {
             menu: false,
             menu_cursor: 0,
             menu_top: 0,
+            tab_menu: false,
+            tab_menu_target: 0,
+            tab_menu_cursor: 0,
             menu_ready: false,
             menu_action: String::new(),
             menu_path: PathBuf::new(),
@@ -265,6 +289,8 @@ impl Model {
             player: None,
             pdf: None,
             preview_scroll: 0,
+            preview_select: None,
+            preview_selecting: false,
             image_file: None,
             media_probe: None,
             thumb_index: None,
@@ -309,6 +335,11 @@ impl Model {
         if self.pending.is_some() {
             return Ok(());
         }
+        // A listing opened over a search page ends the search: the page's results were the listing,
+        // and no row of another folder can be addressed from it.
+        if self.search_page || !self.search.is_empty() {
+            self.drop_search();
+        }
         // Cleared on send: a late re-sort reply belongs to the old listing, and a re-sort sent after this names its own anchor.
         self.sort_anchor = None;
         if self.cancel_taildrop() {
@@ -344,14 +375,138 @@ impl Model {
         self.restore_cursor = None;
         self.restore_path = None;
     }
+    // The folder the next whole-disk search narrows to, canonical because the index stores the
+    // paths the filesystem spells (/var and /private/var are one folder on a Mac).
+    pub fn search_under(&self) -> String {
+        if !self.search_folder {
+            return String::new();
+        }
+        let origin = self
+            .search_from
+            .clone()
+            .unwrap_or_else(|| self.path.clone());
+        std::fs::canonicalize(&origin).unwrap_or(origin).to_string_lossy().into_owned()
+    }
+    // Answers the query line from the whole-disk index: the one request Enter sends and a live
+    // keystroke sends, so the two can never disagree about the listing base or the folder filter.
+    pub fn start_search(&mut self, query: String, wire: &mut Wire) -> io::Result<()> {
+        if query.is_empty() {
+            return Ok(());
+        }
+        let origin = self.search_from.clone().unwrap_or_else(|| self.path.clone());
+        self.search_from = Some(origin.clone());
+        let under = self.search_under();
+        // The index answers with absolute paths, so the listing base is the root itself.
+        self.path = PathBuf::from("/");
+        self.invalidate_rows();
+        self.cursor = 0;
+        self.top = 0;
+        self.total = 0;
+        self.searching = true;
+        self.search_query = query.clone();
+        self.live_query = query.clone();
+        self.live_scope = self.search_folder;
+        self.search = if under.is_empty() {
+            "Search: starting".into()
+        } else {
+            format!("Search: starting in {}", origin.display())
+        };
+        self.sort_anchor = None;
+        wire.send(vec![
+            ("c", word("search")),
+            ("path", word(&self.path.to_string_lossy())),
+            ("query", word(&query)),
+            ("hidden", Json::Bool(self.hidden)),
+            ("locate", Json::Bool(true)),
+            ("under", word(&under)),
+        ])
+    }
+    // Enter on the query line: the live answer for the same text is already drawn, so it settles
+    // rather than asking the backend for it twice.
+    pub fn commit_search(&mut self, query: String, wire: &mut Wire) -> io::Result<()> {
+        if query.is_empty() {
+            return Ok(());
+        }
+        if query == self.live_query && !self.search_query.is_empty() && self.search_folder == self.live_scope {
+            return Ok(());
+        }
+        self.start_search(query, wire)
+    }
+    // The tick behind the query line: the text answers without Enter, one query per loop turn, so
+    // typing at any speed still shows results as it goes.
+    pub fn advance_live_search(&mut self, wire: &mut Wire) -> io::Result<()> {
+        if !self.live_pending {
+            return Ok(());
+        }
+        if !self.editor.as_ref().is_some_and(|editor| editor.kind == "search") {
+            self.live_pending = false;
+            return Ok(());
+        }
+        self.live_pending = false;
+        let value = self.editor.as_ref().map(|editor| editor.value.clone()).unwrap_or_default();
+        if value.is_empty() {
+            // An emptied line is handled where it is edited, so a Tab on an empty line changes nothing.
+            return Ok(());
+        }
+        if value == self.live_query && self.search_folder == self.live_scope {
+            return Ok(());
+        }
+        self.start_search(value, wire)
+    }
+    // The page's blank state: its query is gone, so its results are, and the header stays.
+    pub fn clear_search(&mut self) {
+        self.search.clear();
+        self.search_query.clear();
+        self.searching = false;
+        self.total = 0;
+        self.invalidate_rows();
+        self.cursor = 0;
+        self.top = 0;
+    }
+    // Escape on the page: the search state ends and the folder the page was opened from is back.
+    pub fn leave_search(&mut self, wire: &mut Wire) -> io::Result<()> {
+        match self.drop_search() {
+            Some(origin) if origin.is_absolute() => self.open(origin, wire),
+            _ => Ok(()),
+        }
+    }
+    // Ends the search page and its results, answering the folder it began in for whoever navigates
+    // next. The page's own base is the filesystem root, so nothing on it can outlive the page.
+    pub fn drop_search(&mut self) -> Option<PathBuf> {
+        let origin = self.search_from.take();
+        self.search_page = false;
+        self.search.clear();
+        self.search_query.clear();
+        self.searching = false;
+        self.search_folder = false;
+        self.live_pending = false;
+        self.total = 0;
+        self.invalidate_rows();
+        self.cursor = 0;
+        self.top = 0;
+        origin
+    }
+    // Where a write lands while a search page shows its results: the folder the page began in,
+    // because the search listing's own base is the filesystem root.
+    pub fn write_dir(&self) -> PathBuf {
+        if self.search_page || !self.search.is_empty() {
+            if let Some(origin) = self.search_from.as_ref().filter(|origin| origin.is_dir()) {
+                return origin.clone();
+            }
+        }
+        self.path.clone()
+    }
     pub fn refresh(&mut self, wire: &mut Wire) -> io::Result<()> {
         if !self.search.is_empty() && !self.search_query.is_empty() {
             self.searching = true;
             self.search = "Search: refreshing".into();
             self.invalidate_rows();
             self.sort_anchor = None;
+            // A reload repeats the search it came from, whole-disk and all; a plain folder walk here
+            // would walk the root the answer's base names.
             wire.send(vec![("c", word("search")), ("path", word(&self.path.to_string_lossy())),
-                ("query", word(&self.search_query)), ("hidden", Json::Bool(self.hidden))])
+                ("query", word(&self.search_query)), ("hidden", Json::Bool(self.hidden)),
+                ("locate", Json::Bool(true)), ("under", word(&self.search_under()))])
         } else { self.open(self.path.clone(), wire) }
     }
     pub fn window(&mut self, wire: &mut Wire) -> io::Result<()> {
@@ -430,12 +585,23 @@ impl Model {
         self.menu_action = "deleteRefresh".into();
         wire.send(vec![("c", word("menuaction")), ("op", word("refreshDelete")), ("id", number(self.action_id))])
     }
+    // The tab strip's menu, in row order: Close Tab, Close Other Tabs, New Tab. Close Tab stays
+    // enabled on the last tab because it takes the same quit `w` takes; the other two need more
+    // than one tab and room for one more.
+    pub fn tab_menu_enabled(&self, index: usize) -> bool {
+        match index {
+            0 => !self.tabs.is_empty(),
+            1 => self.tabs.len() > 1,
+            2 => self.tabs.len() < crate::uischema::MAX_LAST_TABS,
+            _ => false,
+        }
+    }
     pub fn menu_enabled(&self, index: usize) -> bool {
         if self.taildrop.submenu { return self.menu_ready && !self.taildrop.loading() && index < self.taildrop.peers.len(); }
         match index {
-            0 => self.menu_ready && !self.menu_path.as_os_str().is_empty(),
-            1 => true,
-            2 => self.menu_ready && self.menu_count > 0 && !self.taildrop.loading() && !self.taildrop.peers.is_empty(),
+            0 | 1 | 2 | 3 => self.menu_ready && !self.menu_path.as_os_str().is_empty(),
+            4 => true,
+            5 => self.menu_ready && self.menu_count > 0 && !self.taildrop.loading() && !self.taildrop.peers.is_empty(),
             _ => false,
         }
     }
@@ -532,6 +698,15 @@ impl Model {
         self.player = None;
         self.pdf = None;
     }
+    // True while the preview pane shows text lines, which are the only rows a selection can cover.
+    pub fn preview_is_text(&self) -> bool {
+        (self.preview_visible || self.quicklook)
+            && self.selected.len() < 2
+            && self.player.is_none()
+            && self.pdf.is_none()
+            && self.image_file.is_none()
+            && !self.preview_display.is_empty()
+    }
     pub fn move_by(&mut self, delta: isize, extend: bool, wire: &mut Wire) -> io::Result<()> {
         if self.total == 0 || self.pending.is_some() {
             return Ok(());
@@ -579,10 +754,12 @@ impl Model {
                     self.path = path;
                     self.cursor = self.restore_cursor.take().unwrap_or(0);
                     self.top = self.cursor;
+                    self.search_page = false;
                     self.search.clear();
                     self.search_query.clear();
                     self.searching = false;
                     self.search_from = None;
+                    self.search_folder = false;
                     self.filter.clear();
                     self.tabs[self.tab].path = self.path.clone();
                     self.navigation_before = None;
@@ -817,11 +994,21 @@ impl Model {
                 if self.pending_clipboard {
                     self.pending_clipboard = false;
                     self.clipboard = paths;
-                    self.say(format!(
+                    let message = format!(
                         "{} {}",
                         super::render::items(self.clipboard.len()),
                         if self.cut { "cut" } else { "copied" }
-                    ));
+                    );
+                    // The files go on the system clipboard beside the session's own list, so the
+                    // copy pastes in Finder and a copy made in Finder pastes here. A test reads the
+                    // session's list and never the operator's pasteboard.
+                    #[cfg(not(test))]
+                    match super::clipboard::copy_files(&self.clipboard) {
+                        Ok(()) => self.say(message),
+                        Err(e) => self.fail(format!("{message} — the system clipboard refused it: {e}")),
+                    }
+                    #[cfg(test)]
+                    self.say(message);
                 }
             }
             "searching" | "searched" => {
@@ -1164,6 +1351,63 @@ mod tests {
         crate::tui::wire::finish(wire, reader);
     }
 
+    // The query line answers after a short pause, as Everything's does, and Enter does not ask for
+    // an answer that is already drawn.
+    #[test]
+    fn a_quiet_query_line_answers_without_enter_and_enter_does_not_repeat_it() {
+        let (mut wire, reader) = crate::tui::wire::echo_wire();
+        let mut model = Model::new(PathBuf::from("/listing/child"), &Json::Null);
+        model.editor = Some(crate::tui::editor::Editor::new("search", "flea".into(), model.path.clone()));
+        model.live_pending = true;
+        model.advance_live_search(&mut wire).unwrap();
+        let sent = wire.events.recv_timeout(std::time::Duration::from_secs(2)).expect("a search request").expect("parseable");
+        assert_eq!(text(&sent, "c"), "search");
+        assert_eq!(text(&sent, "query"), "flea");
+        assert!(flag(&sent, "locate"));
+        assert_eq!(model.search_query, "flea");
+        assert_eq!(model.path, PathBuf::from("/"));
+        model.commit_search("flea".into(), &mut wire).unwrap();
+        assert!(wire.events.recv_timeout(std::time::Duration::from_millis(250)).is_err(),
+            "Enter must not ask twice for a drawn answer");
+        // The scope is part of the query, so flipping it asks again even though the text is unchanged.
+        model.search_folder = true;
+        model.live_pending = true;
+        model.advance_live_search(&mut wire).unwrap();
+        let sent = wire.events.recv_timeout(std::time::Duration::from_secs(2)).expect("a scope request").expect("parseable");
+        assert_eq!(text(&sent, "under"), "/listing/child");
+        crate::tui::wire::finish(wire, reader);
+    }
+
+    // Erasing the query leaves the page standing with its header and no results.
+    #[test]
+    fn an_emptied_query_line_keeps_the_page() {
+        let mut model = Model::new(PathBuf::from("/"), &Json::Null);
+        model.search_page = true;
+        model.search_from = Some(PathBuf::from("/listing/child"));
+        model.search_query = "flea".into();
+        model.search = "Search: 2 matches".into();
+        model.clear_search();
+        assert!(model.search_page, "the page survives its query");
+        assert!(model.search_query.is_empty() && model.search.is_empty());
+        assert_eq!(model.total, 0);
+    }
+
+    // Escape on the page ends the search and puts the folder it came from back.
+    #[test]
+    fn leaving_the_page_puts_the_folder_back() {
+        let (mut wire, reader) = crate::tui::wire::echo_wire();
+        let mut model = Model::new(PathBuf::from("/"), &Json::Null);
+        model.search_page = true;
+        model.search_from = Some(PathBuf::from("/listing/child"));
+        model.search_query = "flea".into();
+        model.leave_search(&mut wire).unwrap();
+        assert!(!model.search_page);
+        let sent = wire.events.recv_timeout(std::time::Duration::from_secs(2)).expect("a list request").expect("parseable");
+        assert_eq!(text(&sent, "c"), "list");
+        assert_eq!(text(&sent, "path"), "/listing/child");
+        crate::tui::wire::finish(wire, reader);
+    }
+
     #[test]
     fn counted_lines_read_plural_for_many() {
         let (mut wire, reader) = crate::tui::wire::echo_wire();
@@ -1286,11 +1530,20 @@ mod tests {
         model.menu_path = PathBuf::from("/selected");
         model.menu_count = 1;
         assert!(!model.menu_enabled(0));
-        assert!(model.menu_enabled(1));
+        assert!(!model.menu_enabled(1));
+        assert!(!model.menu_enabled(2));
+        assert!(!model.menu_enabled(3), "remove needs the snapshot's identity too");
+        assert!(model.menu_enabled(4), "the hidden-files toggle needs no snapshot");
         model.menu_ready = true;
         assert!(model.menu_enabled(0));
-        assert!(!model.menu_enabled(2));
+        assert!(model.menu_enabled(1));
+        assert!(model.menu_enabled(2));
+        assert!(model.menu_enabled(3));
+        assert!(!model.menu_enabled(5));
         model.menu_path.clear();
         assert!(!model.menu_enabled(0));
+        assert!(!model.menu_enabled(1));
+        assert!(!model.menu_enabled(2));
+        assert!(!model.menu_enabled(3));
     }
 }

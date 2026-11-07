@@ -386,16 +386,33 @@ files the walk visits, one `getxattr` each, never swept ahead of it.
 index is built by Flea itself (no Spotlight and no external indexer): the home tree,
 `/Applications` and every mounted volume, with caches, trash, VCS objects, build products
 and `target` directories listed but never descended, up to 1.5 million entries. The answer
-is one `listed` with the match count, the ranked head as the listing's rows under base `/`
-(whole paths, so every per-row facility keeps working), and one `searched` whose `scanned`
-is the indexed population and whose `n` is the rows this answer holds, at most 20,000;
-narrow the query to see more. A distinct `searching` line is never sent, because nothing
+holds files only, and each file matches on its **own name**: a folder is never a row, and a
+file whose name does not match is not one because a parent folder carries the query. The
+`listed` line carries the match count, the head as the listing's rows under base `/` (whole
+paths, so every per-row facility keeps working), and one `searched` whose `scanned` is the
+indexed population and whose `n` is the rows this answer holds, at most 20,000; narrow the
+query to see more. **The query is Everything's search syntax** as far as a name index can
+answer it: a space is AND, `|` is OR, `!` negates, `< >` group, `"` keeps text literal, and
+`*` / `?` are wildcards anchored to the whole name; `case:`/`nocase:`, `path:`/`nopath:`,
+`wholefilename:`/`exact:`, `ext:`, `startwith:` and `endwith:` are honoured. A plain term is a
+case-insensitive substring of the file's own name, never a fuzzy subsequence. A function
+needing metadata the index does not hold (`size:`, `dm:`, `dc:`, `da:`, `attrib:`, `type:`,
+`content:`, ...) or `regex:` answers one `error` line with `where` `search` and then an empty
+`listed`/`searched` pair, so a pane never waits on a search that did not run. A distinct `searching` line is never sent, because nothing
 walks. Until the first snapshot exists the same request walks the home tree with whole
-paths and starts the background build, so the first whole-Mac search is useful before the
-index is ready; later launches answer in tens of milliseconds. The snapshot lives in
+paths under the same rule — files only, each matched on its own name — and starts the
+background build, so the first whole-Mac search is useful before the index is ready; later
+launches answer in tens of milliseconds. The snapshot lives in
 `$XDG_CACHE_HOME/flea/locate.idx` (`~/Library/Caches/flea/locate.idx` on a Mac), is read on
 the first whole-Mac search of a process and rebuilt behind that answer once it is 12 hours
 old. `path` is ignored apart from being echoed as the base by an older client's request.
+`"under":"/a/folder"` narrows the answer to that folder and everything below it before ranking,
+so a folder filter never spends the 20,000-row head on rows it would drop; a bare prefix is not
+containment (`/a/folder` does not hold `/a/folder-old`), an empty or absent field means every
+disk, and the population `scanned` still counts the whole snapshot. The snapshot stores canonical
+paths (the roots are resolved when it is built), so a client sends the folder's canonical path —
+the TUI resolves the search's starting folder before the request — and a folder named through a
+link still matches.
 
 ### searchcancel
 

@@ -14,7 +14,7 @@ shelf/ShelfCard.qml 444
 shelf/ShelfService.qml 481
 src/backend/copyfile.rs 739
 src/backend/codereq.rs 408
-src/backend/tags.rs 408
+src/backend/tags.rs 440
 src/backend/searchsession.rs 350
 src/backend/searchtags.rs 444
 src/backend/searchtags_tests.rs 519
@@ -39,21 +39,21 @@ src/backend/opsdispatch.rs 2273
 src/backend/opsreq.rs 563
 src/backend/opsreq/tests.rs 502
 src/backend/permissions.rs 703
-src/backend/run.rs 1116
+src/backend/run.rs 1173
 src/backend/officepdf.rs 404
 src/backend/run_session_tests.rs 525
 src/backend/ops.rs 440
 src/backend/thumbs.rs 521
 src/backend/thumbspec.rs 479
 src/backend/dirsizeworker.rs 573
-src/backend/watch.rs 550
+src/backend/watch.rs 558
 src/backend/thumbreq.rs 464
 src/backend/undo.rs 717
 src/backend/undo_tests.rs 439
 src/backend/undoshare.rs 414
 src/backend/undoshare_tests.rs 563
 src/backend/collide_replace_tests.rs 492
-src/backend/proto.rs 473
+src/backend/proto.rs 477
 src/backend/sandbox.rs 401
 src/backend/thumbworker.rs 961
 src/backend/trashbrowse.rs 1025
@@ -61,13 +61,13 @@ src/backend/rawpreview_tests.rs 427
 src/backend/trashdelete.rs 987
 src/clip/watch_end_tests.rs 405
 src/gvfsprefetch_tests.rs 398
-src/gui.rs 505
-src/tui/actions.rs 1058
+src/gui.rs 507
+src/tui/actions.rs 1289
 src/tui/hold_tests.rs 427
 src/tui/input.rs 455
-src/tui/model.rs 1268
-src/tui/mod.rs 419
-src/tui/render.rs 913
+src/tui/model.rs 1549
+src/tui/mod.rs 423
+src/tui/render.rs 1237
 src/uischema.rs 597
 src/uistate.rs 849
 src/uistore.rs 568
@@ -80,7 +80,7 @@ tests/js/facts.js 415
 tests/js/devices.js 437
 tests/js/previewswap.js 475
 tests/js/mdstructure.js 655
-tests/js/keymap.js 366
+tests/js/keymap.js 371
 tests/js/focus.js 843
 tests/js/mounts.js 359
 tests/js/menu.js 673
@@ -186,7 +186,7 @@ ui/js/ColumnsCarry.js 103
 ui/js/Devices.js 440
 ui/js/Filter.js 284
 ui/js/Focus.js 492
-ui/js/Keymap.js 370
+ui/js/Keymap.js 373
 ui/js/Nav.js 328
 ui/js/Markdown.js 135
 ui/js/MdBlocks.js 437
@@ -208,13 +208,18 @@ ui/js/UiState.js 438
 ui/TabBar.qml 673
 ui/boot/fleatab.qml 50
 tests/unlock-stdin.qml 483
-src/backend/searchindex.rs 401
+src/backend/searchindex.rs 554
 tests/gridjump.qml 516
 tests/gridbare.qml 426
 src/backend/trash.rs 401
 src/backend/trash_tests.rs 423
 tests/permissions-adv.qml 402
-tests/quicklook-code.qml 463"
+tests/quicklook-code.qml 463
+src/backend/search.rs 422
+src/backend/searchwalk.rs 406
+src/backend/mountinfo.rs 500
+src/sys.rs 466
+src/main.rs 415"
 
 status=0
 

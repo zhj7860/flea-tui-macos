@@ -78,6 +78,15 @@ fn read_text(path: &Path, cancel: &AtomicBool) -> Result<String, String> {
     Ok(body)
 }
 pub fn load(m: &mut Model, force: bool) {
+    // The answer under the cursor changes with every keystroke; decoding each one is work nobody asked
+    // for, and Enter ends the query line.
+    if m.editor.as_ref().is_some_and(|editor| editor.kind == "search") {
+        m.preview_reader.cancel();
+        m.preview_path.clear();
+        m.preview.clear();
+        m.preview_body.clear();
+        return;
+    }
     if m.selected.len() > 1 || (!m.preview_visible && !m.quicklook) {
         m.preview_reader.cancel();
         m.preview_path.clear();
@@ -103,7 +112,13 @@ pub fn load(m: &mut Model, force: bool) {
     let Some(row) = m.rows.get(&m.cursor) else {
         return;
     };
-    m.preview.push(row.name.clone());
+    // A search result carries its whole path in the name, so the title is the file's own name and
+    // the folder sits under it: a narrow preview then shows the name before the path wraps over it.
+    let (parent, leaf) = row.name.rsplit_once('/').unwrap_or(("", row.name.as_str()));
+    m.preview.push(leaf.to_string());
+    if !parent.is_empty() {
+        m.preview.push(format!("{parent}/"));
+    }
     m.preview
         .push(format!("{} · {}", row.kind, super::render::bytes(row.size)));
     if row.modified > 0 {
@@ -139,7 +154,12 @@ pub fn load(m: &mut Model, force: bool) {
 pub fn poll(m: &mut Model) {
     let Some((generation, result)) = m.preview_reader.poll() else { return };
     if generation != m.preview_generation { return; }
-    m.preview.truncate(2);
+    // Keep every header line the load wrote (a name, possibly a folder, a kind and a size) and drop
+    // the "Loading…" that stood in the body's place.
+    match m.preview.iter().rposition(|line| line == "Loading…") {
+        Some(at) => m.preview.truncate(at),
+        None => m.preview.truncate(2),
+    }
     match result {
         Ok(body) => { m.preview.push(String::new()); m.preview_body = body; }
         Err(error) => m.preview.push(error),
@@ -215,6 +235,9 @@ pub fn layout(m: &mut Model) {
         .map(super::render::clean)
         .collect();
     m.preview_display = shown;
+    // The lines these cells named are gone (another file, a scroll, a resize).
+    m.preview_select = None;
+    m.preview_selecting = false;
     m.preview_layout_scroll = m.preview_scroll;
     m.preview_layout_height = m.height;
 }
@@ -268,6 +291,39 @@ mod tests {
         m.rows.get_mut(&0).unwrap().name = "link".into();
         load(&mut m, true);
         assert_eq!(read_text(&d.join("link"), &AtomicBool::new(false)).unwrap_err(), "This file could not be read.");
+    }
+    // A search result's row name is the whole path; the preview titles it with the file's own name
+    // and puts the folder under it, so the narrow pane shows the name first.
+    #[test]
+    fn a_search_row_titles_the_preview_with_the_files_own_name() {
+        let d = TestDir::new("tui-preview-search");
+        let folder = "Final Signed FRS/Integration/ISD";
+        let leaf = "Huawei CRM ISD Restful API Reference Guide.pdf";
+        std::fs::create_dir_all(d.path().join(folder)).expect("the folders are made");
+        d.file(&format!("{folder}/{leaf}"), "body");
+        let mut m = Model::new(d.path().into(), &Json::Null);
+        m.search_page = true;
+        m.rows.insert(0, Row {
+            name: d.join(folder).join(leaf).display().to_string(),
+            directory: false,
+            size: 4,
+            mode: 0o100644,
+            link: String::new(),
+            kind: "PDF document".into(),
+            thumbnail: false,
+            modified: 0,
+            icon: "application-pdf".into(),
+        });
+        m.preview_visible = true;
+        m.preview_auto = false;
+        load(&mut m, false);
+        assert_eq!(m.preview[0], leaf);
+        assert_eq!(m.preview[1], format!("{}/", d.join(folder).display()));
+        assert_eq!(m.preview[2], "PDF document · 4 B");
+        layout(&mut m);
+        let shown = m.preview_display.join("");
+        assert!(shown.contains("Final Signed FRS"), "{shown}");
+        assert!(shown.contains("PDF document"), "{shown}");
     }
     // The hint under an unloaded preview names the key the keymap binds, and says nothing when none is bound.
     #[test]

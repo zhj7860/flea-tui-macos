@@ -11,6 +11,17 @@ use std::process::{Command, Stdio};
 pub const FAILED: i32 = 2;
 pub const IS_DIRECTORY: i32 = 3;
 
+// A macOS application bundle is a directory to the filesystem and one program to the person who
+// searched for it: the desktop launches it, and no caller is asked to walk into its Contents.
+pub fn is_app_bundle(path: &Path) -> bool {
+    cfg!(target_os = "macos") && path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("app"))
+}
+
+// The one shape whose 3 means navigate: a folder that is not an application bundle.
+fn is_directory_answer(target: &Path) -> bool {
+    target.is_dir() && !is_app_bundle(target)
+}
+
 // Canonical, so a file named --output=/etc/x cannot be read as a flag by the child.
 fn resolved(path: &str) -> Option<PathBuf> {
     std::fs::canonicalize(path).ok()
@@ -49,7 +60,9 @@ fn open_inner(path: &str, ask: bool) -> i32 {
             return FAILED;
         }
     };
-    if target.is_dir() {
+    // A bundle is handed to LaunchServices instead: the window's 3 means navigate, and nobody
+    // navigates into an application.
+    if is_directory_answer(&target) {
         return IS_DIRECTORY;
     }
     // A FIFO, socket or device is never a program and never blocks here: it skips the snapshot and the run decision and opens the way it always did.
@@ -141,6 +154,43 @@ fn open_normally(target: &Path, ask: bool) -> i32 {
     }
 }
 
+// Reveals an item where the desktop keeps it: Finder selects it on Darwin, and elsewhere the folder
+// it lives in is opened by the desktop's own handler. The menu's Open path is the only caller.
+// FLEA_OPEN names the launcher, the tree's test seam, as the macOS app entry honours it.
+pub fn reveal(path: &str) -> i32 {
+    let target = match resolved(path) {
+        Some(p) => p,
+        None => {
+            eprintln!("flea: that file could not be opened, check that it still exists");
+            return FAILED;
+        }
+    };
+    let mut launcher = Command::new(std::env::var("FLEA_OPEN").unwrap_or_else(|_| open_program().into()));
+    prepare(&mut launcher);
+    #[cfg(target_os = "macos")]
+    launcher.arg("-R").arg(&target);
+    // gio has no reveal: the folder the item sits in is the closest thing its handler opens.
+    #[cfg(not(target_os = "macos"))]
+    launcher.arg("open").arg(target.parent().unwrap_or(&target));
+    let ended = launcher
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .status();
+    match ended {
+        Ok(status) if status.success() => 0,
+        Ok(_) => {
+            eprintln!("flea: no application on this system opened that path");
+            FAILED
+        }
+        Err(_) => {
+            eprintln!("flea: nothing on this system could be asked to open that path");
+            FAILED
+        }
+    }
+}
+
 // The suite's stubs speak gio, GNU timeout and mkfifo, so those checks are Linux's.
 #[cfg(all(test, target_os = "linux"))]
 #[path = "open_tests.rs"]
@@ -156,9 +206,49 @@ mod darwin_tests {
         assert!(Path::new(open_program()).is_file(), "every macOS ships this");
     }
 
+    // The menu's Open path asks the launcher to reveal the item: Finder's own `-R` on this platform.
+    #[test]
+    fn reveal_asks_the_launcher_to_show_the_item() {
+        let root = std::env::temp_dir().join(format!("flea-reveal-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("the fixture is made");
+        let stub = root.join("open");
+        let log = root.join("argv");
+        std::fs::write(&stub, format!("#!/bin/sh\necho \"$@\" > \"{}\"\n", log.display())).expect("the stub is written");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).expect("the stub runs");
+        let item = root.join("file.txt");
+        std::fs::write(&item, b"x").expect("the item is written");
+        std::env::set_var("FLEA_OPEN", &stub);
+        let status = reveal(&item.to_string_lossy());
+        std::env::remove_var("FLEA_OPEN");
+        assert_eq!(status, 0);
+        let asked = std::fs::read_to_string(&log).expect("the stub recorded its argv");
+        let real = std::fs::canonicalize(&item).expect("the item resolves");
+        assert_eq!(asked.trim(), format!("-R {}", real.display()));
+        std::fs::remove_dir_all(&root).expect("the fixture is removed");
+    }
+
     #[test]
     fn a_directory_is_answered_without_a_launch() {
         let dir = std::env::temp_dir();
         assert_eq!(open(&dir.to_string_lossy()), IS_DIRECTORY);
+    }
+
+    // A bundle is a directory to the filesystem and one program to the person who searched for
+    // it, so it is the one folder shape that is not the navigate answer and reaches `open`.
+    #[test]
+    fn an_application_bundle_is_never_the_directory_answer() {
+        for (name, bundle) in [("Safari.app", true), ("Safari.APP", true), ("Applications", false), ("notes.app.txt", false), ("app", false)] {
+            let path = Path::new("/Applications").join(name);
+            assert_eq!(is_app_bundle(&path), bundle, "{name}");
+        }
+        let root = std::env::temp_dir().join(format!("flea-open-bundle-{}", std::process::id()));
+        let bundle = root.join("Fake.app");
+        let plain = root.join("Plain");
+        std::fs::create_dir_all(&bundle).expect("the bundle dir is made");
+        std::fs::create_dir_all(&plain).expect("the plain dir is made");
+        assert!(!is_directory_answer(&bundle), "a bundle is launched, never walked into");
+        assert!(is_directory_answer(&plain), "every other folder is still the navigate answer");
+        std::fs::remove_dir_all(&root).expect("the fixture is removed");
     }
 }

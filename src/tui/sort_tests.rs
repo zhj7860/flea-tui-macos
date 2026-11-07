@@ -291,3 +291,19 @@ fn a_cursor_key_spends_the_anchor_so_a_late_reply_moves_nothing() {
     assert_eq!(model.cursor, moved, "the late reply leaves the cursor where the operator put it");
     finish(wire, reader);
 }
+
+// The reverse key under both terminal protocols: a legacy terminal sends the capital byte with no
+// modifier, a kitty-protocol one the base letter with Shift held. Both reach the same S row.
+#[test]
+fn the_reverse_key_answers_on_either_protocol() {
+    let (mut wire, reader) = echo_wire();
+    let mut model = Model::new(PathBuf::from("/listing"), &Json::Null);
+    open_names(&mut model, &mut wire, &[("a", false), ("b", false)]);
+    press(&mut model, &mut wire, &sort_key());
+    assert!(!model.reverse, "s steps the order and clears the reverse");
+    press(&mut model, &mut wire, &Key::character('S', "shift"));
+    assert!(model.reverse, "Shift+S reverses on a protocol terminal");
+    press(&mut model, &mut wire, &Key::character('S', ""));
+    assert!(!model.reverse, "the legacy capital byte toggles it back");
+    finish(wire, reader);
+}

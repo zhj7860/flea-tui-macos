@@ -1,5 +1,8 @@
 mod actions;
 mod batch;
+mod clipboard;
+// Match StatusBar.messageMs while keeping the actionable undo receipt until dismissed.
+const MESSAGE_TIME: std::time::Duration = std::time::Duration::from_millis(4000);
 mod completion;
 mod editor;
 mod empty;
@@ -123,6 +126,7 @@ pub fn run(path: Option<&str>, select: Option<&str>) -> i32 {
                 model.menu_action = "open".into();
                 wire.send(vec![("c", wire::word("menuaction")), ("op", wire::word("validate")), ("id", wire::number(model.action_id)), ("action", wire::word("open"))])?;
             }
+            model.advance_live_search(&mut wire)?;
             preview::load(&mut model, false);
             preview::poll(&mut model);
             preview::request(&mut model, &mut wire)?;
@@ -139,7 +143,6 @@ pub fn run(path: Option<&str>, select: Option<&str>) -> i32 {
                 model.completion = completion;
             }
             // Match StatusBar.messageMs while keeping the actionable undo receipt until dismissed.
-            const MESSAGE_TIME: std::time::Duration = std::time::Duration::from_millis(4000);
             if !matches!(model.menu_action.as_str(), "taildropRefresh" | "taildrop")
                 && !model.message.contains("Undo available") && model.message_at.elapsed() >= MESSAGE_TIME {
                 model.message.clear();

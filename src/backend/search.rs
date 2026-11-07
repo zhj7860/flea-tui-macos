@@ -22,6 +22,13 @@ pub struct Search {
     pub started: Instant,
     // Push whole paths rather than scope-relative ones, for a search whose base is the root itself.
     absolute: bool,
+    // Everything's syntax, for the whole-Mac fallback; None is the window's folder walk, scored fuzzy.
+    everything: Option<crate::backend::searchsyntax::Query>,
+}
+
+// The last component of a whole-path row name, which is the name Everything sorts by.
+fn leaf(text: &str) -> &str {
+    text.rsplit('/').next().unwrap_or(text)
 }
 
 impl Search {
@@ -37,16 +44,18 @@ impl Search {
             scanned: 0,
             started: Instant::now(),
             absolute: false,
+            everything: None,
         }
     }
 
     // The whole-Mac fallback walks home but answers with paths the root base can join, so a result
-    // still opens while the name index is being built.
-    pub fn new_absolute(root: &str, query: &str, hidden: bool) -> Search {
-        Search { absolute: true, ..Search::new(root, query, hidden) }
+    // still opens while the name index is being built; it keeps the index's file-only, name-based
+    // Everything matching.
+    pub fn new_absolute(root: &str, query: crate::backend::searchsyntax::Query, hidden: bool) -> Search {
+        Search { absolute: true, everything: Some(query), ..Search::new(root, "", hidden) }
     }
 
-    // Returns true when the walk is finished; the caller then writes the terminal line.
+// Returns true when the walk is finished; the caller then writes the terminal line.
     pub fn step(&mut self, listing: &mut Listing) -> bool {
         for _ in 0..DIRS_PER_TICK {
             match self.pending.pop() {
@@ -82,13 +91,26 @@ impl Search {
                 }
                 continue;
             }
+            // The fallback is a file list, so a folder is walked but never listed.
+            if self.everything.is_some() && is_dir {
+                self.pending.push(child);
+                continue;
+            }
             // The candidate is the whole relative path, not the base name, so one query can span a
             // separator: "dwnhelp" reaches "downloads/helper.txt", see docs/protocol.md "search".
             let text = if self.absolute { std::borrow::Cow::Owned(self.root.join(&child).to_string_lossy().into_owned()) } else { text };
-            if let Some(score) = self.fuzzy.score(&text) {
+            // The whole-Mac fallback runs the index's matcher; the window's walk stays fuzzy.
+            let matched = if let Some(query) = self.everything.as_ref() {
+                query.matches(&raw.to_string_lossy(), &text)
+            } else if let Some(score) = self.fuzzy.score(&text) {
+                self.scores.push(score);
+                true
+            } else {
+                false
+            };
+            if matched {
                 // The row's name is its path relative to the root; a name that is not UTF-8 rows as lossy text, like every row on the wire, so base.join(name) reaches only a UTF-8 name.
                 listing.push(&text, is_dir);
-                self.scores.push(score);
             }
             // corner: a symlink reports its own type here, so a link to a directory is never descended and no loop is possible.
             if is_dir {
@@ -101,6 +123,22 @@ impl Search {
     // the name arena never moves. Answers whether the row order changed, because a new order
     // invalidates every outstanding row index the same way a sort does.
     pub fn rank(&self, listing: &mut Listing) -> bool {
+        // Everything answers in name order, and the fallback's rows are whole paths, so the name is
+        // the last component; a tie keeps the path order stable.
+        if self.everything.is_some() {
+            if listing.len() < 2 {
+                return false;
+            }
+            let names = std::mem::take(&mut listing.names);
+            let spans = &mut listing.spans;
+            spans.sort_by(|a, b| {
+                let an = &names[a.off as usize..(a.off + a.len) as usize];
+                let bn = &names[b.off as usize..(b.off + b.len) as usize];
+                crate::backend::sort::name_order(leaf(an).as_bytes(), leaf(bn).as_bytes()).then_with(|| an.cmp(bn))
+            });
+            listing.names = names;
+            return true;
+        }
         // A listing this walk did not fill by itself is never reordered: the scores would name other rows.
         if self.scores.len() != listing.len() || listing.len() < 2 {
             return false;

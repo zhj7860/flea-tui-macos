@@ -468,7 +468,8 @@ action = "parent"
 char = "/"
 action = "filter"
 
-# Search walks the subtree under the current directory; filter above narrows what is already listed.
+# The TUI's search answers from Flea's whole-disk name index; the window's walks the subtree under
+# the current directory, where filter above narrows what is already listed.
 [[text]]
 char = "f"
 action = "search"

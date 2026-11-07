@@ -120,7 +120,7 @@ pub(crate) fn fill_roots(out: &Mutex<Index>, roots: &[PathBuf], probes: &WalkPro
 
 // Trees no one searches and every walk spends most of its time in: caches, trash, VCS objects and
 // build products. A directory of one of these names is still listed, only never descended.
-fn locate_skip(name: &std::ffi::OsStr) -> bool {
+pub(crate) fn locate_skip(name: &std::ffi::OsStr) -> bool {
     matches!(
         name.to_string_lossy().as_ref(),
         "Caches" | ".Trash" | ".cache" | ".git" | "node_modules" | ".Spotlight-V100" | ".fseventsd" | "DerivedData" | "target"

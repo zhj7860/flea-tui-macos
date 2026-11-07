@@ -137,3 +137,15 @@ action = "parent"
     assert_eq!(map.chord("escape", "default", "listing").as_deref(), Some("Backspace"));
     assert_eq!(map.chord("parent", "default", "listing"), None, "the earlier Backspace row shadows this one");
 }
+
+// Under the kitty keyboard protocol Shift+s arrives as the base letter with the shift modifier (text
+// "s", mods "shift"), where a legacy terminal sends "S" with none. Both must reach the capital row.
+#[test]
+fn a_shifted_text_reaches_the_capital_row_on_either_protocol() {
+    let map = Map::load();
+    assert_eq!(map.action(&Key::character('s', "shift"), "default"), "sortReverse", "Shift+s reverses the order");
+    assert_eq!(map.action(&Key::character('s', ""), "default"), "sortNext", "plain s still cycles");
+    assert_eq!(map.action(&Key::character('G', ""), "default"), "cursorLast", "a legacy terminal sends the capital byte");
+    assert_eq!(map.action(&Key::character('g', "shift"), "default"), "cursorLast", "a protocol terminal sends the modifier");
+    assert_eq!(map.action(&Key::character('f', ""), "default"), "search", "f is the search key");
+}
