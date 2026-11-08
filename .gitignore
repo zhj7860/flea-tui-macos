@@ -27,3 +27,18 @@ __pycache__/
 
 # Built macOS app bundle
 /dist
+
+# gitpush: Rust build artifacts (all crates)
+target/
+*.rlib
+*.rmeta
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.pdb
+*.dSYM/
+*.rs.bk
+*.profraw
