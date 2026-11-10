@@ -549,7 +549,7 @@ pub fn draw(
             out.push('│');
             out.push_str(&base);
         }
-        let index = filtered.as_ref().map_or(m.top + y, |rows| rows.get(y).copied().unwrap_or(usize::MAX));
+        let index = filtered.as_ref().map_or(m.top + y, |rows| rows.get(m.top + y).copied().unwrap_or(usize::MAX));
         if let Some(entry) = m.rows.get(&index) {
             let row_color = if index == m.cursor {
                 format!("{}\x1b[7m", theme.accent)
@@ -603,7 +603,7 @@ pub fn draw(
             } else {
                 out.push_str(&super::empty::line(y, body, middle, cell_pixels, elapsed));
             }
-        } else if filtered.as_ref().is_some_and(|rows| y == rows.len()) {
+        } else if filtered.as_ref().is_some_and(|rows| m.top + y == rows.len()) {
             let count = filtered.as_ref().unwrap().len();
             let note = if count == 0 { format!("Nothing matches {}", m.filter) }
                 else { hidden_note(m.rows.len() - count) };
@@ -888,7 +888,7 @@ pub fn menu_rows(m: &Model) -> Vec<String> {
     }
     let reason = m.taildrop.reason();
     let taildrop = if reason.is_empty() { "taildrop  ▶".into() } else { format!("taildrop · {}", reason) };
-    vec!["open".into(), "open path".into(), "copy path".into(), "remove".into(), if m.hidden { "hide hidden".into() } else { "show hidden".into() }, taildrop]
+    vec!["open".into(), "open path".into(), "copy file".into(), "copy path".into(), "remove".into(), if m.hidden { "hide hidden".into() } else { "show hidden".into() }, taildrop]
         .into_iter().skip(m.menu_top).collect()
 }
 pub fn panel_rows(m: &Model, map: &Map) -> Vec<String> {
@@ -994,18 +994,18 @@ mod tests {
         model.menu_top = 1;
         model.menu_cursor = 4;
         let rows = menu_rows(&model);
-        assert_eq!(rows, ["open path", "copy path", "remove", "show hidden", "taildrop  ▶"]);
+        assert_eq!(rows, ["open path", "copy file", "copy path", "remove", "show hidden", "taildrop  ▶"]);
         assert_eq!(overlay_rect(&rows, model.columns, model.height + CHROME_ROWS).3, 4);
         let mut output = String::new();
         overlay(&mut output, &rows, model.columns, model.height + CHROME_ROWS, "",
             Some(model.menu_cursor - model.menu_top), "open", None);
-        assert!(output.contains("\x1b[7m show hidden │"));
+        assert!(output.contains("\x1b[7m remove"));
         assert!(!output.contains("\x1b[7m taildrop"));
         assert!(output.contains("copy path"));
         model.hidden = true;
-        assert_eq!(menu_rows(&model), ["open path", "copy path", "remove", "hide hidden", "taildrop  ▶"]);
+        assert_eq!(menu_rows(&model), ["open path", "copy file", "copy path", "remove", "hide hidden", "taildrop  ▶"]);
         model.taildrop.error = "signed out".into();
-        assert_eq!(menu_rows(&model), ["open path", "copy path", "remove", "hide hidden", "taildrop · signed out"]);
+        assert_eq!(menu_rows(&model), ["open path", "copy file", "copy path", "remove", "hide hidden", "taildrop · signed out"]);
     }
 
     // A preview selection reads the drawn cells it covers, across lines and in either direction.
@@ -1064,11 +1064,11 @@ mod tests {
     #[test]
     fn the_row_actions_are_offered_together_and_never_alone() {
         let mut model = Model::new(std::path::PathBuf::from("/"), &crate::jsondoc::Json::Null);
-        assert!(!model.menu_enabled(0) && !model.menu_enabled(1) && !model.menu_enabled(2) && !model.menu_enabled(3));
-        assert!(model.menu_enabled(4), "the hidden-files toggle is always live");
+        assert!(!model.menu_enabled(0) && !model.menu_enabled(1) && !model.menu_enabled(2) && !model.menu_enabled(3) && !model.menu_enabled(4));
+        assert!(model.menu_enabled(5), "the hidden-files toggle is always live");
         model.menu_ready = true;
         model.menu_path = std::path::PathBuf::from("/tmp/a.txt");
-        assert!(model.menu_enabled(0) && model.menu_enabled(1) && model.menu_enabled(2) && model.menu_enabled(3));
+        assert!(model.menu_enabled(0) && model.menu_enabled(1) && model.menu_enabled(2) && model.menu_enabled(3) && model.menu_enabled(4));
     }
     #[test]
     fn counted_lines_read_singular_for_one_and_plural_for_many() {

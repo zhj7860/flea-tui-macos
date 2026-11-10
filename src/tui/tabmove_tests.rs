@@ -87,9 +87,9 @@ fn a_tenth_tab_is_refused_in_both_adding_arms() {
     model.tabs = (0..cap).map(|_| crate::tui::model::Tab { path: PathBuf::from("/listing"), cursor: 0, back: Vec::new(), forward: Vec::new() }).collect();
     model.tab = cap - 1;
     model.rows.insert(0, folder_row());
-    press(&mut model, &mut wire, &Key::character('t', ""));
-    assert_eq!(model.tabs.len(), cap, "t on a full strip adds nothing");
-    assert_eq!(model.message, "Nine tabs is the most", "t on a full strip says the cap");
+    press(&mut model, &mut wire, &Key::character('T', "ctrlshift"));
+    assert_eq!(model.tabs.len(), cap, "Ctrl+Shift+T on a full strip adds nothing");
+    assert_eq!(model.message, "Nine tabs is the most", "Ctrl+Shift+T on a full strip says the cap");
     model.message.clear();
     press(&mut model, &mut wire, &open_key());
     assert_eq!(model.tabs.len(), cap, "ctrl-return on a full strip adds nothing");
@@ -102,7 +102,7 @@ fn reorder_keys_move_the_current_tab_and_send_nothing() {
     let (mut wire, reader) = echo_wire();
     let mut model = Model::new(PathBuf::from("/listing"), &Json::Null);
     for _ in 0..2 {
-        press(&mut model, &mut wire, &Key::character('t', ""));
+        press(&mut model, &mut wire, &Key::character('T', "ctrlshift"));
         settle_open(&mut model, &mut wire);
     }
     assert_eq!(model.tabs.len(), 3, "two new tabs stand beside the first");

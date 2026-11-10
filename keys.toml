@@ -56,7 +56,7 @@ key = "L"
 action = "pathBar"
 
 # Opens the default terminal in the directory being shown, through flea --terminal
-# (xdg-terminal-exec --dir=). Ctrl+T is unbound elsewhere here, and bare t below is tabNew.
+# (xdg-terminal-exec --dir=). Ctrl+T is unbound elsewhere here; the terminal's new tab is Ctrl+Shift+T.
 [[ctrl]]
 key = "T"
 action = "openTerminal"
@@ -80,6 +80,47 @@ action = "reload"
 [[ctrl]]
 key = "Comma"
 action = "settings"
+
+# Every single letter and digit is typed text in the terminal: a bare printable character there
+# starts the folder filter, so no command may take one. The window keeps its vim letters (the
+# [[text]] rows below are frontend = "gui"), and every terminal command that used to ride a bare
+# letter has a chord here. Cursor movement, open, parent, page, rename, trash, copy, cut, paste,
+# undo, search, reload, path bar, terminal and eject keep the keys they already had.
+#
+#   Ctrl+O          menu                  (space above the listing)
+#   Ctrl+G          toggle this row's selection
+#   Ctrl+S          next sort order
+#   Ctrl+Shift+S    reverse the order
+#   Ctrl+Shift+O    reveal a search result in its folder
+#   Ctrl+Shift+T    new tab
+#   Ctrl+Left/Right back and forward through the history
+#   Ctrl+Q          quit the terminal
+[[ctrl]]
+key = "O"
+action = "menu"
+
+[[ctrl]]
+key = "G"
+action = "toggleSelect"
+
+[[ctrl]]
+key = "S"
+action = "sortNext"
+
+[[ctrl]]
+key = "Left"
+action = "historyBack"
+
+[[ctrl]]
+key = "Right"
+action = "historyForward"
+
+# The window has no Ctrl+Q of its own and closes from its own window, so the quit chord is the
+# terminal's alone.
+[[ctrl]]
+key = "Q"
+action = "quit"
+frontend = "tui"
 
 # Checked before the plain ctrl rows and falling through when unmatched, so Ctrl+Shift+D still
 # pages. Ctrl+Shift+N is Nautilus's own New Folder and Finder's with Cmd read as Ctrl, and the
@@ -137,6 +178,21 @@ action = "tabMoveRight"
 key = "C"
 action = "copyPath"
 
+# The three commands whose capital letter was their only key. A legacy terminal cannot tell
+# Ctrl+Shift+S from Ctrl+S, so the reverse order needs a terminal on the kitty keyboard protocol
+# (Ghostty, kitty, foot), which is what the terminal interface asks for at startup.
+[[ctrlshift]]
+key = "S"
+action = "sortReverse"
+
+[[ctrlshift]]
+key = "T"
+action = "tabNew"
+
+[[ctrlshift]]
+key = "O"
+action = "reveal"
+
 # Shift falls through instead of returning, because shift-modified letters already carry their
 # own capital text (see G below); this table only covers the arrow keys, which carry no text.
 # The preset overlay, the four-value chooser the Keys settings section walks: default, vim, mac and
@@ -155,6 +211,9 @@ action = "copyPath"
 # with no keyboard route to them at all, on a keyboard-first file manager. Default and Vim take the
 # spelling the Mac rows below already use, because only one preset is ever live and the two never
 # meet; the bare digits are tab1 through tab9, so a chord is the only free shape here.
+
+
+
 [[preset]]
 name = "default"
 mods = "ctrl"
@@ -162,6 +221,9 @@ key = "1"
 keys = "ctrl-1"
 action = "viewList"
 label = "list"
+
+
+
 
 [[preset]]
 name = "default"
@@ -171,6 +233,9 @@ keys = "ctrl-2"
 action = "viewColumns"
 label = "columns"
 
+
+
+
 [[preset]]
 name = "default"
 mods = "ctrl"
@@ -178,6 +243,9 @@ key = "3"
 keys = "ctrl-3"
 action = "viewGrid"
 label = "grid"
+
+
+
 
 [[preset]]
 name = "default"
@@ -187,6 +255,9 @@ keys = "ctrl-4"
 action = "viewDual"
 label = "dual pane"
 
+
+
+
 [[preset]]
 name = "vim"
 mods = "ctrl"
@@ -194,6 +265,9 @@ key = "1"
 keys = "ctrl-1"
 action = "viewList"
 label = "list"
+
+
+
 
 [[preset]]
 name = "vim"
@@ -203,6 +277,9 @@ keys = "ctrl-2"
 action = "viewColumns"
 label = "columns"
 
+
+
+
 [[preset]]
 name = "vim"
 mods = "ctrl"
@@ -210,6 +287,9 @@ key = "3"
 keys = "ctrl-3"
 action = "viewGrid"
 label = "grid"
+
+
+
 
 [[preset]]
 name = "vim"
@@ -221,6 +301,9 @@ label = "dual pane"
 
 # Finder's own chords, read with Cmd as Ctrl the way Omarchy's universal clipboard already delivers
 # them; ui/js/Keymap.js's shared ctrl table keeps only the chords both platforms agree on.
+
+
+
 [[preset]]
 name = "mac"
 mods = "ctrl"
@@ -228,6 +311,9 @@ key = "1"
 keys = "ctrl-1"
 action = "viewList"
 label = "list"
+
+
+
 
 [[preset]]
 name = "mac"
@@ -237,6 +323,9 @@ keys = "ctrl-2"
 action = "viewColumns"
 label = "columns"
 
+
+
+
 [[preset]]
 name = "mac"
 mods = "ctrl"
@@ -245,6 +334,9 @@ keys = "ctrl-3"
 action = "viewGrid"
 label = "grid"
 
+
+
+
 [[preset]]
 name = "mac"
 mods = "ctrl"
@@ -252,6 +344,9 @@ key = "4"
 keys = "ctrl-4"
 action = "viewDual"
 label = "dual pane"
+
+
+
 
 [[preset]]# Historical Ctrl navigation aliases remain additive.
 
@@ -262,6 +357,9 @@ keys = "ctrl-up"
 action = "parent"
 label = "up one level"
 
+
+
+
 [[preset]]# Historical Ctrl navigation aliases remain additive.
 
 name = "mac"
@@ -270,6 +368,9 @@ key = "Down"
 keys = "ctrl-down"
 action = "open"
 label = "open"
+
+
+
 
 [[preset]]# Historical Ctrl navigation aliases remain additive.
 
@@ -281,6 +382,9 @@ action = "trash"
 label = "move to Trash"
 
 # Finder's Connect to Server. Bare a stays a shared key, so the Windows preset loses only the chord.
+
+
+
 [[preset]]
 name = "mac"
 mods = "ctrl"
@@ -292,6 +396,9 @@ label = "connect to server"
 # Explorer's own chords. Backspace, Delete, F2, Ctrl+A, Ctrl+C/V/X, Ctrl+Z, Ctrl+F and Ctrl+Shift+N
 # are already in the shared tables because Finder and Explorer agree on them; these are the four
 # this product can honour where they differ.
+
+
+
 [[preset]]
 name = "windows"
 mods = "ctrl"
@@ -299,6 +406,9 @@ key = "H"
 keys = "ctrl-h"
 action = "toggleHidden"
 label = "hidden files"
+
+
+
 
 [[preset]]
 name = "windows"
@@ -308,6 +418,9 @@ keys = "ctrl-shift-1"
 action = "viewList"
 label = "list"
 
+
+
+
 [[preset]]
 name = "windows"
 mods = "ctrlshift"
@@ -316,6 +429,9 @@ keys = "ctrl-shift-2"
 action = "viewColumns"
 label = "columns"
 
+
+
+
 [[preset]]
 name = "windows"
 mods = "ctrlshift"
@@ -323,6 +439,9 @@ key = "3"
 keys = "ctrl-shift-3"
 action = "viewGrid"
 label = "grid"
+
+
+
 
 [[preset]]
 name = "windows"
@@ -428,38 +547,50 @@ key = "Right"
 action = "pageForward"
 
 # The character is authoritative for letters, so shift-g is distinguishable from g.
+#
+# Every row in this table is the window's own (`frontend = "gui"`): in the terminal a bare letter or
+# digit is typed text, the first keystroke of the folder filter, so no command takes one and every
+# command above reaches it through a chord instead.
 [[text]]
 char = "j"
+frontend = "gui"
 action = "cursorDown"
 
 [[text]]
 char = "k"
+frontend = "gui"
 action = "cursorUp"
 
 [[text]]
 char = "g"
+frontend = "gui"
 action = "cursorFirst"
 
 [[text]]
 char = "G"
+frontend = "gui"
 action = "cursorLast"
 
 # Decided 2026-09-01: the keymap sheet's own letters. Selection moved off x, which now cuts,
 # onto v, which is also the TUI board's visual-mode key.
 [[text]]
 char = "v"
+frontend = "gui"
 action = "toggleSelect"
 
 [[text]]
 char = "J"
+frontend = "gui"
 action = "extendDown"
 
 [[text]]
 char = "K"
+frontend = "gui"
 action = "extendUp"
 
 [[text]]
 char = "h"
+frontend = "gui"
 action = "parent"
 
 # Narrows the rows already listed, in place and with no round trip, in every view; ui/js/Focus.js
@@ -468,15 +599,11 @@ action = "parent"
 char = "/"
 action = "filter"
 
-# The TUI's search answers from Flea's whole-disk name index; the window's walks the subtree under
-# the current directory, where filter above narrows what is already listed.
-[[text]]
-char = "f"
-action = "search"
-
-# Only means something on a search result, so ui/js/Focus.js drops it everywhere else and o stays type-ahead.
+# Only means something on a search result, so ui/js/Focus.js drops it everywhere else; the terminal
+# reveals with Ctrl+Shift+O.
 [[text]]
 char = "o"
+frontend = "gui"
 action = "reveal"
 
 # The path bar's own key, the vim line-command colon it is drawn as on the Tui board. Ctrl+L above
@@ -487,55 +614,69 @@ action = "pathBar"
 
 [[text]]
 char = "t"
+frontend = "gui"
 action = "tabNew"
 
 # The Tags flyout's own key, from the listing; the seven digits toggle while that list is open.
 [[text]]
+# The window's own: this terminal has no tags, so the letter is typed text there.
+frontend = "gui"
 char = "T"
 action = "tags"
 
 # Swaps the preview column's compact facts line for the full table (ui.json previewFacts); a no-op unless that column is on screen.
 [[text]]
+# The window's own: this terminal has no facts, so the letter is typed text there.
+frontend = "gui"
 char = "i"
 action = "factsToggle"
 
 [[text]]
 char = "w"
+frontend = "gui"
 action = "tabClose"
 
 
 [[text]]
 char = "y"
+frontend = "gui"
 action = "copy"
 
 # The capital-is-the-variant shape g/G, j/J and s/S already use: y takes the file, Y takes the route.
 [[text]]
+# The window's own: this terminal has no the folder path, so the letter is typed text there.
+frontend = "gui"
 char = "Y"
 action = "copydirpath"
 
 [[text]]
 char = "x"
+frontend = "gui"
 action = "cut"
 
 [[text]]
 char = "p"
+frontend = "gui"
 action = "paste"
 
-# Two presses, because a single d sat in the middle of the letters a name is typed with and trashed
-# the row on the third keystroke of "Vid". Delete and Ctrl+Delete still go on one press.
+# The window's own two-press arm; the terminal keeps the bare d for typing and trashes on Delete,
+# which goes on one press (Ctrl+Delete is not bound).
 [[text]]
 char = "d"
+frontend = "gui"
 action = "trashArm"
 keys = "dd"
 
 [[text]]
 char = "r"
+frontend = "gui"
 action = "rename"
 
 # The canvas draws this on the keymap sheet and again in the status line after a trash ("z undoes"),
 # so it is the one key the shipped table was missing rather than a new invention.
 [[text]]
 char = "z"
+frontend = "gui"
 action = "undo"
 
 # The TUI board draws "s cycles, r reverses", but r is rename in both front ends and the canvas's
@@ -544,10 +685,12 @@ action = "undo"
 # see ui/js/Sort.js; the columns it cannot are refused on an aimed click instead.
 [[text]]
 char = "s"
+frontend = "gui"
 action = "sortNext"
 
 [[text]]
 char = "S"
+frontend = "gui"
 action = "sortReverse"
 
 [[text]]
@@ -556,6 +699,8 @@ action = "toggleHidden"
 
 # Opens the Network group's add-location popup; works from either the list or the rail.
 [[text]]
+# The window's own: this terminal has no a network place, so the letter is typed text there.
+frontend = "gui"
 char = "a"
 action = "addNetwork"
 
@@ -564,19 +709,26 @@ action = "addNetwork"
 # m is no longer a type-ahead letter; ui/js/Focus.js routes it by which view has focus.
 [[text]]
 char = "m"
+frontend = "gui"
 action = "menu"
 
 # MenuAdditions040: c opens Copy as at the cursor, P opens Paste as, and V
 # flips the selection; c, P and V work with the rows hidden, like every key.
 [[text]]
+# The window's own: this terminal has no Copy as, so the letter is typed text there.
+frontend = "gui"
 char = "c"
 action = "copyAs"
 
 [[text]]
+# The window's own: this terminal has no Paste as, so the letter is typed text there.
+frontend = "gui"
 char = "P"
 action = "pasteAs"
 
 [[text]]
+# The window's own: this terminal has no invert selection, so the letter is typed text there.
+frontend = "gui"
 char = "V"
 action = "invertSelection"
 
@@ -604,12 +756,15 @@ char = "+"
 action = "zoomIn"
 
 [[text]]
+# The window's own: this terminal has no expand, so the letter is typed text there.
+frontend = "gui"
 char = "e"
 action = "expand"
 
 # The page pair: h goes back in a PDF or to the parent while browsing; l goes forward, enters a directory, or previews a file.
 [[text]]
 char = "l"
+frontend = "gui"
 action = "pageForward"
 
 # Tabs040 callout 1: { and } move the current tab one place, the keys beside the
@@ -648,7 +803,7 @@ sheet = false
 [sheetgroups]
 move = ["cursorDown", "cursorUp", "cursorFirst", "cursorLast", "pageDown", "pageUp", "open",
         "parent", "pageForward", "historyBack", "historyForward", "focusNext", "focusPrevious", "focusPreview",
-        "tabNew", "openTab", "tabClose", "tabNext", "tabPrevious", "tabMoveLeft", "tabMoveRight", "windowNew", "escape"]
+        "tabNew", "openTab", "tabClose", "tabNext", "tabPrevious", "tabMoveLeft", "tabMoveRight", "windowNew", "escape", "quit"]
 look = ["viewList", "viewColumns", "viewGrid", "viewDual", "togglePreview", "factsToggle", "loadPreview", "preview", "previewPageForward", "previewPageBack",
         "toggleHidden", "sidebar", "zoomIn", "zoomOut", "expand", "mute", "textSizeUp", "textSizeDown",
         "textSizeReset", "keymapSheet"]
@@ -710,7 +865,7 @@ action = "filter"
 label = "filter"
 
 [[sheet]]
-keys = "f"
+keys = "^f"
 action = "search"
 label = "find"
 
@@ -767,9 +922,24 @@ action = "autofitColumns"
 label = "autofit columns"
 
 [[sheet]]
-keys = "dd"
-action = "trashArm"
+keys = "delete"
+action = "trash"
 label = "trash"
+
+[[sheet]]
+keys = "shift-delete"
+action = "deletePermanently"
+label = "delete for good"
+
+[[sheet]]
+keys = "^left"
+action = "historyBack"
+label = "back"
+
+[[sheet]]
+keys = "^right"
+action = "historyForward"
+label = "forward"
 
 [[sheet]]
 keys = "z ^z"
@@ -1104,6 +1274,9 @@ label = "open the place in a new tab"
 # mods=text compares the produced character; other modifiers match exactly.
 # Comma-separated contexts share controls only where focus scopes cannot overlap.
 
+
+
+
 [[preset]]
 name = "default"
 mods = "ctrl"
@@ -1113,6 +1286,9 @@ action = "windowNew"
 label = "new window"
 frontend = "gui"
 context = "listing,rail"
+
+
+
 
 [[preset]]
 name = "vim"
@@ -1124,6 +1300,9 @@ label = "new window"
 frontend = "gui"
 context = "listing,rail"
 
+
+
+
 [[preset]]
 name = "windows"
 mods = "ctrl"
@@ -1134,6 +1313,9 @@ label = "new window"
 frontend = "gui"
 context = "listing,rail"
 
+
+
+
 [[preset]]
 name = "mac"
 mods = "ctrl"
@@ -1143,6 +1325,9 @@ action = "tabNew"
 label = "new tab"
 frontend = "all"
 context = "listing,rail"
+
+
+
 
 [[preset]]
 name = "windows"
@@ -1156,6 +1341,9 @@ context = "listing,rail"
 
 # Every preset, #182: Shift+Delete is permanent delete in Finder, Explorer, Nautilus and Dolphin alike,
 # and it still goes through the same confirmation the menu row does.
+
+
+
 [[preset]]
 name = "all"
 mods = "shift"
@@ -1165,6 +1353,9 @@ action = "deletePermanently"
 label = "delete permanently"
 frontend = "all"
 context = "listing"
+
+
+
 
 [[preset]]
 name = "all"
@@ -1176,6 +1367,9 @@ label = "preview column"
 frontend = "all"
 context = "listing"
 
+
+
+
 [[preset]]
 name = "all"
 mods = "ctrl"
@@ -1185,6 +1379,9 @@ action = "loadPreview"
 label = "preview"
 frontend = "all"
 context = "listing"
+
+
+
 
 [[preset]]
 name = "all"
@@ -1196,6 +1393,9 @@ label = "close tab"
 frontend = "all"
 context = "listing,rail"
 
+
+
+
 [[preset]]
 name = "all"
 mods = "ctrl"
@@ -1205,6 +1405,9 @@ action = "tabNext"
 label = "next tab"
 frontend = "all"
 context = "listing,rail"
+
+
+
 
 [[preset]]
 name = "all"
@@ -1216,6 +1419,9 @@ label = "prev tab"
 frontend = "all"
 context = "listing,rail"
 
+
+
+
 [[preset]]
 name = "all"
 mods = "ctrl"
@@ -1226,6 +1432,9 @@ label = "focus preview"
 frontend = "all"
 context = "listing"
 
+
+
+
 [[preset]]
 name = "all"
 mods = "ctrl"
@@ -1235,6 +1444,9 @@ action = "copy"
 label = "copy"
 frontend = "tui"
 context = "listing"
+
+
+
 
 [[preset]]
 name = "all"
@@ -1249,6 +1461,9 @@ context = "listing"
 # H and L, not h and l: the character is authoritative for letters, and h and l are the shared
 # table's parent and browse-in. The cap has to spell what is bound or the sheet advertises a key
 # that does something else.
+
+
+
 [[preset]]
 name = "default"
 mods = "text"
@@ -1256,8 +1471,11 @@ key = "H"
 keys = "H"
 action = "historyBack"
 label = "back"
-frontend = "all"
+frontend = "gui"
 context = "listing"
+
+
+
 
 [[preset]]
 name = "vim"
@@ -1266,8 +1484,11 @@ key = "H"
 keys = "H"
 action = "historyBack"
 label = "back"
-frontend = "all"
+frontend = "gui"
 context = "listing"
+
+
+
 
 [[preset]]
 name = "default"
@@ -1276,8 +1497,11 @@ key = "L"
 keys = "L"
 action = "historyForward"
 label = "forward"
-frontend = "all"
+frontend = "gui"
 context = "listing"
+
+
+
 
 [[preset]]
 name = "vim"
@@ -1286,8 +1510,11 @@ key = "L"
 keys = "L"
 action = "historyForward"
 label = "forward"
-frontend = "all"
+frontend = "gui"
 context = "listing"
+
+
+
 
 [[preset]]
 name = "vim"
@@ -1296,8 +1523,11 @@ key = "y"
 keys = "yy"
 action = "copyArm"
 label = "copy"
-frontend = "all"
+frontend = "gui"
 context = "listing"
+
+
+
 
 [[preset]]
 name = "vim"
@@ -1306,8 +1536,11 @@ key = "d"
 keys = "dd"
 action = "cutArm"
 label = "cut"
-frontend = "all"
+frontend = "gui"
 context = "listing"
+
+
+
 
 [[preset]]
 name = "vim"
@@ -1316,8 +1549,11 @@ key = "p"
 keys = "pp"
 action = "pasteArm"
 label = "paste"
-frontend = "all"
+frontend = "gui"
 context = "listing"
+
+
+
 
 [[preset]]
 name = "vim"
@@ -1326,8 +1562,11 @@ key = "g"
 keys = "gg"
 action = "cursorFirstArm"
 label = "first row"
-frontend = "all"
+frontend = "gui"
 context = "listing"
+
+
+
 
 [[preset]]
 name = "vim"
@@ -1336,8 +1575,11 @@ key = "D"
 keys = "D"
 action = "trash"
 label = "move to Trash"
-frontend = "all"
+frontend = "gui"
 context = "listing"
+
+
+
 
 [[preset]]
 name = "vim"
@@ -1346,8 +1588,11 @@ key = "u"
 keys = "u"
 action = "undo"
 label = "undo"
-frontend = "all"
+frontend = "gui"
 context = "listing"
+
+
+
 
 [[preset]]
 name = "vim"
@@ -1356,8 +1601,11 @@ key = "l"
 keys = "l"
 action = "open"
 label = "open"
-frontend = "all"
+frontend = "gui"
 context = "listing"
+
+
+
 
 [[preset]]
 name = "mac"
@@ -1369,6 +1617,9 @@ label = "rename"
 frontend = "all"
 context = "listing"
 
+
+
+
 [[preset]]
 name = "mac"
 mods = "none"
@@ -1378,6 +1629,9 @@ action = "rename"
 label = "rename"
 frontend = "all"
 context = "listing"
+
+
+
 
 [[preset]]
 name = "mac"
@@ -1389,6 +1643,9 @@ label = "up one level"
 frontend = "all"
 context = "listing"
 
+
+
+
 [[preset]]
 name = "mac"
 mods = "none"
@@ -1398,6 +1655,9 @@ action = "open"
 label = "open"
 frontend = "all"
 context = "listing"
+
+
+
 
 [[preset]]
 name = "mac"
@@ -1409,6 +1669,9 @@ label = "Control+X is inert"
 frontend = "all"
 context = "listing"
 
+
+
+
 [[preset]]
 name = "mac"
 mods = "super"
@@ -1418,6 +1681,9 @@ action = "copy"
 label = "copy"
 frontend = "all"
 context = "listing"
+
+
+
 
 [[preset]]
 name = "mac"
@@ -1429,6 +1695,9 @@ label = "paste"
 frontend = "all"
 context = "listing"
 
+
+
+
 [[preset]]
 name = "mac"
 mods = "superalt"
@@ -1439,6 +1708,9 @@ label = "move here"
 frontend = "all"
 context = "listing"
 
+
+
+
 [[preset]]
 name = "mac"
 mods = "super"
@@ -1448,6 +1720,9 @@ action = "duplicate"
 label = "duplicate"
 frontend = "all"
 context = "listing"
+
+
+
 
 [[preset]]
 name = "mac"
@@ -1460,6 +1735,9 @@ frontend = "all"
 context = "listing"
 
 # Redo on the default preset. A legacy terminal sends Ctrl+Shift+Z as Ctrl+Z, so the TUI sees this chord only under the kitty keyboard protocol.
+
+
+
 [[preset]]
 name = "default"
 mods = "ctrlshift"
@@ -1469,6 +1747,9 @@ action = "redo"
 label = "redo"
 frontend = "all"
 context = "listing"
+
+
+
 
 [[preset]]
 name = "mac"
@@ -1480,6 +1761,9 @@ label = "redo"
 frontend = "all"
 context = "listing"
 
+
+
+
 [[preset]]
 name = "mac"
 mods = "super"
@@ -1489,6 +1773,9 @@ action = "selectAll"
 label = "select all"
 frontend = "all"
 context = "listing"
+
+
+
 
 [[preset]]
 name = "mac"
@@ -1500,6 +1787,9 @@ label = "get info"
 frontend = "all"
 context = "listing"
 
+
+
+
 [[preset]]
 name = "mac"
 mods = "super"
@@ -1509,6 +1799,9 @@ action = "windowNew"
 label = "new window"
 frontend = "gui"
 context = "listing,rail"
+
+
+
 
 [[preset]]
 name = "mac"
@@ -1520,6 +1813,9 @@ label = "back"
 frontend = "all"
 context = "listing"
 
+
+
+
 [[preset]]
 name = "mac"
 mods = "super"
@@ -1529,6 +1825,9 @@ action = "historyForward"
 label = "forward"
 frontend = "all"
 context = "listing"
+
+
+
 
 [[preset]]
 name = "mac"
@@ -1540,6 +1839,9 @@ label = "hidden files"
 frontend = "all"
 context = "listing"
 
+
+
+
 [[preset]]
 name = "mac"
 mods = "supershift"
@@ -1549,6 +1851,9 @@ action = "toggleHidden"
 label = "hidden files"
 frontend = "all"
 context = "listing"
+
+
+
 
 [[preset]]
 name = "windows"
@@ -1560,6 +1865,9 @@ label = "move to Trash"
 frontend = "all"
 context = "listing"
 
+
+
+
 [[preset]]
 name = "windows"
 mods = "ctrl"
@@ -1569,6 +1877,9 @@ action = "redo"
 label = "redo"
 frontend = "all"
 context = "listing"
+
+
+
 
 [[preset]]
 name = "windows"
@@ -1580,6 +1891,9 @@ label = "properties"
 frontend = "all"
 context = "listing"
 
+
+
+
 [[preset]]
 name = "windows"
 mods = "alt"
@@ -1589,6 +1903,9 @@ action = "properties"
 label = "properties"
 frontend = "all"
 context = "listing"
+
+
+
 
 [[preset]]
 name = "windows"
@@ -1600,6 +1917,9 @@ label = "back"
 frontend = "all"
 context = "listing"
 
+
+
+
 [[preset]]
 name = "windows"
 mods = "alt"
@@ -1609,6 +1929,9 @@ action = "historyForward"
 label = "forward"
 frontend = "all"
 context = "listing"
+
+
+
 
 [[preset]]
 name = "windows"
@@ -1620,6 +1943,9 @@ label = "up one level"
 frontend = "all"
 context = "listing"
 
+
+
+
 [[preset]]
 name = "all"
 mods = "none"
@@ -1629,6 +1955,9 @@ action = "escape"
 label = "escape"
 frontend = "all"
 context = "rail,menu,panel,preview,pdf,media"
+
+
+
 
 [[preset]]
 name = "all"
@@ -1641,6 +1970,9 @@ frontend = "all"
 context = "listing,rail"
 
 # ListColumns040: F4 fits every drawn list column, the keyboard twin of the header's double click (GUI only).
+
+
+
 [[preset]]
 name = "all"
 mods = "none"
@@ -1650,6 +1982,9 @@ action = "autofitColumns"
 label = "autofit columns"
 frontend = "gui"
 context = "listing"
+
+
+
 
 [[preset]]
 name = "all"
@@ -1661,6 +1996,9 @@ label = "context menu"
 frontend = "all"
 context = "listing,rail"
 
+
+
+
 [[preset]]
 name = "all"
 mods = "none"
@@ -1671,6 +2009,9 @@ label = "cursorDown"
 frontend = "all"
 context = "rail,menu,panel,preview,pdf,media"
 
+
+
+
 [[preset]]
 name = "all"
 mods = "none"
@@ -1680,6 +2021,9 @@ action = "cursorUp"
 label = "cursorUp"
 frontend = "all"
 context = "rail,menu,panel,preview,pdf,media"
+
+
+
 
 [[preset]]
 name = "all"
@@ -1693,6 +2037,9 @@ context = "rail,menu,panel,preview,media"
 
 # Space closes every preview now (decided 2026-09-11), so the media strip's play control needed a key of
 # its own: without one a keyboard-first file manager could only play and pause with the pointer.
+
+
+
 [[preset]]
 name = "all"
 mods = "text"
@@ -1705,6 +2052,9 @@ context = "media"
 
 # MediaMute rule 4: m mutes while a media preview is open, and keeps its listing meaning everywhere
 # else, which the media context is what makes possible.
+
+
+
 [[preset]]
 name = "all"
 mods = "text"
@@ -1714,6 +2064,9 @@ action = "mute"
 label = "mute"
 frontend = "all"
 context = "media"
+
+
+
 
 [[preset]]
 name = "all"
@@ -1725,6 +2078,9 @@ label = "cursorUp"
 frontend = "all"
 context = "rail,menu,panel,preview,media"
 
+
+
+
 [[preset]]
 name = "all"
 mods = "none"
@@ -1734,6 +2090,9 @@ action = "open"
 label = "open"
 frontend = "all"
 context = "rail,menu,panel,preview,pdf,media"
+
+
+
 
 [[preset]]
 name = "all"
@@ -1745,6 +2104,9 @@ label = "open"
 frontend = "all"
 context = "rail,menu,panel,preview,pdf,media"
 
+
+
+
 [[preset]]
 name = "all"
 mods = "none"
@@ -1754,6 +2116,9 @@ action = "preview"
 label = "preview"
 frontend = "all"
 context = "rail,menu,panel,preview,pdf,media"
+
+
+
 
 [[preset]]
 name = "all"
@@ -1765,6 +2130,9 @@ label = "focusNext"
 frontend = "all"
 context = "rail,menu,panel,preview,pdf,media"
 
+
+
+
 [[preset]]
 name = "all"
 mods = "shift"
@@ -1774,6 +2142,9 @@ action = "focusPrevious"
 label = "focus back"
 frontend = "all"
 context = "listing,rail,menu,panel,preview,pdf,media"
+
+
+
 
 [[preset]]
 name = "all"
@@ -1785,6 +2156,9 @@ label = "focus back"
 frontend = "all"
 context = "listing,rail,menu,panel,preview,pdf,media"
 
+
+
+
 [[preset]]
 name = "all"
 mods = "none"
@@ -1795,6 +2169,9 @@ label = "menuRight"
 frontend = "all"
 context = "menu"
 
+
+
+
 [[preset]]
 name = "all"
 mods = "none"
@@ -1804,6 +2181,9 @@ action = "parent"
 label = "parent"
 frontend = "all"
 context = "menu"
+
+
+
 
 [[preset]]
 name = "all"
@@ -1816,6 +2196,9 @@ frontend = "all"
 context = "menu"
 
 # The Tags flyout's own digits: while that list is open 1 to 7 toggle the tag they name.
+
+
+
 [[preset]]
 name = "all"
 mods = "text"
@@ -1825,6 +2208,9 @@ action = "tag1"
 label = "tag 1"
 frontend = "all"
 context = "menu"
+
+
+
 
 [[preset]]
 name = "all"
@@ -1836,6 +2222,9 @@ label = "tag 2"
 frontend = "all"
 context = "menu"
 
+
+
+
 [[preset]]
 name = "all"
 mods = "text"
@@ -1845,6 +2234,9 @@ action = "tag3"
 label = "tag 3"
 frontend = "all"
 context = "menu"
+
+
+
 
 [[preset]]
 name = "all"
@@ -1856,6 +2248,9 @@ label = "tag 4"
 frontend = "all"
 context = "menu"
 
+
+
+
 [[preset]]
 name = "all"
 mods = "text"
@@ -1865,6 +2260,9 @@ action = "tag5"
 label = "tag 5"
 frontend = "all"
 context = "menu"
+
+
+
 
 [[preset]]
 name = "all"
@@ -1876,6 +2274,9 @@ label = "tag 6"
 frontend = "all"
 context = "menu"
 
+
+
+
 [[preset]]
 name = "all"
 mods = "text"
@@ -1885,6 +2286,9 @@ action = "tag7"
 label = "tag 7"
 frontend = "all"
 context = "menu"
+
+
+
 
 [[preset]]
 name = "all"
@@ -1899,6 +2303,9 @@ context = "menu"
 # MenuAdditions040: each Copy as row's letter copies at once, and each Paste
 # as row's letter links at once. The letters work with key hints off and are
 # drawn only when key hints are on, like every menu hint.
+
+
+
 [[preset]]
 name = "all"
 mods = "text"
@@ -1908,6 +2315,9 @@ action = "copyPath"
 label = "copy path"
 frontend = "all"
 context = "menu"
+
+
+
 
 [[preset]]
 name = "all"
@@ -1919,6 +2329,9 @@ label = "copy name"
 frontend = "all"
 context = "menu"
 
+
+
+
 [[preset]]
 name = "all"
 mods = "text"
@@ -1928,6 +2341,9 @@ action = "copyStem"
 label = "copy name without extension"
 frontend = "all"
 context = "menu"
+
+
+
 
 [[preset]]
 name = "all"
@@ -1939,6 +2355,9 @@ label = "copy folder path"
 frontend = "all"
 context = "menu"
 
+
+
+
 [[preset]]
 name = "all"
 mods = "text"
@@ -1948,6 +2367,9 @@ action = "copyUri"
 label = "copy file URI"
 frontend = "all"
 context = "menu"
+
+
+
 
 [[preset]]
 name = "all"
@@ -1959,6 +2381,9 @@ label = "copy shell-quoted"
 frontend = "all"
 context = "menu"
 
+
+
+
 [[preset]]
 name = "all"
 mods = "text"
@@ -1968,6 +2393,9 @@ action = "pasteLink"
 label = "paste link"
 frontend = "all"
 context = "menu"
+
+
+
 
 [[preset]]
 name = "all"
@@ -1979,6 +2407,9 @@ label = "paste absolute link"
 frontend = "all"
 context = "menu"
 
+
+
+
 [[preset]]
 name = "all"
 mods = "text"
@@ -1988,6 +2419,9 @@ action = "pasteHardLink"
 label = "paste hard link"
 frontend = "all"
 context = "menu"
+
+
+
 
 [[preset]]
 name = "all"
@@ -1999,6 +2433,9 @@ label = "focus listing"
 frontend = "all"
 context = "preview,pdf,media"
 
+
+
+
 [[preset]]
 name = "all"
 mods = "none"
@@ -2008,6 +2445,9 @@ action = "seekBack"
 label = "seekBack"
 frontend = "all"
 context = "preview,pdf,media"
+
+
+
 
 [[preset]]
 name = "all"
@@ -2019,6 +2459,9 @@ label = "seekForward"
 frontend = "all"
 context = "preview,pdf,media"
 
+
+
+
 [[preset]]
 name = "all"
 mods = "text"
@@ -2028,6 +2471,9 @@ action = "seekBack"
 label = "seekBack"
 frontend = "all"
 context = "preview,pdf,media"
+
+
+
 
 [[preset]]
 name = "all"
@@ -2040,6 +2486,9 @@ frontend = "all"
 context = "preview,pdf,media"
 
 # Decided 2026-10-03: r flips the open Markdown Quick Look to source and back, and the listing's r stays rename (preview context only).
+
+
+
 [[preset]]
 name = "all"
 mods = "text"
@@ -2051,6 +2500,9 @@ frontend = "all"
 context = "preview"
 
 # w wraps the open code or text Quick Look and stays close tab in the listing (preview context only).
+
+
+
 [[preset]]
 name = "all"
 mods = "text"
@@ -2062,6 +2514,9 @@ frontend = "all"
 context = "preview"
 
 # Compare's overlay: y copies the whole patch, headers included, and the listing's y stays copy (preview context only).
+
+
+
 [[preset]]
 name = "all"
 mods = "text"
@@ -2072,6 +2527,9 @@ label = "copy patch"
 frontend = "all"
 context = "preview"
 
+
+
+
 [[preset]]
 name = "all"
 mods = "text"
@@ -2081,6 +2539,9 @@ action = "zoomOut"
 label = "zoomOut"
 frontend = "all"
 context = "preview,pdf"
+
+
+
 
 [[preset]]
 name = "all"
@@ -2093,6 +2554,9 @@ frontend = "all"
 context = "preview,pdf"
 
 # Media040 callout 3: 0 returns a Quick Look image to fit (image preview only; a PDF has no fit key).
+
+
+
 [[preset]]
 name = "all"
 mods = "text"
@@ -2103,6 +2567,9 @@ label = "zoomFit"
 frontend = "all"
 context = "preview"
 
+
+
+
 [[preset]]
 name = "all"
 mods = "text"
@@ -2112,6 +2579,9 @@ action = "expand"
 label = "expand"
 frontend = "all"
 context = "pdf"
+
+
+
 
 [[preset]]
 name = "all"
@@ -2125,6 +2595,9 @@ context = "editor"
 
 # Page the Columns preview while the listing keeps the keyboard.
 
+
+
+
 [[preset]]
 name = "all"
 mods = "text"
@@ -2134,6 +2607,9 @@ action = "previewPageForward"
 label = "page preview forward"
 frontend = "gui"
 context = "listing"
+
+
+
 
 [[preset]]
 name = "all"

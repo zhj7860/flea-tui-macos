@@ -2,18 +2,11 @@ use super::*;
 #[test]
 fn compiled_source_drives_text_and_native_ctrl() {
     let map = Map::load();
-    assert_eq!(
-        map.action(
-            &Key {
-                name: "J".into(),
-                text: "j".into(),
-                mods: "".into(),
-                pointer: None,
-            },
-            "default"
-        ),
-        "cursorDown"
-    );
+    // Every bare letter and digit is typed text in the terminal, so no row may answer one; the
+    // arrows carry the movement the vim letters used to.
+    assert_eq!(map.action(&Key::character('j', ""), "default"), "");
+    assert_eq!(map.action(&Key::character('1', ""), "default"), "");
+    assert_eq!(map.action(&Key::named("Down", ""), "default"), "cursorDown");
     assert_eq!(
         map.action(
             &Key {
@@ -55,8 +48,8 @@ fn contexts_share_only_declared_actions_and_sheet_matches_preset() {
         map.in_context(&Key::named("Insert", "ctrl"), "default", "editor"),
         ""
     );
-    assert_eq!(map.action(&Key::character('y', ""), "vim"), "copyArm");
-    assert!(map.sheet("vim").iter().any(|line| line.contains("yy")));
+    assert_eq!(map.action(&Key::character('y', ""), "vim"), "", "the vim letters are the window's");
+    assert!(map.sheet("vim").iter().any(|line| line.contains("open")));
     assert!(!map
         .sheet("default")
         .iter()
@@ -100,7 +93,8 @@ fn hints_name_the_shipped_keys_as_the_sheet_spells_them() {
     assert_eq!(hints.load_preview, "Ctrl+Space");
     assert_eq!(hints.delete_permanently, "Shift+Delete");
     assert_eq!(hints.trash, "Delete");
-    assert_eq!(map.chord("trashArm", "default", "listing").as_deref(), Some("d"));
+    assert_eq!(map.chord("trashArm", "default", "listing"), None, "no shipped key arms a trash here");
+    assert_eq!(map.chord("trash", "default", "listing").as_deref(), Some("Delete"));
     assert_eq!(map.chord("noSuchAction", "default", "listing"), None);
 }
 #[test]
@@ -138,14 +132,25 @@ action = "parent"
     assert_eq!(map.chord("parent", "default", "listing"), None, "the earlier Backspace row shadows this one");
 }
 
-// Under the kitty keyboard protocol Shift+s arrives as the base letter with the shift modifier (text
-// "s", mods "shift"), where a legacy terminal sends "S" with none. Both must reach the capital row.
+// Every printable character, capital or not, is typed text in the terminal: the vim rows, the
+// shifted capitals and the digits all belong to the window, and the commands are chords. Under the
+// kitty keyboard protocol a chord with Shift arrives as the base letter with both modifiers, which
+// is what lets Ctrl+Shift+S name the reverse order (a legacy terminal cannot tell it from Ctrl+S).
 #[test]
-fn a_shifted_text_reaches_the_capital_row_on_either_protocol() {
+fn bare_characters_are_text_and_the_commands_are_chords() {
     let map = Map::load();
-    assert_eq!(map.action(&Key::character('s', "shift"), "default"), "sortReverse", "Shift+s reverses the order");
-    assert_eq!(map.action(&Key::character('s', ""), "default"), "sortNext", "plain s still cycles");
-    assert_eq!(map.action(&Key::character('G', ""), "default"), "cursorLast", "a legacy terminal sends the capital byte");
-    assert_eq!(map.action(&Key::character('g', "shift"), "default"), "cursorLast", "a protocol terminal sends the modifier");
-    assert_eq!(map.action(&Key::character('f', ""), "default"), "search", "f is the search key");
+    for (key, mods) in [('s', ""), ('s', "shift"), ('S', ""), ('S', "shift"), ('d', ""), ('d', "shift")] {
+        assert_eq!(map.action(&Key::character(key, mods), "default"), "", "{key} with {mods:?} is typed text");
+    }
+    assert_eq!(map.action(&Key::character('S', "ctrl"), "default"), "sortNext", "Ctrl+S cycles the order");
+    assert_eq!(map.action(&Key::character('S', "ctrlshift"), "default"), "sortReverse", "Ctrl+Shift+S reverses it");
+    assert_eq!(map.action(&Key::character('G', "ctrl"), "default"), "toggleSelect", "Ctrl+G toggles the row");
+    assert_eq!(map.action(&Key::character('O', "ctrl"), "default"), "menu", "Ctrl+O opens the menu");
+    assert_eq!(map.action(&Key::character('Q', "ctrl"), "default"), "quit", "Ctrl+Q leaves");
+    assert_eq!(map.action(&Key::named("Left", "ctrl"), "default"), "historyBack", "Ctrl+Left walks back");
+    assert_eq!(map.action(&Key::named("Right", "ctrl"), "default"), "historyForward", "Ctrl+Right walks forward");
+    assert_eq!(map.action(&Key::character('F', "ctrl"), "default"), "search", "Ctrl+F is the search key");
+    assert_eq!(map.action(&Key::character('O', "ctrlshift"), "default"), "reveal", "Ctrl+Shift+O reveals a result");
+    assert_eq!(map.action(&Key::character('T', "ctrlshift"), "default"), "tabNew", "Ctrl+Shift+T opens a tab");
 }
+

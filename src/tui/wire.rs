@@ -172,6 +172,11 @@ mod tabmove_tests;
 #[path = "tabmenu_tests.rs"]
 mod tabmenu_tests;
 
+// Typing a letter into the filter, and the menu's Copy file row, over the same wire.
+#[cfg(test)]
+#[path = "typeahead_tests.rs"]
+mod typeahead_tests;
+
 // The model's status lines and faults, which also need the echo wire.
 #[cfg(test)]
 #[path = "words_tests.rs"]

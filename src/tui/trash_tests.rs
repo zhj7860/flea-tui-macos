@@ -1,6 +1,7 @@
 // Issue 133 through the real key path: on a GVFS mount every preset's trash keys reach no backend and say why.
 use super::sort_tests::{drain, press, requests};
 use super::*;
+use crate::tui::actions;
 use crate::tui::input::Key;
 use crate::tui::keymap::{Hints, Map};
 use crate::tui::model::Model;
@@ -15,14 +16,16 @@ fn key(name: &str, text: &str, mods: &str) -> Key {
     Key { name: name.into(), text: text.into(), mods: mods.into(), pointer: None }
 }
 
-// Every shipped way to trash, per preset, checked against the shipped map: dd, Delete, vim's D,
-// Windows' Ctrl+D and the Mac's Ctrl+Delete.
+// Every shipped way to trash, per preset, checked against the shipped map: Delete in every preset,
+// Windows' Ctrl+D and the Mac's Ctrl+Delete. No bare letter trashes any more, because a letter typed
+// alone is the folder filter's.
 fn trash_keys() -> Vec<(&'static str, Key)> {
     let keys = vec![
-        ("default", key("d", "d", "")),
         ("default", key("Delete", "", "")),
-        ("vim", key("D", "D", "")),
+        ("vim", key("Delete", "", "")),
+        ("windows", key("Delete", "", "")),
         ("windows", key("D", "", "ctrl")),
+        ("mac", key("Delete", "", "")),
         ("mac", key("Delete", "", "ctrl")),
     ];
     for (preset, pressed) in &keys {
@@ -98,15 +101,21 @@ action = "trash"
 "##);
     let (mut wire, reader) = echo_wire();
     let mut model = listing("/listing", "default", &mut wire);
-    press(&mut model, &mut wire, &key("d", "d", ""));
+    // The arm is no longer on a shipped key, so the prompt is driven from a table that still has one.
+    let arm = Map::parse(r##"
+[[text]]
+char = "d"
+action = "trashArm"
+"##);
+    actions::key(&mut model, &key("d", "d", ""), &arm, &mut wire).unwrap();
     assert_eq!(model.message, "Press d again to trash, or Delete on its own", "the shipped keys, and a status line takes no period");
     model.hints = Hints::new(&rebound, "default");
     model.key_arm.clear();
-    press(&mut model, &mut wire, &key("d", "d", ""));
+    actions::key(&mut model, &key("d", "d", ""), &arm, &mut wire).unwrap();
     assert_eq!(model.message, "Press d again to trash, or Backspace on its own", "a rebound trash key");
     model.hints.trash.clear();
     model.key_arm.clear();
-    press(&mut model, &mut wire, &key("d", "d", ""));
+    actions::key(&mut model, &key("d", "d", ""), &arm, &mut wire).unwrap();
     assert_eq!(model.message, "Press d again to trash", "no key left to name");
     finish(wire, reader);
     let (mut wire, reader) = echo_wire();

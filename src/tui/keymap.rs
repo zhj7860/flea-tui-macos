@@ -99,17 +99,20 @@ impl Map {
             return String::new();
         }
         for (kind, block) in &self.blocks {
-            let matches = if key.mods.is_empty() {
-                (kind == "text" && get(block, "char") == key.text && !key.text.is_empty())
-                    || (kind == "code" && get(block, "key") == key.name)
-            } else if key.mods == "shift" {
-                // Shift reaches a text row as a modifier on a protocol terminal, and as the capital
-                // byte on a legacy one; both name the same capital row.
-                (kind == "text" && get(block, "char") == text && !text.is_empty())
-                    || (kind == "code" && get(block, "key") == key.name)
-            } else {
-                kind == &key.mods && get(block, "key") == key.name
-            };
+            // A row scoped to the window is not this front end's: its key is unbound here, which is
+            // what lets a letter the window owns be typed text in the terminal.
+            let matches = get(block, "frontend") != "gui"
+                && (if key.mods.is_empty() {
+                    (kind == "text" && get(block, "char") == key.text && !key.text.is_empty())
+                        || (kind == "code" && get(block, "key") == key.name)
+                } else if key.mods == "shift" {
+                    // Shift reaches a text row as a modifier on a protocol terminal, and as the
+                    // capital byte on a legacy one; both name the same capital row.
+                    (kind == "text" && get(block, "char") == text && !text.is_empty())
+                        || (kind == "code" && get(block, "key") == key.name)
+                } else {
+                    kind == &key.mods && get(block, "key") == key.name
+                });
             if matches {
                 return get(block, "action").into();
             }
@@ -126,36 +129,47 @@ impl Map {
             .map(|(name, key)| spell(&key, name))
     }
     pub fn sheet(&self, preset: &str) -> Vec<String> {
+        // Every key is resolved once and grouped by the action it answers: the sheet used to rescan
+        // the whole table for each of its rows, which froze the key for about a second on the full
+        // table. The order of the chords inside a row is still the table's own.
+        let mut by_action: HashMap<String, Vec<String>> = HashMap::new();
+        for (kind, block) in &self.blocks {
+            let Some((name, key)) = block_key(kind, block) else {
+                continue;
+            };
+            let found = self.action(&key, preset);
+            if found.is_empty() {
+                continue;
+            }
+            let chord = format!(
+                "{}{}",
+                spell(&key, name),
+                if found.ends_with("Arm") { name } else { "" }
+            );
+            let keys = by_action.entry(canonical(&found).to_string()).or_default();
+            if !keys.contains(&chord) {
+                keys.push(chord);
+            }
+        }
         let mut rows = Vec::new();
         for (_, label) in self.blocks.iter().filter(|(kind, _)| kind == "sheet") {
             let action = get(label, "action");
             if !supported(action) {
                 continue;
             }
-            let mut keys = Vec::new();
-            for (kind, block) in &self.blocks {
-                let Some((name, key)) = block_key(kind, block) else {
-                    continue;
-                };
-                let found = self.action(&key, preset);
-                if canonical(&found) != action {
-                    continue;
-                }
-                let chord = format!(
-                    "{}{}",
-                    spell(&key, name),
-                    if found.ends_with("Arm") { name } else { "" }
-                );
-                if !keys.contains(&chord) {
-                    keys.push(chord);
-                }
+            let Some(keys) = by_action.get(action) else {
+                continue;
+            };
+            if keys.is_empty() {
+                continue;
             }
-            if !keys.is_empty() {
-                rows.push(format!("{}  {}", keys.join(" / "), get(label, "label")));
-            }
+            rows.push(format!("{}  {}", keys.join(" / "), get(label, "label")));
         }
-        rows.push("1–9  Select tab".into());
-        rows.push("q  Quit".into());
+        // The terminal's own tail: leaving is a chord here, because a bare letter is typed text, so it
+        // is read from the map rather than written. The Tab key and the strip's own rows cover tabs.
+        if let Some(chord) = self.chord("quit", preset, "listing") {
+            rows.push(format!("{chord}  Quit"));
+        }
         rows
     }
 }

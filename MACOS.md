@@ -119,10 +119,11 @@ instead.
 
 ## Tabs
 
-`t` opens a tab on the folder on screen, `w` or `Ctrl+W` closes the current one, and `1` to `9`
-switch; closing the last tab closes Flea. A **right-click on a tab** opens the strip's own menu —
-**Close Tab**, **Close Other Tabs** and **New Tab** — with `Tab`/arrows and Enter, Escape to
-dismiss. Closing a tab other than the current one leaves the pane where it is; closing the current
+`Ctrl+Shift+T` opens a tab on the folder on screen and `Ctrl+W` closes the current one; `[` and `]`
+(or `Ctrl+PageUp`/`Ctrl+PageDown`) step between them, and closing the last tab closes Flea. A digit
+types into the folder filter like any other character, so the strip has no digit jumps. A
+**right-click on a tab** opens the strip's own menu — **Close Tab**, **Close Other Tabs** and
+**New Tab** — with `Tab`/arrows and Enter, Escape to dismiss. Closing a tab other than the current one leaves the pane where it is; closing the current
 one opens its neighbour.
 
 ## Terminal entry
@@ -144,15 +145,56 @@ without AppleScript automation permission, which this port does not request.
 
 ## The menu
 
-`m` opens the menu on the row under the cursor: **open**, **open path**, **copy path**,
-**remove**, **show hidden** (or **hide hidden**) and **taildrop**. **open path** reveals the item
+`Ctrl+O` opens the menu on the row under the cursor: **open**, **open path**, **copy file**,
+**copy path**, **remove**, **show hidden** (or **hide hidden**) and **taildrop**. **copy file**
+is the `Ctrl+C` copy on that row (or the marked selection): the files and their paths go on the
+system pasteboard. **open path** reveals the item
 where the desktop keeps it rather than opening the file: Finder selects it on macOS
 (`open -R <path>`), and on other systems the folder it lives in is handed to the desktop's
-handler, since `gio` has no reveal. **remove** is the `dd` trash on the row (or the marked
+handler, since `gio` has no reveal. **remove** is the `Delete` trash on the row (or the marked
 selection): it is undoable with `Ctrl+Z`, and on macOS it moves the item to the freedesktop Trash
-under `~/.local/share/Trash`, not Finder's `~/.Trash`. The first four rows need a row under the
+under `~/.local/share/Trash`, not Finder's `~/.Trash`. The first five rows need a row under the
 cursor, the hidden-files toggle never does, and Taildrop needs a selected row and a reachable
 device.
+
+## Typing filters the folder
+
+`/` opens the filter line on the folder on screen, and so does **any single letter or digit typed on
+its own**. Every printable character belongs to the text here: no command is bound to one, so the
+window keeps the vim letters on its own side (`frontend = "gui"` in `keys.toml`) and the terminal
+reaches every command through a chord or a non-text key. Typing `b` opens the line with `b` in it
+and narrows the listing at once, the letters after it narrow further, `Backspace` erases, `Esc`
+clears the filter and closes the line, and `Enter` keeps the filter and hands the keys back to the
+listing. The status line counts what the filter hides (`3 rows hidden by the filter`).
+
+**The filter covers the whole folder, not the screenful.** Its first keystroke reads the listing once
+(one `window` from row 0, up to 100,000 rows) and every name in it is matched, so a match past the
+page still answers and a filtered list longer than the screen scrolls with the arrows, `Home` and
+`End`. The read is one request for the whole filter, not one per keystroke; `Esc` puts the screenful
+back. A search page is the exception: its rows come from the walk's own ranking, so filtering there
+narrows what the page holds.
+
+| | |
+|---|---|
+| move, page, first/last | arrows, `PageUp`/`PageDown`, `Home`/`End` |
+| open, parent, browse in | `Enter`, `Backspace` or `Left`, `Right` |
+| preview | `Space` (`Esc` closes it) |
+| rename, trash, delete for good | `F2`, `Delete`, `Shift+Delete` |
+| copy, cut, paste | `Ctrl+C`, `Ctrl+X`, `Ctrl+V` |
+| undo, redo | `Ctrl+Z`, `Ctrl+Shift+Z` or `Ctrl+Y` |
+| select, extend | `Ctrl+G`, `Shift+Up`/`Shift+Down`, `Ctrl+A` |
+| sort, reverse, hidden | `Ctrl+S`, `Ctrl+Shift+S`, `.` or `Ctrl+Shift+.` |
+| menu | `Ctrl+O` |
+| search | `Ctrl+F` (`Tab` cycles its scope) |
+| filter, path bar, keys sheet | `/`, `Ctrl+L` or `:`, `?` |
+| reload, terminal, eject | `Ctrl+R` or `F5`, `Ctrl+T`, `Ctrl+E` |
+| tabs | `Ctrl+Shift+T`, `Ctrl+W`, `[`/`]`, `Ctrl+PageUp`/`Ctrl+PageDown` |
+| history | `Ctrl+Left`, `Ctrl+Right` |
+| reveal a search result | `Ctrl+Shift+O` |
+| quit | `Ctrl+Q` |
+
+Inside a menu the letters it draws (`p`, `n`, `e` …) still pick rows, and the tags flyout's `1` to
+`7` still toggle a tag: a menu is modal, and nothing typed there can narrow a folder.
 
 ## The mouse
 
@@ -165,9 +207,9 @@ the listing.
 
 ## Copy and paste
 
-`Ctrl+C` / `y` puts the selected files on the macOS pasteboard **both as a file list and as their
+`Ctrl+C` puts the selected files on the macOS pasteboard **both as a file list and as their
 paths as text**: Finder, the Desktop and every file-aware application paste the files, and a text
-field pastes the paths. `Ctrl+X` / `x` cuts and `Ctrl+V` / `p` pastes files into the folder on
+field pastes the paths. `Ctrl+X` cuts and `Ctrl+V` pastes files into the folder on
 screen. The paths also stay in the session, so the same keys work with no pasteboard at all.
 
 The pasteboard is written through AppleScriptObjC — a small `osascript` script kept at
@@ -187,9 +229,9 @@ Flea reads, at the cost of the terminal's own copy and paste on those chords.
 
 ## Search results
 
-The **f** page's results are a listing of their own, so the row menu and the clipboard keys
-work there exactly as in a folder: `m` opens open / open path / copy path / remove / show hidden /
-taildrop on the row under the cursor, `Ctrl+C` / `Ctrl+X` put the result paths on the pasteboard,
+The search page's results are a listing of their own, so the row menu and the clipboard keys
+work there exactly as in a folder: `Ctrl+O` opens open / open path / copy file / copy path / remove /
+show hidden / taildrop on the row under the cursor, `Ctrl+C` / `Ctrl+X` put the result paths on the pasteboard,
 and the menu's **remove** trashes a result (undoable with `Ctrl+Z`). `Ctrl+V` in the page pastes
 into the folder the search began in, since the page's own listing base is the filesystem root
 (`/`); `show hidden` re-runs the query with hidden rows included instead of leaving the page.
@@ -223,7 +265,7 @@ arrive, so a write by row would name another file by the time it ran.
 
 ## Whole-Mac search, indexed by Flea itself
 
-**f** opens a **search page** of its own in the TUI, and its scope is always **every disk**: the
+**Ctrl+F** opens a **search page** of its own in the TUI, and its scope is always **every disk**: the
 answer comes from Flea's own name index, never from walking the folder on screen. The page has a
 heading row — **Name, Path, Modified** — and every result draws exactly those three columns: the
 file's own name, the folder holding it, and its age in the listing's own short form (`12 min`,
@@ -264,7 +306,7 @@ name index, and it is also the answer on a box where Spotlight is switched off (
   **Down**, **PageUp** and **PageDown** walk the results while the line is still open — the view
   follows the cursor, and Home/End stay the field's own — so a query never has to be "committed"
   before it can be browsed. Enter only closes the line — it never asks twice for an answer already
-  drawn — and the page keeps its heading and rows, so `j`, Enter and `m` act on the results. **f**
+  drawn — and the page keeps its heading and rows, so the arrows, Enter and `Ctrl+O` act on the results. **Ctrl+F**
   again reopens the line on the running query; erasing it leaves the page blank with a hint;
   **Escape** leaves the page and puts the folder it was opened from back. Opening a folder from the results
   is an ordinary navigation and leaves the page too.
@@ -308,10 +350,11 @@ name index, and it is also the answer on a box where Spotlight is switched off (
   newlines, keeps the cells the drag covered, and a plain click clears the selection. Nothing is
   editable: the same cells a terminal's own selection would take, taken by Flea because mouse
   reporting belongs to the TUI. A new preview, a scroll or a resize drops the selection.
-- **`m` on a result opens the same menu a listing row does**, and its second row, **copy path**,
-  puts the cursor row's absolute path on the system clipboard as plain text — `pbcopy` on a Mac,
-  `wl-copy` on a Wayland session — and says so in the status line, even while the search line
-  is showing. It is text, not a file copy: paste it into a terminal or an editor.
+- **`Ctrl+O` on a result opens the same menu a listing row does.** **copy file** puts the row's files
+  on the pasteboard the way `Ctrl+C` does, and **copy path** puts the cursor row's absolute path
+  there as plain text — `pbcopy` on a Mac, `wl-copy` on a Wayland session — and says so in the
+  status line, even while the search line is showing. The path is text, not a file copy: paste it
+  into a terminal or an editor.
 - A reload (`F5`) repeats the same whole-disk search with its folder filter; it never falls back
   to walking the folder the answer's base names.
 
@@ -359,7 +402,7 @@ than misbehaving:
 ## Testing on macOS
 
 ```bash
-cargo test --bin flea tui::                    # 134 pass: rendering, input, model, keymap
+cargo test --bin flea tui::                    # 156 pass: rendering, input, model, keymap, type-ahead
 cargo test --bin flea backend::watch           # kqueue watch semantics
 cargo test --bin flea backend::peekwatch       # column watches
 cargo test --bin flea backend::mountinfo       # Darwin mount-line parser

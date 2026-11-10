@@ -61,14 +61,14 @@ pub fn key(model: &mut Model, key: &Key, map: &Map, wire: &mut Wire) -> io::Resu
         let count = if model.taildrop.submenu {
             model.taildrop.peers.len().max(1)
         } else {
-            6
+            7
         };
         let action = map.in_context(key, &model.preset, "menu");
         match action.as_str() {
             "escape" | "parent" => {
                 if model.taildrop.submenu {
                     model.taildrop.submenu = false;
-                    model.menu_cursor = 5;
+                    model.menu_cursor = 6;
                     model.menu_top = 0;
                 } else {
                     model.menu = false;
@@ -99,7 +99,7 @@ pub fn key(model: &mut Model, key: &Key, map: &Map, wire: &mut Wire) -> io::Resu
                     }
                     return Ok(());
                 }
-                if model.menu_cursor == 5 {
+                if model.menu_cursor == 6 {
                     if model.taildrop.peers.is_empty() {
                         model.fail(if model.taildrop.loading() {
                             "Taildrop is still loading".into()
@@ -125,8 +125,9 @@ pub fn key(model: &mut Model, key: &Key, map: &Map, wire: &mut Wire) -> io::Resu
                         return wire.send(vec![("c", word("menuaction")), ("op", word("validate")), ("id", super::wire::number(model.action_id)), ("action", word("open"))]);
                     }
                     1 => return open_path(model),
-                    2 => return copy_path(model),
-                    3 => return act(model, "trash", wire),
+                    2 => return act(model, "copy", wire),
+                    3 => return copy_path(model),
+                    4 => return act(model, "trash", wire),
                     _ => {
                         model.menu_action.clear();
                         return act(model, "toggleHidden", wire);
@@ -234,13 +235,8 @@ pub fn key(model: &mut Model, key: &Key, map: &Map, wire: &mut Wire) -> io::Resu
     if key.name == "Paste" {
         return Ok(());
     }
-    if key.mods.is_empty() && key.text.len() == 1 {
-        if let Ok(n) = key.text.parse::<usize>() {
-            if (1..=9).contains(&n) {
-                return tab(model, n - 1, wire);
-            }
-        }
-    }
+    // No digit switches a tab: a bare digit is typed text like any other printable character, and the
+    // strip answers to [ and ], Ctrl+PageUp/PageDown and its own clicks.
     if key.name == "PageDown" && key.mods == "ctrl" {
         return tab(model, (model.tab + 1) % model.tabs.len(), wire);
     }
@@ -296,13 +292,13 @@ pub fn key(model: &mut Model, key: &Key, map: &Map, wire: &mut Wire) -> io::Resu
         if !key.mods.is_empty() {
             return Ok(());
         }
+        // Every bare letter and digit starts the filter, the way `/` does, so a name typed on its own
+        // narrows the folder before any chord is needed. No command is bound to one: the terminal's
+        // keys.toml rows all carry a modifier, and the window keeps the vim letters on its own side.
+        // Esc clears what was typed exactly as it does for `/`.
         match key.text.as_str() {
-            "q" => model.quit = true,
-            "H" if matches!(model.preset.as_str(), "default" | "vim") => {
-                history(model, false, wire)?
-            }
-            "L" if matches!(model.preset.as_str(), "default" | "vim") => {
-                history(model, true, wire)?
+            text if typed_letter(text) && model.pending.is_none() => {
+                return start_filter(model, text, wire);
             }
             _ => {}
         }
@@ -356,12 +352,20 @@ fn act(m: &mut Model, action: &str, w: &mut Wire) -> io::Result<()> {
         "pageDown" => m.move_by(m.height as isize, false, w)?,
         "pageUp" => m.move_by(-(m.height as isize), false, w)?,
         "first" | "cursorFirst" => {
-            m.cursor = 0;
-            m.window(w)?;
+            if m.filter.is_empty() {
+                m.cursor = 0;
+                m.window(w)?;
+            } else {
+                m.edge(false);
+            }
         }
         "last" | "cursorLast" => {
-            m.cursor = m.total.saturating_sub(1);
-            m.window(w)?;
+            if m.filter.is_empty() {
+                m.cursor = m.total.saturating_sub(1);
+                m.window(w)?;
+            } else {
+                m.edge(true);
+            }
         }
         "parent" => {
             if let Some(p) = m.path.parent().map(|p| p.to_path_buf()) {
@@ -483,6 +487,8 @@ fn act(m: &mut Model, action: &str, w: &mut Wire) -> io::Result<()> {
             }
         }
         "undo" | "redo" => w.send(vec![("c", word(action))])?,
+        // F5 and Ctrl+R: a search repeats itself with its folder filter, a folder lists again.
+        "reload" => m.refresh(w)?,
         "deletePermanently" => {
             m.action_id = m.action_id.wrapping_add(1).max(1);
             m.menu_action = "deleteSnapshot".into();
@@ -598,7 +604,7 @@ fn act(m: &mut Model, action: &str, w: &mut Wire) -> io::Result<()> {
             m.menu = true;
             // Without a row under the cursor the first two rows are dead, so the cursor starts on
             // the hidden-files toggle rather than on Open.
-            m.menu_cursor = if m.rows.contains_key(&m.cursor) { 0 } else { 4 };
+            m.menu_cursor = if m.rows.contains_key(&m.cursor) { 0 } else { 5 };
             m.menu_top = 0;
             m.taildrop.submenu = false;
             m.taildrop.refresh();
@@ -663,6 +669,7 @@ fn act(m: &mut Model, action: &str, w: &mut Wire) -> io::Result<()> {
                 m.dismiss_error();
             } else if !m.filter.is_empty() {
                 m.apply_filter(String::new());
+                m.window(w)?;
             } else if m.search_page || m.searching || !m.search.is_empty() {
                 // Leaving the page: stop the walk that is still out, then put the folder back.
                 if m.searching {
@@ -919,7 +926,7 @@ fn pointer_key(
     let index = if m.filter.is_empty() {
         m.top + pointer.y - super::render::BODY_ROW
     } else {
-        m.shown().get(pointer.y - super::render::BODY_ROW).copied().unwrap_or(usize::MAX)
+        m.shown().get(m.top + pointer.y - super::render::BODY_ROW).copied().unwrap_or(usize::MAX)
     };
     if !m.rows.contains_key(&index) {
         return Ok(());
@@ -1193,6 +1200,23 @@ fn save_preview_column(m: &mut Model) {
         m,
     );
 }
+// One printable character with no chord: the shape a typed letter or digit arrives in from either
+// keyboard protocol (legacy sends the capital with no modifier, kitty sends the base letter and Shift).
+fn typed_letter(text: &str) -> bool {
+    let mut chars = text.chars();
+    match (chars.next(), chars.next()) {
+        // Letters and digits both: neither is a shortcut here, so both start the filter.
+        (Some(c), None) => c.is_alphanumeric(),
+        _ => false,
+    }
+}
+// Starts the filter on the character just typed; the editor's own path then narrows live, and Esc
+// clears what was typed exactly as it does for `/`.
+fn start_filter(m: &mut Model, text: &str, wire: &mut Wire) -> io::Result<()> {
+    m.editor = Some(Editor::new("filter", text.to_string(), m.path.clone()));
+    m.apply_filter(text.to_string());
+    m.widen(wire)
+}
 fn edit(m: &mut Model, key: &Key, w: &mut Wire) -> io::Result<()> {
     let mut editor = m.editor.take().unwrap();
     let kind = editor.kind;
@@ -1204,6 +1228,7 @@ fn edit(m: &mut Model, key: &Key, w: &mut Wire) -> io::Result<()> {
     if key.name == "Escape" {
         if kind == "filter" {
             m.apply_filter(String::new());
+            m.window(w)?;
         }
         if kind == "search" {
             m.live_pending = false;
@@ -1267,6 +1292,11 @@ fn edit(m: &mut Model, key: &Key, w: &mut Wire) -> io::Result<()> {
     }
     if kind == "filter" {
         m.apply_filter(editor.value.clone());
+        if editor.value.is_empty() {
+            m.window(w)?;
+        } else {
+            m.widen(w)?;
+        }
     }
     if kind == "path" {
         m.completion = m.completer.request(&editor.value, &editor.path);

@@ -99,7 +99,7 @@ def generate(data):
                 fail(f'shared listing key {caps(mods, key)} claims {seen[key]} and {row["action"]}')
             seen[key] = row['action']
             shared.append(dict(name='all', mods=mods, key=key, keys=row.get('keys', caps(mods, key)),
-                               action=row['action'], context='listing', frontend='all',
+                               action=row['action'], context='listing', frontend=row.get('frontend', 'all'),
                                **({} if row.get('sheet', True) else {'sheet': False})))
     lines = ['.pragma library', '', '// Generated from keys.toml by tools/flea-keymap-gen. Do not edit.']
     def emit(name, value):

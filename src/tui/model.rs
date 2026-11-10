@@ -4,6 +4,11 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 use std::path::PathBuf;
 
+// Rows one filtered view reads at once. A filter matches names the listing has not sent yet, so the
+// whole listing is read once; past this the filter reports how many rows it scanned rather than
+// spending a million-entry folder's whole stat pass on one keystroke.
+const FILTER_ROWS: usize = 100_000;
+
 #[derive(Clone)]
 pub struct Row {
     pub name: String,
@@ -149,6 +154,9 @@ pub struct Model {
     pub media_probe: Option<(usize, usize, usize)>,
     pub thumb_index: Option<usize>,
     pub filter: String,
+    // A filtered view matches names the listing has not sent yet, so opening one reads the whole
+    // listing; set while that read is out.
+    pub widening: bool,
     pub restore_cursor: Option<usize>,
     pub restore_path: Option<PathBuf>,
     // Set by a re-sort press, kept across its replies, spent by a cursor move, a new listing request or a -1 answer.
@@ -295,6 +303,7 @@ impl Model {
             media_probe: None,
             thumb_index: None,
             filter: String::new(),
+            widening: false,
             restore_cursor: None,
             restore_path: None,
             sort_anchor: None,
@@ -599,9 +608,9 @@ impl Model {
     pub fn menu_enabled(&self, index: usize) -> bool {
         if self.taildrop.submenu { return self.menu_ready && !self.taildrop.loading() && index < self.taildrop.peers.len(); }
         match index {
-            0 | 1 | 2 | 3 => self.menu_ready && !self.menu_path.as_os_str().is_empty(),
-            4 => true,
-            5 => self.menu_ready && self.menu_count > 0 && !self.taildrop.loading() && !self.taildrop.peers.is_empty(),
+            0 | 1 | 2 | 3 | 4 => self.menu_ready && !self.menu_path.as_os_str().is_empty(),
+            5 => true,
+            6 => self.menu_ready && self.menu_count > 0 && !self.taildrop.loading() && !self.taildrop.peers.is_empty(),
             _ => false,
         }
     }
@@ -655,12 +664,75 @@ impl Model {
             .collect()
     }
     pub fn apply_filter(&mut self, query: String) {
+        let leaving = query.is_empty();
         self.filter = query;
         let shown = self.shown();
         self.selected.retain(|i| shown.contains(i));
         if !shown.contains(&self.cursor) {
-            self.cursor = shown.first().copied().unwrap_or(self.top);
+            self.cursor = shown.first().copied().unwrap_or(0);
+            self.top = 0;
         }
+        if leaving {
+            // Back to listing rows: `top` counts rows again, and window() clamps it around the cursor.
+            self.widening = false;
+            self.top = self.cursor;
+        } else {
+            self.reveal_shown(&shown);
+        }
+    }
+    // A filtered view matches names the listing has not sent yet, so it reads the whole listing once,
+    // from row 0 and capped, instead of only the screenful it holds. A search page answers from its
+    // walk's own index, so it keeps the rows it has and is never widened.
+    pub fn widen(&mut self, wire: &mut Wire) -> io::Result<()> {
+        if self.widening
+            || self.pending.is_some()
+            || self.search_page
+            || !self.search.is_empty()
+            || self.total == 0
+            || self.rows.len() >= self.total
+        {
+            return Ok(());
+        }
+        self.widening = true;
+        let count = self.total.min(FILTER_ROWS);
+        wire.send(vec![("c", word("window")), ("start", number(0)), ("count", number(count))])
+    }
+    // Puts the first match on screen around the cursor; under a filter `top` counts matches, not rows.
+    pub(crate) fn reveal_shown(&mut self, shown: &[usize]) {
+        let height = self.height.max(1);
+        let pos = shown.iter().position(|i| *i == self.cursor).unwrap_or(0);
+        if pos < self.top {
+            self.top = pos;
+        }
+        if pos >= self.top + height {
+            self.top = pos + 1 - height;
+        }
+        self.top = self.top.min(shown.len().saturating_sub(1));
+    }
+    // Home and End under a filter land on the first and last match, never on a row the filter hid.
+    pub fn edge(&mut self, last: bool) {
+        let shown = self.shown();
+        let edge = if last { shown.last() } else { shown.first() };
+        if let Some(&index) = edge {
+            self.cursor = index;
+            self.reveal_shown(&shown);
+        }
+    }
+    // The reply that lands a widening re-clamps the cursor, because the filter ran before the rows did.
+    pub fn landed_widen(&mut self) {
+        if !self.widening {
+            return;
+        }
+        self.widening = false;
+        if self.filter.is_empty() {
+            return;
+        }
+        let shown = self.shown();
+        if !shown.contains(&self.cursor) {
+            self.cursor = shown.first().copied().unwrap_or(0);
+            self.top = 0;
+        }
+        self.reveal_shown(&shown);
     }
     pub fn indices(&self) -> Json {
         Json::Arr(if self.selected.is_empty() {
@@ -727,6 +799,7 @@ impl Model {
             if extend {
                 self.selected.insert(self.cursor);
             }
+            self.reveal_shown(&shown);
             return Ok(());
         }
         if extend {
@@ -847,6 +920,7 @@ impl Model {
                 for (i, row) in rows.iter().enumerate() {
                     self.rows.insert(start + i, Row::parse(row, kinds));
                 }
+                self.landed_widen();
                 self.remember_selection();
                 if let Some(path) = &self.restore_path {
                     if let Some((&i, _)) = self.rows.iter().find(|(_, r)| self.row_path(r) == *path)
@@ -1532,18 +1606,21 @@ mod tests {
         assert!(!model.menu_enabled(0));
         assert!(!model.menu_enabled(1));
         assert!(!model.menu_enabled(2));
-        assert!(!model.menu_enabled(3), "remove needs the snapshot's identity too");
-        assert!(model.menu_enabled(4), "the hidden-files toggle needs no snapshot");
+        assert!(!model.menu_enabled(3), "copy path needs the snapshot's identity too");
+        assert!(!model.menu_enabled(4), "remove needs the snapshot's identity too");
+        assert!(model.menu_enabled(5), "the hidden-files toggle needs no snapshot");
         model.menu_ready = true;
         assert!(model.menu_enabled(0));
         assert!(model.menu_enabled(1));
         assert!(model.menu_enabled(2));
         assert!(model.menu_enabled(3));
-        assert!(!model.menu_enabled(5));
+        assert!(model.menu_enabled(4));
+        assert!(!model.menu_enabled(6));
         model.menu_path.clear();
         assert!(!model.menu_enabled(0));
         assert!(!model.menu_enabled(1));
         assert!(!model.menu_enabled(2));
         assert!(!model.menu_enabled(3));
+        assert!(!model.menu_enabled(4));
     }
 }

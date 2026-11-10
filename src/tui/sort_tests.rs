@@ -31,19 +31,19 @@ pub(super) fn press(model: &mut Model, wire: &mut Wire, key: &Key) {
 }
 
 fn sort_key() -> Key {
-    let key = Key::character('s', "");
+    let key = Key::character('S', "ctrl");
     assert_eq!(Map::load().action(&key, "default"), "sortNext", "the test presses the shipped sort key");
     key
 }
 
 fn reverse_key() -> Key {
-    let key = Key { name: "S".into(), text: "S".into(), mods: "".into(), pointer: None };
+    let key = Key::character('S', "ctrlshift");
     assert_eq!(Map::load().action(&key, "default"), "sortReverse", "the test presses the shipped reverse key");
     key
 }
 
 // A live listing through the real receive path: open, listed, rows. No model state by hand.
-fn open_names(model: &mut Model, wire: &mut Wire, names: &[(&str, bool)]) {
+pub(super) fn open_names(model: &mut Model, wire: &mut Wire, names: &[(&str, bool)]) {
     model.open(model.path.clone(), wire).unwrap();
     let sent = drain(wire);
     assert_eq!(requests(&sent, "list").len(), 1, "open sends one list");
@@ -212,8 +212,8 @@ fn stale_listing_inputs_leave_a_late_sort_reply_alone() {
     open_names(&mut model, &mut wire, &[("amber", false), ("bronze", false)]);
     press(&mut model, &mut wire, &sort_key());
     drain(&mut wire);
-    press(&mut model, &mut wire, &Key::character('f', ""));
-    assert!(model.editor.is_some(), "f opens the search editor");
+    press(&mut model, &mut wire, &Key::character('F', "ctrl"));
+    assert!(model.editor.is_some(), "Ctrl+F opens the search editor");
     press(&mut model, &mut wire, &Key::character('q', ""));
     press(&mut model, &mut wire, &Key::named("Return", ""));
     let sent = drain(&mut wire);
@@ -281,8 +281,8 @@ fn a_cursor_key_spends_the_anchor_so_a_late_reply_moves_nothing() {
     press(&mut model, &mut wire, &sort_key());
     drain(&mut wire);
     assert_eq!(model.sort_anchor, Some(PathBuf::from("/listing/amber")));
-    // The operator moves on before the reply: j is their choice of row, and the reply must not undo it.
-    press(&mut model, &mut wire, &Key::character('j', ""));
+    // The operator moves on before the reply: Down is their choice of row, and the reply must not undo it.
+    press(&mut model, &mut wire, &Key::named("Down", ""));
     drain(&mut wire);
     assert_eq!(model.sort_anchor, None, "a cursor key spends the waiting anchor");
     let moved = model.cursor;
@@ -292,18 +292,19 @@ fn a_cursor_key_spends_the_anchor_so_a_late_reply_moves_nothing() {
     finish(wire, reader);
 }
 
-// The reverse key under both terminal protocols: a legacy terminal sends the capital byte with no
-// modifier, a kitty-protocol one the base letter with Shift held. Both reach the same S row.
+// The order is a chord on both fronts: Ctrl+S cycles and Ctrl+Shift+S reverses. A capital S typed
+// on its own is text, so it filters instead of reversing.
 #[test]
-fn the_reverse_key_answers_on_either_protocol() {
+fn the_sort_chords_cycle_and_reverse() {
     let (mut wire, reader) = echo_wire();
     let mut model = Model::new(PathBuf::from("/listing"), &Json::Null);
     open_names(&mut model, &mut wire, &[("a", false), ("b", false)]);
     press(&mut model, &mut wire, &sort_key());
-    assert!(!model.reverse, "s steps the order and clears the reverse");
-    press(&mut model, &mut wire, &Key::character('S', "shift"));
-    assert!(model.reverse, "Shift+S reverses on a protocol terminal");
+    assert!(!model.reverse, "Ctrl+S steps the order and clears the reverse");
+    press(&mut model, &mut wire, &reverse_key());
+    assert!(model.reverse, "Ctrl+Shift+S reverses");
     press(&mut model, &mut wire, &Key::character('S', ""));
-    assert!(!model.reverse, "the legacy capital byte toggles it back");
+    assert!(model.reverse, "a bare capital S is typed text and never reverses");
+    assert_eq!(model.filter, "S", "it starts the filter instead");
     finish(wire, reader);
 }
